@@ -156,7 +156,7 @@ def main():
 
         if args.lib_preset == "small":
             kios = [5, 12, 25, 50]
-            rhos = [200_000, 400_000, 600_000]
+            rhos = [20_000, 40_000, 80_000, 150_000, 300_000]
             Vs   = [1.0, 2.0, 3.5]
             cfg  = SimConfig(n_walkers=5_000, n_ensembles=2, n_steps=50_000,
                              L=180.0, buffer=45.0, grid_spacing=1.2)
