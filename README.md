@@ -17,11 +17,9 @@ tailored to a **multi-Δ preclinical 9.4T acquisition**:
 pip install numpy scipy matplotlib numba nibabel
 ```
 
-**CUDA requirement:** You need an Nvidia GPU with CUDA support and the CUDA
-toolkit installed.  Numba will detect it automatically.  If no GPU is found,
-the code falls back to a (much slower) CPU implementation.
+**CUDA requirement:** Nvidia GPU + CUDA toolkit.  Numba detects automatically.
+Falls back to CPU if no GPU.
 
-For your RTX 2060 laptop, install CUDA via:
 ```bash
 conda install -c conda-forge cudatoolkit numba
 ```
@@ -30,22 +28,112 @@ conda install -c conda-forge cudatoolkit numba
 ## Quick start
 
 ```bash
-# 1. Reproduce Figure 4 (smoke test)
-python run_simulation.py --minimal       # ~2 min GPU
+# 1. Smoke test
+python run_simulation.py --minimal
 
-# 2. Build a simulation library (do once)
-python fit_data.py --build-library --lib-preset small    # ~15 min GPU
-python fit_data.py --build-library --lib-preset default  # ~1 hr GPU
-python fit_data.py --build-library --lib-preset dense    # ~4 hr GPU
+# 2. Build library
+python fit_data.py --build-library --lib-preset default
 
-# 3. Fit your mouse data
+# 3. Fit data (all four deltas)
 python fit_data.py --fit \
-    --dwi15 /path/to/DWI_15ms/eddy_corrected.nii.gz \
-    --dwi25 /path/to/DWI_25ms/eddy_corrected.nii.gz \
-    --dwi30 /path/to/DWI_30ms/eddy_corrected.nii.gz \
-    --dwi40 /path/to/DWI_40ms/eddy_corrected.nii.gz \
-    --mask  /path/to/mask.nii.gz \
-    --out   /path/to/madi_output/
+    --input 15:dwi15.nii.gz 25:dwi25.nii.gz 30:dwi30.nii.gz 40:dwi40.nii.gz \
+    --mask mask.nii.gz
+
+# 3b. Fit data (only two deltas — works fine)
+python fit_data.py --fit \
+    --input 15:dwi15.nii.gz 25:dwi25.nii.gz \
+    --mask mask.nii.gz
+```
+
+
+## Building & extending the library
+
+The library always simulates all 4 Δ values per entry.  At fitting time,
+you choose which subset to use.  All `--build-library` modes support
+`--append` to skip already-computed entries.
+
+### Mode 1: Preset grid
+
+Full cross-product of a named preset:
+
+```bash
+python fit_data.py --build-library --lib-preset default
+python fit_data.py --build-library --lib-preset dense
+```
+
+### Mode 2: Preset + custom additions
+
+Merge extra values into the preset grid:
+
+```bash
+# Add high-rho values (crossed with ALL preset kio and V)
+python fit_data.py --build-library --append \
+    --custom-rhos 1500000 2000000 3000000
+
+# Add extra values for all three parameters
+python fit_data.py --build-library --append \
+    --custom-kios 40 60 --custom-rhos 2000000 --custom-Vs 0.2 7.0
+```
+
+### Mode 3: Explicit sub-grid
+
+Cross ONLY the values you specify (ignores the preset grid):
+
+```bash
+# Only simulate these specific rho values at these specific kio and V
+python fit_data.py --build-library --append --explicit \
+    --grid-kios 12 25 50 \
+    --grid-rhos 1500000 2000000 3000000 \
+    --grid-Vs 0.5 1.0 2.0
+
+# If you omit one axis, the preset values are used for that axis:
+# This crosses custom rhos with ALL preset kios and Vs
+python fit_data.py --build-library --append --explicit \
+    --grid-rhos 1500000 2000000
+```
+
+### Mode 4: Exact triplets
+
+Simulate specific (kio, rho, V) points:
+
+```bash
+python fit_data.py --build-library --append \
+    --triplets 12,1500000,0.5  25,2000000,1.0  50,3000000,0.3
+```
+
+### Inspect a library
+
+```bash
+python fit_data.py --info --library madi_library.npz
+```
+
+
+## Fitting with flexible Δ inputs
+
+The `--input` flag takes `delta:path` pairs.  Use as many or as few as you
+have.  The library stores all 4 Δ values; at fitting time, only the columns
+matching your Δ values are compared.
+
+```bash
+# All four
+python fit_data.py --fit \
+    --input 15:dwi15.nii.gz 25:dwi25.nii.gz 30:dwi30.nii.gz 40:dwi40.nii.gz \
+    --mask mask.nii.gz --out results_4delta/
+
+# Just two
+python fit_data.py --fit \
+    --input 15:dwi15.nii.gz 25:dwi25.nii.gz \
+    --mask mask.nii.gz --out results_2delta/
+
+# Just one (less identifiability, but works)
+python fit_data.py --fit \
+    --input 25:dwi25.nii.gz \
+    --mask mask.nii.gz --out results_1delta/
+```
+
+**Legacy syntax still works** (but --input is preferred):
+```bash
+python fit_data.py --fit --dwi15 dwi15.nii.gz --dwi25 dwi25.nii.gz --mask mask.nii.gz
 ```
 
 
@@ -59,7 +147,7 @@ madi_gpu/
 │   ├── ensemble.py        # Contracted Voronoi + voxelised lookup grid
 │   ├── walker_gpu.py      # Numba CUDA random walk kernel + CPU fallback
 │   ├── signal.py          # Multi-delta SDE signal computation
-│   ├── library.py         # Library builder + voxel matcher
+│   ├── library.py         # Library builder (append, triplets, sub-grids)
 │   └── plotting.py        # Visualisation
 ├── run_simulation.py      # Reproduce Figure 4 (parameter sensitivity)
 ├── fit_data.py            # Build library + fit NIfTI data → maps
@@ -68,52 +156,93 @@ madi_gpu/
 ```
 
 
+## Parameter ranges
+
+From Springer et al. MADI I & II (NMR in Biomedicine 2023;36:e4781, e4782):
+
+### Paper's full library (14,000+ entries)
+
+| Parameter | Range | Unique values | Step size |
+|-----------|-------|---------------|-----------|
+| V (cell volume) | 0.01 – 206 pL | 949 | ~0.05 pL below 2 pL, ~0.2 pL above 8 pL |
+| ρ (cell density) | 4,400 – 58×10⁶ cells/μL | 186 | Non-uniform |
+| k_io (efflux rate) | 0.0 – 130 s⁻¹ | 65 | Non-uniform |
+| v_i (volume fraction) | 0.5 – 0.994 | 20 | Entries on ρ·V hyperbolae |
+
+### Paper's brain map results (MADI-II Table 2)
+
+| Region | ρ (10⁵ cells/μL) | V (pL) | k_io (s⁻¹) |
+|--------|------------------|--------|-------------|
+| Cortical GM | 1.1 | 6.0 | 6.6 |
+| Thalamus | 6.2 | 1.2 | 22 |
+| Putamen | 2.9 | 2.6 | 17 |
+| White matter | 6.9 | 0.91 | 22 |
+
+### Dense tissue (MADI-II Table 1)
+
+| Tissue | ρ (cells/μL) | V (pL) | k_io (s⁻¹) |
+|--------|-------------|--------|-------------|
+| Colorectal cancer | 950,000 | 0.74 | 6.6 |
+| Prostate lesion | 1,200,000 | 0.54 | 39 |
+| Lymphocyte beds | up to 6,000,000 | — | — |
+
+### This implementation's presets
+
+| Preset | k_io | ρ (cells/μL) | V (pL) |
+|--------|------|-------------|--------|
+| small | 4 vals (5–50) | 5 vals (100k–1.2M) | 4 vals (0.5–3.5) |
+| default | 9 vals (2–75) | 9 vals (100k–1.5M) | 9 vals (0.3–5.0) |
+| dense | 16 vals (2–100) | 13 vals (100k–3M) | 15 vals (0.2–9.0) |
+
+
 ## How it works
 
 ### GPU random walk kernel
 
-Each CUDA thread runs **one walker** through all 50,000 time steps:
-
+Each CUDA thread runs one walker through all time steps:
 1. **Propose displacement:** Gaussian with σ = √(2·D₀·t_s) per axis
-2. **Classify compartment:** Voxel grid lookup (precomputed on CPU) → nearest
-   two seeds → bisecting-plane test → intracellular or interstitial
-3. **Permeation test:** If compartment changed, draw uniform random; accept
-   if u < p_p^m (m = number of membranes crossed)
-4. **Accumulate encoding moments:** During PFG-1 (0→δ) and each PFG-2
-   (Δ_i → Δ_i+δ), accumulate position × dt
-
-**Key optimisation:** All 4 Δ values share the same PFG-1, so we run one
-walk and accumulate 4 different PFG-2 windows simultaneously.  This is 4×
-more efficient than separate walks.
-
-### Voxelised spatial grid
-
-The Voronoi ensemble is "rasterised" onto a 3D grid where each voxel stores
-the indices of the two nearest seeds.  This converts the expensive KD-tree
-query (O(log N) per point) into a simple array index (O(1)).
-
-Grid memory: 250³ × 4 bytes × 2 = ~125 MB (fits in 6 GB VRAM).
-
-### Signal computation
-
-For each Δ and b-value, compute the gradient strength G via b = (γGδ)²·tD,
-then calculate the phase for each walker and average cos(φ) over walkers
-and gradient directions.
+2. **Classify compartment:** Voxel grid lookup → nearest seeds → bisecting-plane test
+3. **Permeation test:** If boundary crossed, accept with probability p_p^m
+4. **Accumulate encoding moments:** All 4 Δ windows simultaneously (4× efficiency)
 
 ### Library matching
 
-The library contains one simulated signal vector per (k_io, ρ, V) triplet.
-Each vector has n_deltas × n_shells = 16 values.  Fitting is nearest-neighbor
-in this 16-D signal space (vectorised with NumPy, ~seconds for a whole brain).
+Each library entry stores a 16-element signal vector (4 Δ × 4 b-values).
+When fitting with fewer Δ values, the matcher extracts the corresponding
+subset of columns from each library vector before computing distances.
+Matching is nearest-neighbour in signal space, vectorised with NumPy.
 
 
-## Why not disimpy?
+## Troubleshooting
 
-[Disimpy](https://github.com/kerkelae/disimpy) is excellent for impermeable
-surfaces but does not support **semipermeable** membranes.  MADI requires
-water to permeate cell membranes with probability p_p at each encounter —
-a fundamentally different boundary condition.  This codebase implements its
-own Numba CUDA kernel with the permeation logic from the paper's SI §IV.b.
+### All voxels hit the ρ upper boundary
+
+```bash
+python fit_data.py --build-library --append \
+    --custom-rhos 1500000 2000000 3000000 5000000
+```
+
+### Want to fill in a specific region of parameter space
+
+```bash
+python fit_data.py --build-library --append --explicit \
+    --grid-kios 8 12 18 25 \
+    --grid-rhos 800000 1000000 1200000 1500000 2000000 \
+    --grid-Vs 0.3 0.5 0.8 1.0 1.5
+```
+
+### Maps look noisy / blocky
+
+Library is too sparse.  Either densify the whole thing:
+```bash
+python fit_data.py --build-library --lib-preset dense --append
+```
+Or target the parameter region your tissue occupies.
+
+### Fitting output says "⚠ 40% of voxels hit rho UPPER bound"
+
+The fitting code now warns you automatically.  Extend the grid for that
+parameter and re-fit.
 
 
 ## Estimated run times (RTX 2060 Mobile)
@@ -121,44 +250,10 @@ own Numba CUDA kernel with the permeation logic from the paper's SI §IV.b.
 | Task | GPU | CPU fallback |
 |------|-----|------|
 | run_simulation.py --minimal | ~2 min | ~10 min |
-| run_simulation.py (default) | ~10 min | ~2 hr |
-| Library (small, 36 entries) | ~15 min | ~3 hr |
-| Library (default, 378 entries) | ~1 hr | ~20 hr |
-| Library (dense, 1280 entries) | ~4 hr | ~3 days |
+| Library (small) | ~15 min | ~3 hr |
+| Library (default) | ~1.5 hr | ~24 hr |
+| Library (dense) | ~6 hr | ~5 days |
 | Fitting (voxel matching) | ~5 sec | ~5 sec |
-
-
-## MADI biomarkers
-
-| Symbol | Meaning | Mouse brain range |
-|--------|---------|------------------|
-| k_io | Water efflux rate constant | 5 – 100 s⁻¹ |
-| ρ | Cell number density | 100k – 800k cells/μL |
-| V | Mean cell volume | 0.3 – 5 pL |
-
-
-## Adapting to your data
-
-Edit the top of `madi/config.py`:
-- `DELTA_SMALL` — your δ (currently 6 ms)
-- `DELTAS_BIG` — your Δ values
-- `BVALS_UNIQUE` — your b-value shells
-
-Edit the top of `fit_data.py`:
-- `SHELLS` — volume index ranges for each b-shell
-- `DELTAS_MS` — must match your DWI file ordering
-
-
-## Multi-delta advantage
-
-The paper simulates a single tD per parameter set.  Your protocol with
-4 Δ values gives 4 independent decay curves per voxel, each with different
-sensitivity to restriction and exchange.  Joint fitting across all 4 Δ values
-provides much better identifiability of k_io, ρ, and V than a single tD.
-
-This is analogous to how NEXI leverages multiple diffusion times — but
-MADI returns cytometric parameters (cell density, cell volume) in addition
-to the exchange rate.
 
 
 ## License
