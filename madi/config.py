@@ -59,7 +59,12 @@ class SimConfig:
     # --- Ensemble geometry ---
     L:           float = 250.0          # simulation cube side        [μm]
     buffer:      float = 60.0           # walker init margin          [μm]
-    kappa:       float = 0.40           # annulus limit fraction
+    # κ controls per-cell annulus cap: α_i ≤ κ · d_nn/2.
+    # The original code used κ=0.4 which makes target v_i below ≈0.5
+    # unachievable (the cap dominates). Bumped to 0.95 so v_i down to
+    # ≈0.05 can be reached. The paper SI requires only κ<1 to prevent
+    # bounding planes from passing through the seed (SI §S.I).
+    kappa:       float = 0.95           # annulus limit fraction
 
     # --- Voxelised lookup grid ---
     grid_spacing: float = 1.0           # μm per grid voxel
