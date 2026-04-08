@@ -8,6 +8,13 @@ Tailored to:
     24 directions per shell, 97 volumes per Δ
 
 Internal units:  μm (length), ms (time).
+
+IMPORTANT (new semantics):
+    `n_ensembles` is now the number of independent ensembles PER GRADIENT
+    AXIS.  Because the powder average now uses three statistically
+    independent ensembles (one per Cartesian axis), the total number of
+    ensembles built per library entry is `3 × n_ensembles`, and the total
+    number of random walks is `3 × n_ensembles × n_walkers`.
 """
 
 import numpy as np
@@ -49,34 +56,58 @@ BVALS_UNIQUE_INT = BVALS_UNIQUE / 1e6               # [ms/μm²]
 class SimConfig:
     """All tuneable knobs for a MADI-GPU simulation run."""
 
-    # --- Random walk ---
+    # --- Random walk -------------------------------------------------------
     D0:          float = D0_UM2_MS      # diffusion coefficient       [μm²/ms]
     ts:          float = 1e-3           # step time                   [ms] (= 1 μs)
     n_steps:     int   = 50_000         # steps per walk  (50 ms covers Δ=40 + δ=6 = 46 ms)
-    n_walkers:   int   = 20_000         # walkers per ensemble
-    n_ensembles: int   = 5              # independent ensembles
 
-    # --- Ensemble geometry ---
-    L:           float = 250.0          # simulation cube side        [μm]
-    buffer:      float = 60.0           # walker init margin          [μm]
-    # κ controls per-cell annulus cap: α_i ≤ κ · d_nn/2.
-    # The original code used κ=0.4 which makes target v_i below ≈0.5
-    # unachievable (the cap dominates). Bumped to 0.95 so v_i down to
-    # ≈0.05 can be reached. The paper SI requires only κ<1 to prevent
-    # bounding planes from passing through the seed (SI §S.I).
-    kappa:       float = 0.95           # annulus limit fraction
+    # Walkers per ensemble (one ensemble = one gradient axis assignment).
+    # Bumped from 20k → 50k so that the default library entry has:
+    #   total walks = 3 × n_ensembles × n_walkers
+    # With n_ensembles=4 below, that is 3 × 4 × 50k = 600 000 walks/entry,
+    # 6× the previous default.  Paper target is ~12 M walks/entry — see
+    # PAPER_WALKS_PER_ENTRY in walker_gpu.py.  Production users should set
+    # n_walkers=400_000 and n_ensembles=10 to match the paper.
+    n_walkers:   int   = 50_000
 
-    # --- Voxelised lookup grid ---
+    # Number of independent ensembles PER AXIS.  Total ensembles built per
+    # library entry is 3 × n_ensembles (one group of n_ensembles dedicated
+    # to each of the x, y, z gradient axes).
+    n_ensembles: int   = 4
+
+    # --- Ensemble geometry -------------------------------------------------
+    L:           float = 250.0          # Ω_sim cube side             [μm]
+    buffer:      float = 60.0           # walker spawn margin (Ω_src) [μm]
+
+    # Populated domain margin: seeds are sampled in [−pop_margin, L+pop_margin]³
+    # so that cells near the faces of Ω_sim have their correct Poisson–
+    # Voronoi neighbours present.  40 μm is comfortably larger than a few
+    # mean cell spacings for ρ ≥ 100 000 cells/μL.  Increase if you push to
+    # very low ρ.
+    pop_margin:  float = 40.0
+
+    # Per-cell annulus cap: α_i ≤ κ · d_nn/2.
+    kappa:       float = 0.95
+
+    # --- Voxelised lookup grid ---------------------------------------------
     grid_spacing: float = 1.0           # μm per grid voxel
 
-    # --- SDE pulse sequence (your acquisition) ---
+    # --- Boundary-escape policy --------------------------------------------
+    # Paper behaviour: abort on escape.  We allow a small slack so that the
+    # rare statistical escape does not kill an otherwise good run.  If the
+    # escaped-walker fraction exceeds this threshold, run_walks() raises
+    # RuntimeError — matching the paper's "immediately cease" semantics
+    # (SI §S.III).  Escapees below threshold are dropped silently.
+    max_escape_frac: float = 0.01
+
+    # --- SDE pulse sequence (your acquisition) -----------------------------
     delta:       float = DELTA_SMALL    # δ, PFG duration             [ms]
     Deltas:      list  = field(default_factory=lambda: list(DELTAS_BIG))
 
-    # --- Library grid ---
+    # --- Library grid ------------------------------------------------------
     n_b_unique:  int   = 4              # unique non-zero b-values
 
-    # --- Derived ---
+    # --- Derived -----------------------------------------------------------
     @property
     def sigma(self) -> float:
         """Per-component Gaussian displacement std [μm]."""
@@ -108,5 +139,5 @@ class SimConfig:
 
     @property
     def grid_size(self) -> int:
-        """Number of grid points per axis."""
+        """Number of grid points per axis (Ω_sim only)."""
         return int(np.ceil(self.L / self.grid_spacing))

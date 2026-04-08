@@ -70,11 +70,11 @@ N_SHELLS = len(SHELLS)
 
 PRESETS = {
     "calibration": {
-    "kios": [5, 25, 100],
-    "rhos": [200_000, 800_000, 2_000_000],
-    "Vs":   [0.5, 2.0, 5.0],
+    "kios": [10, 35],
+    "rhos": [200_000, 800_000],
+    "Vs":   [1.0, 3.0],
     "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=80_000,
-                 L=500.0, buffer=70.0, grid_spacing=0.8),
+                 L=250.0, buffer=70.0, grid_spacing=0.8),
     },
     "small": {
         "kios": [5, 12, 25, 50],
