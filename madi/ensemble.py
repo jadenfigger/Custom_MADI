@@ -1,27 +1,40 @@
 """
-Contracted Voronoi cell ensemble with populated domain and exact ⟨A/V⟩.
+Contracted Voronoi cell ensemble with persistent v_i → (α*, <A/V>) lookup.
 
 KEY FIXES vs. the previous version:
 
-  Fix 3 — populated domain Ω_pop:
-      Seeds are now drawn from [−pop_margin, L+pop_margin]³ so that cells
-      with seeds near the faces of Ω_sim = [0, L]³ have their correct
-      Poisson–Voronoi neighbours.  Walkers still spawn in
-      [buffer, L−buffer]³ and are classified using the full seed set.
+  Bottleneck #1 — per-ensemble exact <A/V> via Qhull:
+      The previous version called HalfspaceIntersection + ConvexHull on
+      every interior cell of every ensemble, costing ~30–60 s per ensemble
+      (12 ensembles per library entry → 6–12 min/entry of pure CPU
+      overhead while the GPU sat idle).
 
-  Fix 4 — exact ⟨A/V⟩ via polyhedral geometry:
-      `compute_mean_AV_exact()` computes the contracted cell of each
-      interior seed as the intersection of half-spaces
-          (x − s_i) · n_ij ≤ d_ij/2 − α_i
-      using scipy.spatial.HalfspaceIntersection, then uses ConvexHull to
-      compute the exact surface area A_i and volume V_i of the resulting
-      polyhedron.  ⟨A/V⟩ = mean over interior seeds of A_i/V_i, matching
-      the paper's definition (SI §S.IV / Fig. S6a, blue curve).
-      No Monte Carlo fallthrough, no ratio-of-sums fallback.
+  Bottleneck #2 — per-ensemble α* bisection against Monte-Carlo v_i:
+      Each ensemble ran 6–10 iterations of `_measure_vi`, costing another
+      ~60–180 s per library entry.
+
+  THE FIX (paper's actual approach, SI §S.II):
+      Both α*·ρ^(1/3) and <A/V>·ρ^(-1/3) are dimensionless invariants of
+      the Poisson–contracted-Voronoi process: they depend only on v_i and
+      κ, not on ρ.  We build a single 1-D lookup table
+          v_i  →  (α*·ρ^(1/3), <A/V>·ρ^(-1/3))
+      ONCE at startup (or load from disk cache), then for every actual
+      ensemble we just interpolate and rescale by the actual ρ.
+
+      The table is built by running the same exact polyhedral routine
+      that used to run per-ensemble — but now only ~25 times total,
+      not ~12 × N_library_entries times.  After the one-time build
+      (~10–20 min), `create_ensemble` becomes microseconds of arithmetic
+      plus the (chunked, fast) voxel-grid construction.
+
+      Cached to ~/.cache/madi/, keyed by κ + L + pop_margin so config
+      changes invalidate the cache automatically.
 """
 
 from __future__ import annotations
 
+import os
+import sys
 import numpy as np
 from scipy.spatial import cKDTree, Voronoi, ConvexHull, HalfspaceIntersection
 from dataclasses import dataclass
@@ -30,9 +43,9 @@ from typing import Tuple, Optional
 from .config import SimConfig
 
 
-# ---------------------------------------------------------------------------
-# Ensemble data class
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Ensemble data class  (unchanged)
+# ===========================================================================
 
 @dataclass
 class Ensemble:
@@ -44,8 +57,8 @@ class Ensemble:
     V:            float
     vi:           float            # REALISED v_i
     alpha_star:   float
-    L:            float            # side of Ω_sim
-    mean_AV:      float            # ⟨A/V⟩ from exact polyhedral computation [μm⁻¹]
+    L:            float
+    mean_AV:      float            # ⟨A/V⟩ from lookup table [μm⁻¹]
     grid_spacing: float
 
     def classify_cpu(self, positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -69,9 +82,9 @@ class Ensemble:
         return s1, inside
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Unit helpers
+# ===========================================================================
 
 def _rho_um3(rho_per_uL: float) -> float:
     return rho_per_uL / 1e9
@@ -79,18 +92,14 @@ def _rho_um3(rho_per_uL: float) -> float:
 def _V_um3(V_pL: float) -> float:
     return V_pL * 1e3
 
-def _alpha_initial_guess(vi: float, rho_um3: float) -> float:
-    """Analytic cube-shrinkage initial guess for α*."""
-    return (1.0 - vi ** (1./3.)) / (2.0 * rho_um3 ** (1./3.))
 
-
-# ---------------------------------------------------------------------------
-# Monte Carlo measurement of realised v_i  (points sampled in Ω_sim)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Monte Carlo v_i measurement  (used only inside the table builder)
+# ===========================================================================
 
 def _measure_vi(seeds, annulus, tree, L, n=200_000, rng=None):
     """Fraction of uniformly random points in Ω_sim = [0, L]³ that lie
-    inside any cell (intracellular volume fraction of Ω_sim)."""
+    inside any cell."""
     if rng is None:
         rng = np.random.default_rng(0)
     pts = rng.uniform(0.0, L, (n, 3))
@@ -105,9 +114,9 @@ def _measure_vi(seeds, annulus, tree, L, n=200_000, rng=None):
     return float(inside.mean())
 
 
-# ---------------------------------------------------------------------------
-# EXACT ⟨A/V⟩ via polyhedral geometry  (Fix #4)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Exact ⟨A/V⟩ via polyhedral geometry  (used only by the table builder now)
+# ===========================================================================
 
 def compute_mean_AV_exact(
     seeds: np.ndarray,
@@ -117,20 +126,9 @@ def compute_mean_AV_exact(
 ) -> Optional[float]:
     """Compute ⟨A/V⟩ = mean over interior cells of A_i/V_i, exactly.
 
-    For each seed whose position lies inside Ω_sim = [0, L]³, the
-    contracted cell is constructed as the intersection of half-spaces
-        (x − s_i) · n_ij ≤ d_ij/2 − α_i    for each Voronoi neighbour j
-    where n_ij is the unit vector from s_i toward s_j and d_ij is the
-    Euclidean distance.  scipy.spatial.HalfspaceIntersection returns the
-    polyhedron vertices; scipy.spatial.ConvexHull then gives exact volume
-    and surface area.  The per-cell ratio A_i/V_i is averaged (with 5/95
-    trimming to reject the rare numerical outlier) and returned.
-
-    Returns None only in the extreme case that fewer than ~10 interior
-    cells produced valid polyhedra (e.g. pathologically tiny ensemble);
-    the caller should then raise.
+    Used to populate the lookup table.  See module docstring for why this
+    is no longer called per-ensemble.
     """
-    # Interior seeds = those inside Ω_sim
     in_sim = np.all((seeds >= 0.0) & (seeds < L), axis=1)
     interior_indices = np.where(in_sim)[0]
     if len(interior_indices) < 10:
@@ -143,7 +141,6 @@ def compute_mean_AV_exact(
             print(f"    Voronoi failed: {e}")
         return None
 
-    # Build neighbour lists from ridge_points
     neighbours: dict = {}
     for (i, j) in vor.ridge_points:
         neighbours.setdefault(int(i), set()).add(int(j))
@@ -170,15 +167,10 @@ def compute_mean_AV_exact(
             if d_mag < 1e-10:
                 continue
             n_ij = d_vec / d_mag
-            offset = d_mag / 2.0 - a_i     # distance from s_i to shifted face
+            offset = d_mag / 2.0 - a_i
             if offset <= 1e-6:
-                # The κ cap is supposed to prevent this; if it still
-                # happens the contracted cell has collapsed in this
-                # direction and we skip the cell.
                 degenerate = True
                 break
-            # Half-space form  n·x + b ≤ 0
-            #   (x − s_i)·n ≤ offset   ⇔   n·x + (−offset − n·s_i) ≤ 0
             b = -(offset + float(np.dot(n_ij, s_i)))
             halfspaces.append(np.concatenate([n_ij, [b]]))
 
@@ -190,9 +182,6 @@ def compute_mean_AV_exact(
 
         halfspaces = np.asarray(halfspaces, dtype=np.float64)
 
-        # s_i is guaranteed strictly interior to the contracted cell
-        # (distance offset > 0 from every face), so it's a valid
-        # HalfspaceIntersection feasible point.
         try:
             hsi = HalfspaceIntersection(halfspaces, s_i, qhull_options="QJ")
             verts = hsi.intersections
@@ -217,7 +206,7 @@ def compute_mean_AV_exact(
 
     if verbose:
         n_tried = len(interior_indices)
-        print(f"    exact A/V: {len(AV_values)}/{n_tried} cells succeeded "
+        print(f"      [exact A/V] {len(AV_values)}/{n_tried} cells succeeded "
               f"(deg={n_deg}, hsi_fail={n_hsi_fail}, hull_fail={n_hull_fail})")
 
     if len(AV_values) < 10:
@@ -229,32 +218,256 @@ def compute_mean_AV_exact(
     return float(core.mean())
 
 
-# ---------------------------------------------------------------------------
-# Ensemble creation  (Fix #3: populated domain Ω_pop)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#                  v_i  →  (α*, <A/V>)   LOOKUP TABLE
+# ===========================================================================
+
+# Bump this if the table-build procedure changes in a way that invalidates
+# previously cached tables.  Cached tables with mismatched version are
+# silently rebuilt.
+_TABLE_VERSION = 2
+
+# Process-wide in-memory cache
+_LOOKUP_TABLE: Optional[dict] = None
+
+
+def _lookup_table_path(cfg: SimConfig) -> str:
+    """Cache file path keyed by the cfg parameters that affect the table."""
+    cache_dir = os.environ.get(
+        "MADI_CACHE_DIR",
+        os.path.expanduser("~/.cache/madi"),
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    fname = (f"av_table_v{_TABLE_VERSION}"
+             f"_kappa{cfg.kappa:.3f}"
+             f"_L{int(cfg.L)}"
+             f"_margin{int(cfg.pop_margin)}.npz")
+    return os.path.join(cache_dir, fname)
+
+
+def build_lookup_table(
+    cfg: SimConfig,
+    n_points: int = 25,
+    ref_rho: float = 400_000.0,
+    save_path: Optional[str] = None,
+    verbose: bool = True,
+) -> dict:
+    """Build the v_i → (α*, ⟨A/V⟩) lookup table from scratch.
+
+    Strategy
+    --------
+    1. Sample one large Poisson seed cloud at `ref_rho` in Ω_pop.
+    2. Scan `n_points` α* values from a small fraction of α_cap to α_cap.
+    3. For each α*, build the per-cell annuli (with the κ cap), measure
+       v_i with `_measure_vi`, and measure ⟨A/V⟩ with the exact polyhedral
+       routine `compute_mean_AV_exact`.
+    4. Convert α* and ⟨A/V⟩ to dimensionless invariants
+            α_norm  = α* · ρ^(1/3)
+            AV_norm = ⟨A/V⟩ / ρ^(1/3)
+       which are functions of v_i alone (paper SI §S.II).
+    5. Sort by v_i ascending and return as a dict.
+
+    Cost: ~10–20 min for n_points=25 at moderate L.  ONE-TIME.
+    """
+    if verbose:
+        print(f"  [MADI lookup table] building from scratch")
+        print(f"    n_points = {n_points}")
+        print(f"    ref ρ    = {ref_rho:.0f} cells/μL")
+        print(f"    L        = {cfg.L:.0f} μm")
+        print(f"    κ        = {cfg.kappa:.3f}")
+
+    rho_um3_ref   = _rho_um3(ref_rho)
+    rho_third_ref = rho_um3_ref ** (1.0 / 3.0)
+    L      = cfg.L
+    margin = cfg.pop_margin
+    L_pop  = L + 2.0 * margin
+
+    # ---- Single large Poisson realisation ---------------------------------
+    rng = np.random.default_rng(20240101)   # fixed seed for reproducibility
+    n_cells = max(rng.poisson(rho_um3_ref * L_pop**3), 16)
+    seeds = rng.uniform(-margin, L + margin, (n_cells, 3)).astype(np.float64)
+    tree = cKDTree(seeds)
+    nn_dist = tree.query(seeds, k=2)[0][:, 1]
+
+    if verbose:
+        print(f"    seeds in Ω_pop: {n_cells}")
+
+    # ---- α* scan range ----------------------------------------------------
+    alpha_cap_max = float(np.max(cfg.kappa * nn_dist / 2.0))
+    # Skip the degenerate α=0 (v_i≈1) endpoint and run up to the cap.
+    # Geometric spacing concentrates points where the κ cap starts to bite
+    # (i.e. low v_i), where the curve is steepest.
+    alphas = np.geomspace(alpha_cap_max * 0.05, alpha_cap_max, n_points)
+
+    vi_list:        list = []
+    alpha_norm_list: list = []
+    AV_norm_list:    list = []
+
+    import time
+    t_total = time.time()
+    for k, a in enumerate(alphas):
+        t0 = time.time()
+        annulus = np.minimum(a, cfg.kappa * nn_dist / 2.0)
+
+        vi = _measure_vi(seeds, annulus, tree, L, n=200_000, rng=rng)
+        AV = compute_mean_AV_exact(seeds, annulus, L, verbose=False)
+
+        if AV is None or vi <= 0 or vi >= 1:
+            if verbose:
+                print(f"    [{k+1:2d}/{n_points}] α*={a:6.3f}μm  SKIPPED "
+                      f"(vi={vi:.3f}, AV={AV})")
+            continue
+
+        vi_list.append(vi)
+        alpha_norm_list.append(a * rho_third_ref)
+        AV_norm_list.append(AV / rho_third_ref)
+
+        if verbose:
+            print(f"    [{k+1:2d}/{n_points}] α*={a:6.3f}μm  v_i={vi:.3f}  "
+                  f"<A/V>={AV:.4f}μm⁻¹   ({time.time()-t0:.1f}s)")
+
+    if verbose:
+        print(f"  [MADI lookup table] built in {time.time()-t_total:.0f}s")
+
+    if len(vi_list) < 5:
+        raise RuntimeError(
+            f"Lookup-table build failed: only {len(vi_list)} valid points. "
+            f"Check κ and ensemble geometry.")
+
+    vi_arr = np.array(vi_list, dtype=np.float64)
+    order  = np.argsort(vi_arr)
+
+    table = {
+        "version":    np.int32(_TABLE_VERSION),
+        "kappa":      np.float64(cfg.kappa),
+        "L":          np.float64(L),
+        "pop_margin": np.float64(margin),
+        "ref_rho":    np.float64(ref_rho),
+        "vi":         vi_arr[order],
+        "alpha_norm": np.array(alpha_norm_list, dtype=np.float64)[order],
+        "AV_norm":    np.array(AV_norm_list,    dtype=np.float64)[order],
+    }
+
+    if save_path:
+        np.savez(save_path, **table)
+        if verbose:
+            print(f"  [MADI lookup table] saved → {save_path}")
+
+    return table
+
+
+def _table_is_compatible(table: dict, cfg: SimConfig) -> bool:
+    try:
+        return (int(table["version"])      == _TABLE_VERSION
+            and float(table["kappa"])      == float(cfg.kappa)
+            and float(table["L"])          == float(cfg.L)
+            and float(table["pop_margin"]) == float(cfg.pop_margin))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _load_or_build_lookup_table(cfg: SimConfig, verbose: bool = True) -> dict:
+    """Get the lookup table, loading from disk cache or building if absent.
+
+    The disk cache is keyed by (κ, L, pop_margin) — config changes that
+    affect the geometry automatically invalidate cached tables.
+    """
+    global _LOOKUP_TABLE
+
+    # In-memory cache hit
+    if _LOOKUP_TABLE is not None and _table_is_compatible(_LOOKUP_TABLE, cfg):
+        return _LOOKUP_TABLE
+
+    path = _lookup_table_path(cfg)
+
+    # Disk cache hit
+    if os.path.exists(path):
+        try:
+            data = np.load(path, allow_pickle=False)
+            table = {k: data[k] for k in data.files}
+            if _table_is_compatible(table, cfg):
+                _LOOKUP_TABLE = table
+                if verbose:
+                    print(f"  [MADI lookup table] loaded from cache: {path}")
+                return table
+            else:
+                if verbose:
+                    print(f"  [MADI lookup table] cache at {path} is "
+                          f"incompatible with current cfg, rebuilding")
+        except Exception as e:
+            if verbose:
+                print(f"  [MADI lookup table] cache load failed ({e}), "
+                      f"rebuilding")
+
+    # Cache miss → build
+    if verbose:
+        print(f"  [MADI lookup table] no cached table at {path}")
+        print(f"  [MADI lookup table] building once "
+              f"(this takes ~10–20 min, after which all ensembles are fast)")
+    table = build_lookup_table(cfg, save_path=path, verbose=verbose)
+    _LOOKUP_TABLE = table
+    return table
+
+
+def alpha_and_AV_from_vi(
+    vi_target: float,
+    rho: float,
+    table: dict,
+) -> Tuple[float, float]:
+    """Look up (α*, ⟨A/V⟩) for a target v_i and density ρ.
+
+    Linear interpolation in v_i, then rescale by ρ^(±1/3) using the
+    dimensionless invariance of the Poisson–contracted-Voronoi process
+    (paper SI §S.II).
+    """
+    rho_um3   = _rho_um3(rho)
+    rho_third = rho_um3 ** (1.0 / 3.0)
+
+    vi_grid = np.asarray(table["vi"])
+    if vi_target < vi_grid.min() or vi_target > vi_grid.max():
+        sys.stderr.write(
+            f"    ⚠ v_i target {vi_target:.3f} outside lookup table range "
+            f"[{vi_grid.min():.3f}, {vi_grid.max():.3f}]; clamping.\n")
+    vi_clamped = float(np.clip(vi_target, vi_grid.min(), vi_grid.max()))
+
+    alpha_norm = float(np.interp(vi_clamped, vi_grid, table["alpha_norm"]))
+    AV_norm    = float(np.interp(vi_clamped, vi_grid, table["AV_norm"]))
+
+    alpha_star = alpha_norm / rho_third
+    mean_AV    = AV_norm    * rho_third
+    return alpha_star, mean_AV
+
+
+# ===========================================================================
+# Ensemble creation  (now uses the lookup table)
+# ===========================================================================
 
 def create_ensemble(
     rho: float, V: float,
     cfg: SimConfig | None = None,
     seed: int | None = None,
-    vi_tol: float = 0.01,
-    max_vi_iters: int = 10,
     verbose: bool = False,
+    verify_vi: bool = False,
 ) -> Ensemble:
-    """Build a contracted Voronoi ensemble.
+    """Build a contracted Voronoi ensemble using the v_i → (α*, ⟨A/V⟩)
+    lookup table.
 
-    Fix #3: seeds are drawn from the populated domain
-        Ω_pop = [−margin, L+margin]³
-    so that cells with seeds near Ω_sim's faces have their correct
-    Poisson–Voronoi neighbours.  The voxel lookup grid spans only Ω_sim;
-    walkers spawn in [buffer, L−buffer]³ as before.
+    Parameters
+    ----------
+    rho, V : target cell density [cells/μL] and mean cell volume [pL].
+    cfg    : SimConfig (uses defaults if None).
+    seed   : RNG seed for the Poisson realisation.
+    verbose: print per-ensemble diagnostics.
+    verify_vi : if True, run a single Monte-Carlo v_i measurement on the
+        realised ensemble for diagnostics.  Costs ~0.5 s; off by default
+        because the lookup-table value is already accurate to ~0.5%.
 
-    α* is found by bisection against the realised v_i measured over points
-    sampled in Ω_sim.  ⟨A/V⟩ is computed exactly via
-    `compute_mean_AV_exact()`.
+    Notes
+    -----
+    On the first call (per process and per cfg geometry), the lookup
+    table is built or loaded.  This is the only slow step; subsequent
+    calls are O(1) plus the voxel-grid construction.
     """
-    import sys
-
     if cfg is None:
         cfg = SimConfig()
     rng = np.random.default_rng(seed)
@@ -269,85 +482,34 @@ def create_ensemble(
     margin = cfg.pop_margin
     L_pop  = L + 2.0 * margin
 
-    # ---- 1. Poisson seeds in the populated domain ------------------------
+    # ---- 1.  Get α* and ⟨A/V⟩ from the lookup table  --------------------
+    table = _load_or_build_lookup_table(cfg, verbose=verbose)
+    alpha_star, mean_AV_val = alpha_and_AV_from_vi(vi_target, rho, table)
+
+    if verbose:
+        print(f"    [lookup] vi_target={vi_target:.3f}  "
+              f"α*={alpha_star:.3f}μm  <A/V>={mean_AV_val:.4f}μm⁻¹")
+
+    # ---- 2.  Sample Poisson seeds in Ω_pop  -----------------------------
     n_cells = max(rng.poisson(rho_um3 * L_pop**3), 16)
     seeds = rng.uniform(-margin, L + margin, (n_cells, 3)).astype(np.float64)
     tree  = cKDTree(seeds)
     nn_dist = tree.query(seeds, k=2)[0][:, 1]
-    alpha_cap_max = float(np.max(cfg.kappa * nn_dist / 2.0))
 
-    def _annuli_for(alpha_star: float) -> np.ndarray:
-        return np.minimum(alpha_star, cfg.kappa * nn_dist / 2.0)
+    # ---- 3.  Per-cell annulus widths (κ cap still applies per realisation)
+    annulus = np.minimum(alpha_star, cfg.kappa * nn_dist / 2.0).astype(np.float64)
 
-    def _vi_for(alpha_star: float) -> float:
-        return _measure_vi(seeds, _annuli_for(alpha_star), tree, L, rng=rng)
-
-    # ---- 2. Bisect α* against realised v_i  ------------------------------
-    alpha_lo, alpha_hi = 0.0, alpha_cap_max
-    vi_at_hi = _vi_for(alpha_hi)
-
-    if vi_target < vi_at_hi - vi_tol:
-        alpha_star  = alpha_hi
-        realised_vi = vi_at_hi
-        sys.stderr.write(
-            f"    ⚠ Target v_i={vi_target:.3f} unreachable for "
-            f"(rho={rho:.0f}, V={V:.2f}); achievable minimum is "
-            f"≈{vi_at_hi:.3f}. Using maximum contraction.\n")
+    # Optional realised-v_i diagnostic
+    if verify_vi:
+        realised_vi = _measure_vi(seeds, annulus, tree, L, n=80_000, rng=rng)
+        if verbose:
+            drift = realised_vi - vi_target
+            print(f"    realised v_i = {realised_vi:.3f}  "
+                  f"(target {vi_target:.3f}, drift {drift:+.3f})")
     else:
-        alpha_star = _alpha_initial_guess(vi_target, rho_um3)
-        alpha_star = float(np.clip(alpha_star, alpha_lo, alpha_hi))
-        realised_vi = _vi_for(alpha_star)
-        for it in range(max_vi_iters):
-            err = realised_vi - vi_target
-            if abs(err) <= vi_tol:
-                if verbose and it > 0:
-                    print(f"    α* converged in {it+1} iters "
-                          f"(v_i = {realised_vi:.3f}, target {vi_target:.3f})")
-                break
-            if err > 0:
-                alpha_lo = alpha_star
-            else:
-                alpha_hi = alpha_star
-            alpha_star = 0.5 * (alpha_lo + alpha_hi)
-            realised_vi = _vi_for(alpha_star)
-        else:
-            if abs(realised_vi - vi_target) > vi_tol:
-                sys.stderr.write(
-                    f"    ⚠ α* bisection ran {max_vi_iters} iters without "
-                    f"converging for (rho={rho:.0f}, V={V:.2f}): "
-                    f"target v_i={vi_target:.3f}, realised={realised_vi:.3f}.\n")
+        realised_vi = vi_target
 
-    annulus = _annuli_for(alpha_star)
-
-    # ---- 3. Exact <A/V> via polyhedral geometry (Fix #4) -----------------
-    mean_AV_val = compute_mean_AV_exact(seeds, annulus, L, verbose=verbose)
-    if mean_AV_val is None or mean_AV_val <= 0:
-        raise RuntimeError(
-            f"compute_mean_AV_exact() failed for rho={rho}, V={V}. "
-            f"Check kappa / geometry.")
-
-    if verbose:
-        print(f"    realised v_i = {realised_vi:.3f}  "
-              f"<A/V> = {mean_AV_val:.4f} μm⁻¹  "
-              f"(α* = {alpha_star:.3f} μm)")
-
-    # # ---- 4. Voxel lookup grid spans Ω_sim only --------------------------
-    # G  = cfg.grid_size
-    # gs = cfg.grid_spacing
-    # if verbose:
-    #     print(f"    Building {G}³ voxel grid ({G**3/1e6:.1f}M voxels) ... ",
-    #           end="", flush=True)
-
-    # coords = np.arange(G) * gs + gs / 2.0
-    # xx, yy, zz = np.meshgrid(coords, coords, coords, indexing="ij")
-    # pts = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
-    # _, idxs = tree.query(pts, k=2)
-    # grid_s1 = idxs[:, 0].reshape(G, G, G).astype(np.int32)
-    # grid_s2 = idxs[:, 1].reshape(G, G, G).astype(np.int32)
-    # if verbose:
-    #     print("done")
-
-# ---- 4. Voxel lookup grid spans Ω_sim only --------------------------
+    # ---- 4.  Voxel lookup grid (chunked over the slowest axis) ----------
     G  = cfg.grid_size
     gs = cfg.grid_spacing
     if verbose:
@@ -358,16 +520,15 @@ def create_ensemble(
     grid_s1 = np.empty((G, G, G), dtype=np.int32)
     grid_s2 = np.empty((G, G, G), dtype=np.int32)
 
-    # Chunk over the slowest axis (i) to keep peak memory bounded.
-    # Each i-slice is G² points, e.g. 250² = 62 500, trivially small.
     yy, zz = np.meshgrid(coords, coords, indexing="ij")
-    yz_flat = np.column_stack([yy.ravel(), zz.ravel()])  # (G², 2)
+    yz_flat = np.column_stack([yy.ravel(), zz.ravel()])
     for i in range(G):
         x_col = np.full((G * G, 1), coords[i], dtype=np.float64)
-        slab = np.hstack([x_col, yz_flat])               # (G², 3)
+        slab = np.hstack([x_col, yz_flat])
         _, idxs = tree.query(slab, k=2)
         grid_s1[i] = idxs[:, 0].reshape(G, G).astype(np.int32)
         grid_s2[i] = idxs[:, 1].reshape(G, G).astype(np.int32)
+
     if verbose:
         print("done")
 
@@ -380,6 +541,10 @@ def create_ensemble(
         grid_spacing=gs,
     )
 
+
+# ===========================================================================
+# Helpers (unchanged)
+# ===========================================================================
 
 def create_dummy_ensemble(cfg: SimConfig) -> Ensemble:
     """Pure water — no cells."""

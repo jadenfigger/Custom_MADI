@@ -256,6 +256,14 @@ parameter and re-fit.
 | Fitting (voxel matching) | ~5 sec | ~5 sec |
 
 
+## Setting up envirement and installing packages on Sol Supercomputer through shell
+
+interactive -p general -q public -G a100:1 -c 8 --mem=32G -t 0-04:00
+module load mamba/latest
+mamba create -y -n madi python=3.11 && source activate madi
+mamba install -y -c conda-forge numpy scipy matplotlib nibabel numba cudatoolkit=11.8
+python -c "import numpy, scipy, matplotlib, nibabel, numba; from numba import cuda; print('CUDA available:', cuda.is_availabl ()); print('GPU:', cuda.get_current_device().name if cuda.is_available() else 'none')"
+
 ## License
 
 Research/educational use.  The MADI method is described in US Provisional

@@ -170,14 +170,14 @@ def load_dwi_and_average(input_specs, mask_path):
         img = nib.load(dwi_path)
         data = img.get_fdata()
 
-        vox_data = data[mask_idx[0], mask_idx[1], mask_idx[2], :]
+        vox_data = data[mask, :]
 
         S0 = vox_data[:, 0].copy()
         S0[S0 < 1e-10] = 1e-10
 
         for si, (b_val, vol_slice) in enumerate(SHELLS):
             shell_mean = np.mean(vox_data[:, vol_slice], axis=1)
-            S_norm = np.clip(shell_mean / S0, 0.0, 1.0)
+            S_norm = shell_mean / S0
             measured[:, di * N_SHELLS + si] = S_norm
 
         print("done")
