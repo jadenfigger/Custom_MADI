@@ -73,8 +73,8 @@ PRESETS = {
     "kios": [10, 35],
     "rhos": [200_000, 800_000],
     "Vs":   [1.0, 3.0],
-    "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=80_000,
-                 L=250.0, buffer=70.0, grid_spacing=0.8),
+    "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=50_000,
+                    L=250.0, buffer=60.0, grid_spacing=1.0),
     },
     "small": {
         "kios": [5, 12, 25, 50],
@@ -98,8 +98,8 @@ PRESETS = {
                 2_000_000, 3_000_000],
         "Vs":   [0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5,
                 3.0, 4.0, 5.0, 7.0, 9.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=80_000,
-                 L=500.0, buffer=70.0, grid_spacing=0.8),
+        "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=50_000,
+                     L=250.0, buffer=60.0, grid_spacing=1.0),
     },
 }
 

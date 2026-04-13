@@ -1,0 +1,165 @@
+# MADI Implementation Verification Checklist
+
+A section-by-section audit checklist for verifying a custom MADI implementation against Springer et al., *NMR in Biomedicine* 2023, papers I (nbm.4781) and II (nbm.4782) plus their supporting information (SI).
+
+Each item cites where in the papers the requirement comes from. Work top-to-bottom: the early sections (geometry, RW mechanics) must be right before the later sections (library, matching) can mean anything.
+
+---
+
+## 1. Contracted Voronoi cell geometry (Paper I §3.1, SI §S.I, Figs. S1–S2)
+
+The whole model rests on this. If geometry is wrong, every downstream parameter is wrong.
+
+- [X] **Seed points** are placed by a **Poisson point process** in 3D (uniform, independent). Not a grid, not jittered lattice, not Halton/Sobol. (SI §S.II, Eq. S6.)
+- [ ] Standard Voronoi tessellation is computed from seeds (e.g., `scipy.spatial.Voronoi` / `ConvexHull`). (SI §S.II.)
+- [ ] **Contracted** cells are produced by translating each bounding plane **inward toward the seed** by an annulus width `α_i`, not by scaling from a centroid. (SI §S.I, Eq. S2–S3.)
+- [ ] A **global target annulus width `α*`** is specified; each cell uses `α_i = min(α*, α_i^(lim))`. (SI §S.I.)
+- [ ] The per-cell upper limit `α_i^(lim)` is set as a fraction `κ` of the distance that would push a bounding plane past the seed. Confirm your `κ` matches what you intended (the paper treats this as a safety cap to prevent inversion).
+- [ ] The **interstitium** is the union of all annuli — i.e., a **fully connected extracellular space**, not isolated gaps. Verify visually on a 2D slice.
+- [ ] Gaps between neighboring cells can be **asymmetric per-face** when the neighbor's `α_j < α*`. (SI §S.I, Fig. S2.)
+- [ ] For `α* = 0`, your code reproduces a standard Voronoi tessellation with `v_i = 1` and `V = 1/ρ`.
+
+## 2. Ensemble construction for target (ρ, V) (Paper I §3.1, SI §S.III, Fig. S3)
+
+- [ ] Given a desired `(ρ, V)`, you compute `α*` by inverting the empirical **cubic polynomial** relating `v_i` to the density-normalized target annulus width `ρ^(1/3)·α*` (SI Eq. S7a). Do not invent a new fit.
+- [ ] You use `v_i = ρV` as the link between `(ρ, V)` and `v_i`. (SI Eq. S7b.)
+- [ ] Of the up-to-three cubic roots, you select the **unique root in the physical `α*` range** (SI §S.III — the relation is a bijection on that interval).
+- [ ] The calibration curve / cubic coefficients were derived from **single-celled ensembles** (Poisson-Voronoi realizations of one cell), not multi-cell sims. The paper used **5 × 10⁶** such ensembles across **26 linearly-spaced `α*` values**. Your curve does not have to regenerate those, but it should be consistent with them.
+- [ ] You are aware that a realized finite ensemble only matches desired `(ρ, V)` **in expectation**; actual realized `ρ, V` fluctuate. (SI §S.III.) This is fine for large domains; confirm you are not "correcting" it in a way that biases results.
+
+## 3. Simulation domain sizing (SI §S.III, Fig. S1)
+
+- [ ] Three nested cubic domains exist:
+  - [ ] `Ω_src` — inner cube where walks **originate**.
+  - [ ] `Ω_sim` — simulation cube; walks that **exit `Ω_sim`** are errors (abort / report).
+  - [ ] `Ω_pop` — larger encompassing cube that is **seeded** so that cells whose seeds are outside `Ω_sim` can still legitimately protrude in.
+- [ ] The `Ω_src → Ω_sim` padding is sized using the heuristic of SI Eq. S8, based on the expected diffusion trajectory length `W` over `t_RW,max` (not just `d_rms`). Paper uses `W ≈ 438 μm` as typical. Your padding should scale with `sqrt(D_0 · t_s) · N_steps`–type reasoning, not `sqrt(6·D_0·t_RW)`.
+- [ ] `Ω_pop` is enlarged beyond `Ω_sim` enough that (a) cells overlapping `Ω_sim` have complete neighbor sets, and (b) nearest-neighbor queries for annulus-width computation are unbiased. (SI Eqs. S10–S11; Fig. S1 green square.)
+- [ ] Cells whose seeds lie in `Ω_pop \ Ω_sim` are still used for partitioning but only the portions inside `Ω_sim` contain random walkers.
+- [ ] There is an explicit **out-of-bounds trap**: if a walker reaches `∂Ω_sim`, the simulation raises/records an error rather than silently reflecting. (SI §S.III.)
+
+## 4. Random walk mechanics (Paper I §2, §3.2, SI §S.IV.b, Fig. S9)
+
+- [ ] **Step time** `t_s` is fixed (paper uses **1 μs**). Confirm your value and that `t_RW,max / t_s` gives the intended `N_steps` (paper: 80 ms / 1 μs = 80,000).
+- [ ] Step displacements are drawn from a **3D normal distribution** with mean = current position and **per-component variance `2·D_0·t_s`** (SI §S.IV.b.1). Equivalently, each component ~ `N(0, sqrt(2·D_0·t_s))`. Confirm the factor of 2 (not 6, not 1).
+- [ ] `D_0 = 3.0 μm²/ms` at 37 °C is used as the nanoscopic diffusion coefficient `D_n` everywhere — **inside and outside cells**. You do not assign different intrinsic `D` to compartments. (Paper I §4.2 explicitly argues against this.)
+- [ ] Walker starting positions `r_0` are uniformly random within `Ω_src`.
+- [ ] Starting **compartment label** (inside which cell vs. interstitium) is recorded via a kD-tree query for the **two nearest seeds** and the geometric test of SI Eqs. S13–S14 (perpendicular distance `α'` to the mid-plane between the two nearest seeds compared to `α_i` / `α_j`). Confirm you are not using a simple "closest seed" test — that would miss the annulus.
+- [ ] A kD-tree of seed points is built **once** before RWs; per-step queries use nearest-neighbor lookup, not brute force. (Paper I §2.)
+
+## 5. Membrane-crossing logic (SI §S.IV.b.1, critical)
+
+This is where most custom implementations go wrong. Read SI §S.IV.b.1 carefully.
+
+- [ ] For each proposed step `x_k → x_{k+1/2}`, you classify the number of membranes crossed `m ∈ {0, 1, 2}` by comparing the **old compartment label** and the **new compartment label**:
+  - [ ] `m = 0` — both inside the same cell, or both in interstitium (even if they traverse annulus geometry in between — the paper's logic is based on endpoint labels).
+  - [ ] `m = 1` — one endpoint inside a cell, the other in the interstitium.
+  - [ ] `m = 2` — endpoints inside **two different adjacent cells** (step tunneled through the intervening annulus).
+- [ ] A uniform random `u ~ U(0,1)` is drawn; the step is **accepted iff `u < p_p^m`**. Explicit: for `m=0`, always accept (p_p⁰ = 1); for `m=1`, accept with probability `p_p`; for `m=2`, accept with probability `p_p²`. (SI §S.IV.b.1.)
+- [ ] On rejection, the walker **stays at `x_k`** for that step. **No reflection**, no partial step, no angular deflection. (SI: "The molecule is not allowed angular reflections off the cell boundary.")
+- [ ] Rejected steps **still consume a time step** (elapsed time advances). Confirm your loop does not retry until success.
+- [ ] You are aware that the `m=2` case (traversing a full cell via one step) is rare at tissue scales but must be handled — otherwise you over-permit exchange through thin annuli. The exponential `p_p^m` suppression is essential for myelin-like geometries (Paper II §4.2.3).
+
+## 6. Translating `p_p` ↔ `k_io` (Paper I §3.2, Eqs. 3–5)
+
+- [ ] You use Eq. 5: `⟨k_io(p)⟩ = p_p · sqrt(D_0 / (6·t_s)) · ⟨A/V⟩`. The `sqrt(D_0/(6·t_s))` factor (= `D_0/l_s`, where `l_s = sqrt(6·D_0·t_s)`) is the key. With `D_0 = 3 μm²/ms`, `t_s = 1 μs`, this is `≈ 22.4 mm/s`.
+- [ ] `⟨A/V⟩` is the **ensemble-averaged arithmetic mean of per-cell `A/V`**, NOT `⟨A⟩/⟨V⟩` and NOT the harmonic mean `⟨V/A⟩⁻¹`. (SI §S.IV, Fig. S6a — paper explicitly distinguishes these: `⟨A/V⟩ ≠ ⟨A⟩/⟨V⟩`.)
+- [ ] The `⟨A/V⟩` value you use for a given `(ρ, V)` is **interpolated from the single-cell calibration tables** (26 `α*` values, 5×10⁶ cells), not computed from the realized multi-cell `Ω_sim`. (SI §S.IV — this matters because the realized ensemble is a finite-sample fluctuation around the generating process.)
+- [ ] You are clear that your simulated `k_io` is really `k_io(p)` (passive). The active `k_io(a)` contribution is absorbed when experimental data are matched — not simulated separately. (Paper I §3.2, last paragraph.)
+- [ ] `p_p` is the same on both sides of every membrane (required for steady-state). (Paper I §4.2.)
+
+## 7. Diffusion encoding → b-space decay (Paper I §3.4, Eqs. 7–9)
+
+- [ ] You simulate **SDE (single diffusion encoding)** with the twice-refocused / Stejskal–Tanner formalism: two PFG lobes of duration `δ`, separation `Δ`, with `t_D = Δ − δ/3`. (Eq. 9.)
+- [ ] `b = (γ·G·δ)² · t_D = q² · t_D`.
+- [ ] For each walker you record the **projection of `r_0` on `G`** at the start of the first lobe, and the projection of `r` (final position) on `G` at the start of the second lobe; the phase accrual is `ϕ = γ · δ · (G · Δr)` (linearized — equivalent to integrating precession over each δ). Paper's implementation: advance phase for δ μs at each PFG based on the instantaneous projection. (Paper I §3.4.)
+- [ ] The signal for a given `b` is `S(b) = |⟨ exp(i·ϕ) ⟩|` over all walkers in all ensembles. Confirm you average the **complex** phasors and take the magnitude, not the real part of individual phases.
+- [ ] **SDE-CT** (constant time): `t_D` is held fixed, `G` (→ `q`) is incremented to sweep `b`. This is the paper's brain library. (Paper I §3.4; Paper II §2.1.)
+- [ ] You **normalize** as `S(b)/S_0` where `S_0 = S(b=0)` at the same `t_D` (= TE). Paper's model has **no T₂** — normalization absorbs it. (Paper I §3.4.)
+- [ ] Three **orthogonal PFG directions** are simulated/acquired and **trace-averaged** — this is how the DT magnitude (not anisotropy) is obtained. (Paper II §2.1.)
+- [ ] Paper uses `δ = 20 ms`, `Δ = 50 ms`, `t_D ≈ 43.3 ms` in simulations; brain experimental `Δ_ap = 36 ms`. Confirm your `δ, Δ` and whether you are comparing to the right experimental acquisition.
+
+## 8. Averaging over walkers and ensembles (Paper I §3.2)
+
+- [ ] Each library entry aggregates RWs across **many independent ensemble realizations** with the same `(k_io, ρ, V)` — paper uses **~120 ensembles × 10⁵ walkers ≈ 1.2 × 10⁷ RWs** per entry.
+- [ ] You verified empirically that reducing walker count causes artifacts (non-monotone decays, `S(b)` rising with `b`) — the paper explicitly warns this shows up before `b = 40,000 s/mm²` without sufficient averaging. Your decays should be smooth and monotone out to the `b` range you claim to support (paper claims artifact-free down to `S = 0.015·S_0`).
+- [ ] `S(b)/S_0` is computed **after** pooling all walkers, not as an average of per-ensemble `S(b)/S_0`.
+
+## 9. Library structure and coverage (Paper I §3.3, Paper II §3.1)
+
+- [ ] Each library entry is labeled with its exact `(k_io, ρ, V)` triple (plus `v_i = ρV` as a derived label).
+- [ ] `v_i` is **not** an independent variable — it is a function of `ρ·V`. (Paper II §3.2 explicitly warns against treating `v_i` as a free parameter.)
+- [ ] Library spans realistic biological ranges. Paper II current library sizes: `V ∈ [0.01, 206]` pL (949 values), `ρ ∈ [4.4×10³, 58×10⁶]` cells/μL (186 values), `k_io ∈ [0, 130]` s⁻¹ (65 values), `v_i ∈ [0.5, 0.994]` (20 values) → ~14,000 entries on ~1,300 `ρ·V` hyperbolae. Your library does not have to match these exactly, but (a) the `v_i ≤ 0.994` cap and (b) the discrete `v_i` hyperbola structure should be understood.
+- [ ] Library entries with `v_i > 0.95` are excluded or flagged (paper's matching uses `v_i ≤ 0.95` as a constraint). (Paper II §3.3.)
+- [ ] No entries with `ρ = V = 0` (pure water) except as a boundary case — `k_io` is **undefined** for pure water, not zero or infinity. (Paper II Fig. 2 caption.)
+- [ ] The library captures 400 `b` values out to at least `b_max = 4,000–5,000 s/mm²` for matching 3 T clinical data, more if you want to exploit the large-`b` regime. (Paper I §3.4; Paper II §3.1.)
+
+## 10. Noiseless displacement (`d_rms`) library (Paper I §3.3, Paper II §4.4.9)
+
+- [ ] You maintain (or can regenerate) the `d_rms` time-course library **separately** from the SDE decay library. The displacement library is **acquisition-agnostic**; the SDE decay library is derived from it by applying the encoding scheme. This is how the paper retrospectively simulates OGSE, CG, etc., from one underlying RW library.
+- [ ] Your displacement records are stored per-walker (or as sufficient statistics) so that different `(δ, Δ, G_x, G_y, G_z, pulse shape)` can be applied after the fact.
+
+## 11. Forward-model sanity checks (Paper I §3.3–§3.4, Figs. 3–4)
+
+Run these as unit tests on your simulator:
+
+- [ ] **Pure water** (`ρ = 0`, `V = 0`, `k_io` undefined, no cells): decay is **linear in the semi-log plot** with slope `−D_0 = −3×10⁻³ mm²/s`. This is your Gaussian reference. (Paper I Fig. 4, `kio = ∞` line.)
+- [ ] **No-exchange limit** (`p_p = 0`): separate `H₂O_in` and `H₂O_out` `d_rms(t)` curves as in Paper I Fig. 3a:
+  - [ ] `D_out(t_RW)` drops from `D_0` to a finite `D_WM > 0` **within ns** (very fast mixing in interstitium due to large `A/V`).
+  - [ ] `D_in(t_RW)` drops from `D_0` to **zero** over ~20 ms for `V ~ 1 pL` (well-mixed condition, `t_RW > V^(2/3)/(17·D_0)`, SI Eq. 6).
+- [ ] **Increasing `k_io` at fixed `(ρ, V)`**: diffusivity (apparent slope) **increases**. (Paper I Fig. 4a; Paper II Fig. 2a,d.)
+- [ ] **Increasing `ρ` at fixed `(k_io, V)`**: diffusivity **decreases**. (Paper I Fig. 4b; Paper II Fig. 2b,e.)
+- [ ] **Increasing `V` at fixed `(k_io, ρ)`**: diffusivity **decreases**. (Paper I Fig. 4c; Paper II Fig. 2c,f.)
+- [ ] Limiting behavior as `ρ → 0`, `V → 0`: `D_ap → D_0`, `K_ap → 0` (Gaussian). (Paper II Fig. 2e,f,h,i.)
+- [ ] Kurtosis `K_ap` rises meaningfully (`> 0.8`) **only for `k_io < 30 s⁻¹`**. (Paper II Fig. 2g.) Use this as a kurtosis-regime sanity check.
+- [ ] **Match against Paper I Fig. 4 data** (awake human cerebral cortex, Clark & Le Bihan 2000): `k_io = 12 s⁻¹`, `ρ = 180,000 cells/μL`, `V = 5.0 pL` should match the experimental points. This is the single most important end-to-end validation.
+- [ ] **Match against Paper II Fig. 3 data** (murine colorectal, human prostate lesion/NA, human brain GM, human bladder): confirm your library contains entries within ~1% of the Table 1 values and those entries visually fit the experimental points.
+
+## 12. Inverse problem / library matching (Paper II §3.3–§3.4, SI §S.I)
+
+- [ ] Matching is **non-iterative brute-force**: for each voxel, compute some distance (paper uses least-squares on `S(b)/S_0` values) between the voxel decay and **every** library entry, pick the minimum. No gradient descent. (Paper II §3.4, SI §S.I.)
+- [ ] Voxels identified as essentially acellular (ventricles, sulci, Virchow–Robin) are **excluded from matching** — they are assigned NaN/black, not forced into the library. Paper II uses the T₂-w image for this mask. (Paper II §3.3.)
+- [ ] The matching constraint `v_i ≤ 0.95` is applied. (Paper II §3.3.)
+- [ ] You treat returned parameter distributions as **discontinuous** (histograms, not Gaussians): report **median** values and **FWHM** spans rather than mean ± SD. (Paper II §3.4.)
+- [ ] You ran the **precision self-test** described in Paper II §3.4 and Fig. 5c: pick a library entry representative of cGM (e.g., `ρ=1.3e5, V=6.0 pL, kio=6.6`) and WM (`ρ=6.9e5, V=0.9 pL, kio=22`), add `S/N = 50` Gaussian noise 50,000 times, re-match, and confirm:
+  - [ ] The returned-median is close to the input (minimal systematic bias).
+  - [ ] The WM test histogram is narrower than the cGM test histogram (library is denser at small `V`).
+  - [ ] Neither test histogram is wider than the real experimental histogram for the same tissue.
+
+## 13. Post-processing and derived maps (Paper II §3.3, §4.1)
+
+- [ ] `[H₂O_i] = 42 M = 0.042 nmol/pL` is used when computing the metabolic activity product `[H₂O_i] · V · k_io` (nmol H₂O_i / s / cell). (Paper II §4.1.)
+- [ ] `⟨[H₂O_i]·V·k_io⟩ ≠ [H₂O_i]·⟨V⟩·⟨k_io⟩` — the voxel-wise product must be computed **per pixel** before ROI averaging, not from ROI-averaged parameters. (Paper II Table 2 footnote c.)
+- [ ] You ignore the passive contribution `k_io(p)` when interpreting `k_io` as `x·cMR_NKA / ([H₂O_i]·V)` — paper shows passive is only ~0.2–0.3 s⁻¹, negligible vs. metabolic values (Paper II §4.1).
+- [ ] Parametric maps are reported at the correct effective in-plane resolution given zero-fill and any smoothing (paper: bi-cubic interpolation 1:4, Hamming filter for the activity map; effective `(1.60 mm)²`).
+
+## 14. Things that are NOT in the model (watch for accidental inclusions)
+
+- [ ] **No T₁, T₂ relaxation** — normalized out by `S(b)/S_0` at fixed TE. (Paper I §3.4.)
+- [ ] **No anisotropy** — decays are trace-averaged; MADI parameters are by construction isotropic. If your library is direction-dependent, something is wrong. (Paper I §3.1 attribute 2; Paper II §4.3.)
+- [ ] **No cell morphology beyond contracted Voronoi** — no explicit dendrites, axons, myelin wraps. Dendritic averaging is handled by the "well-mixed" claim, not by modeling neurites. (Paper II §4.2.1.)
+- [ ] **No vasculature / IVIM** — small-`b` flow effects are assumed negligible or excluded from fitting. (Paper I §3.1 attribute 1; Paper II §4.4.11.)
+- [ ] **No distinct intra- vs. extracellular `D`** — single `D_0` everywhere. Any "tortuosity" emerges from geometry, not from a reduced `D`. (Paper I §4.2.)
+- [ ] **No empirical bi-exponential or Kärger–Andrasko fitting** — MADI rejects these. If you are fitting bi-exponentials and calling it MADI, it isn't MADI. (Paper I §4.2, SI §S.VII; Paper II §3.1.)
+- [ ] **No shutter-speed analysis or CA pharmacokinetics** in the MADI pipeline itself. (Paper I §1.3.)
+
+## 15. Numerical hygiene
+
+- [ ] Random number generator is seedable and seeds are logged so results are reproducible.
+- [ ] Per-library-entry wall-clock cost is roughly consistent with paper's **~15 CPU-hours per entry** at 330k–375k steps/sec/core (for `1.2 × 10⁷` walkers × 80,000 steps). Orders-of-magnitude faster suggests you are doing fewer walks than you think.
+- [ ] Parallelism is across (a) batches of walkers within an ensemble, (b) independent ensembles per entry, and (c) independent library entries. Check you are not accidentally sharing RNG state across parallel workers.
+- [ ] Walker state is stored in contiguous arrays (Numpy/vectorized), not as per-walker Python objects. (Paper I §2 explicitly calls out the batching-for-C-speed design.)
+- [ ] Units are consistent throughout: `μm`, `ms`, `pL = 10³ μm³`, `cells/μL`, `s⁻¹`. Paper sometimes writes `ms/μm²` for `b`; confirm `1 ms/μm² = 1000 s/mm²`.
+
+---
+
+## Suggested order of verification
+
+1. Geometry (§1–2) — unit test: for a given `(ρ, V)`, realized `v_i` matches target within a few percent.
+2. RW mechanics (§4–5) — unit test: with `p_p = 0`, walkers never cross membranes; with `p_p = 1`, membranes are invisible and `d_rms → sqrt(6·D_0·t)`.
+3. `k_io` calibration (§6) — unit test: measured `d_rms` vs. `t` in ensembles matches Paper I Fig. 3c/e curve family.
+4. SDE decay (§7–8) — unit test: pure-water decay is exponential with slope `−D_0`.
+5. Forward sanity (§11) — reproduce Paper I Fig. 4 cortex match.
+6. Inverse (§12) — precision self-test before trusting any real data.
+
+If steps 1–5 pass, you can trust the forward model. Step 6 determines whether your library is dense enough for the parameter ranges you care about.

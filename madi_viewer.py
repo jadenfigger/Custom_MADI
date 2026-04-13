@@ -390,29 +390,45 @@ def main():
                 continue
             op = om['pred'][di * n_b : (di + 1) * n_b]
             ax_signal.plot(BVALS_DISPLAY, op, "o-",
-                           color=COLORS[j % len(COLORS)],
-                           ms=3, lw=0.8, alpha=0.20, zorder=2)
+                        color=COLORS[j % len(COLORS)],
+                        ms=3, lw=0.8, alpha=0.20, zorder=2)
 
         # Observed
         ax_signal.scatter(BVALS_DISPLAY, obs, c=OBS_COLOR, s=80, zorder=6,
-                          label="Observed", edgecolors="white", linewidths=1.0)
+                        label="Observed", edgecolors="white", linewidths=1.0)
 
         # Selected match (on top)
         c = COLORS[st.mi % len(COLORS)]
         ax_signal.plot(BVALS_DISPLAY, pred, "o-", color=c, ms=10, lw=2.5,
-                       alpha=0.9, zorder=5,
-                       label=f"#{m['rank']}  kio={m['kio']:.0f}  "
-                             f"ρ={m['rho']/1e3:.0f}k  V={m['V']:.2f}")
+                    alpha=0.9, zorder=5,
+                    label=f"#{m['rank']}  kio={m['kio']:.0f}  "
+                                f"ρ={m['rho']/1e3:.0f}k  V={m['V']:.2f}")
 
-        # Title with fitted values
+        # --- Title: LIVE #1 match (always agrees with table row 1) ---
+        top = st.matches[0]
+        live_line = (f"Live #1: kio={top['kio']:.1f}  "
+                    f"ρ={top['rho']/1e3:.0f}k  V={top['V']:.2f}  "
+                    f"SSE={top['residual']:.4f}")
+
+        # --- Subtitle: what the saved disk maps say for this voxel ---
         kv = get_map_val("kio", vx, vy)
         rv = get_map_val("rho", vx, vy)
         vv = get_map_val("V", vx, vy)
+        disk_line = (f"From maps/: kio={kv:.1f}  "
+                    f"ρ={rv/1e3:.0f}k  V={vv:.2f}")
+
+        # Flag disagreement visually
+        disagree = (abs(top['kio'] - kv) > 0.5 or
+                    abs(top['rho'] - rv) / max(rv, 1) > 0.05 or
+                    abs(top['V']   - vv) > 0.05)
+        if disagree:
+            disk_line += "   ⚠ differs from live fit"
+
         ax_signal.set_title(
             f"Voxel ({vx},{vy})    Δ = {delta_ms:.0f} ms    "
             f"[←/→ Δ   ↑/↓ match]\n"
-            f"Best fit: kio={kv:.1f}  ρ={rv/1e3:.0f}k  V={vv:.2f}",
-            fontsize=10)
+            f"{live_line}\n{disk_line}",
+            fontsize=9)
         ax_signal.set_xlabel("b-value  (s/mm²)")
         ax_signal.set_ylabel("S(b) / S₀")
         ax_signal.legend(loc="upper right", frameon=True, fontsize=7)
@@ -508,9 +524,9 @@ def main():
         sig_sum = np.sum(sig)
 
         print(f"  Click ({event.xdata:.1f}, {event.ydata:.1f}) mm "
-              f"→ voxel ({vx},{vy})  "
-              f"mask={in_mask}  sig_sum={sig_sum:.3f}  "
-              f"kio={kv:.1f}  rho={rv/1e3:.0f}k  V={vv:.2f}")
+            f"→ voxel ({vx},{vy})")
+        print(f"    in_mask={in_mask}  sig_sum={sig_sum:.3f}")
+        print(f"    Disk maps: kio={kv:.1f}  rho={rv/1e3:.0f}k  V={vv:.2f}")
 
         if not in_mask:
             return
@@ -520,6 +536,14 @@ def main():
         px, py = vx_to_disp(vx, vy)
         crosshair_artist[0].set_data([px], [py])
         update_voxel(vx, vy)
+
+        # After update_voxel, st.matches exists — print the live #1
+        # for side-by-side comparison in the console.
+        if st.matches:
+            top = st.matches[0]
+            print(f"    Live #1:   kio={top['kio']:.1f}  "
+                f"rho={top['rho']/1e3:.0f}k  V={top['V']:.2f}  "
+                f"SSE={top['residual']:.6f}")
 
     def on_key(event):
         key = event.key or ''
