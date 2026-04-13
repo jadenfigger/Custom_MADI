@@ -495,6 +495,117 @@ def run_simulation(
     )
 
 
+# ===================================================================
+#  MULTI-KIO API  (ensemble reuse — OPTIMIZATION)
+# ===================================================================
+
+def run_simulation_multi_kio(
+    rho: float, V: float, kios: list,
+    cfg: SimConfig | None = None,
+    seed: int = 0,
+    verbose: bool = True,
+) -> dict:
+    """Build geometry once, then run walks for every kio in `kios`.
+
+    The Voronoi ensemble geometry depends only on (rho, V). kio enters
+    solely via the membrane-crossing probability `pp` in the walk kernel.
+    So for a fixed (rho, V) we can build the 3 × n_ensembles ensembles
+    ONCE and reuse each one for every kio value, saving
+    (n_kios - 1) / n_kios of the scipy Voronoi / HalfspaceIntersection /
+    cKDTree work.  For the dense preset with 16 kio values this is a
+    ~16× reduction on the CPU ensemble-build cost, which dominates at
+    high ρ.
+
+    Statistical equivalence
+    -----------------------
+    Geometry seeds depend on (rho, V, ax, ei) only — same RNG stream as
+    run_simulation when called with seed = hash((rho, V)).
+    Walker RNG seeds depend on (kio, ax, ei) so different kios on the
+    same ensemble draw independent random walks.  Results are
+    statistically identical to building 16 independent entries back to
+    back; only the specific Monte Carlo samples differ (as they always
+    do between MC runs with different seeds).
+
+    Parameters
+    ----------
+    rho, V : geometry parameters
+    kios   : iterable of permeability values to sweep
+    cfg    : SimConfig
+    seed   : base integer; geometry RNG derived from this + (ax, ei).
+
+    Returns
+    -------
+    dict[float, WalkResult]
+        Maps each kio → its WalkResult (same format as run_simulation).
+    """
+    if cfg is None:
+        cfg = SimConfig()
+
+    kios = list(kios)
+
+    # ---- Walker-count warning (Fix #5) ----
+    total_walks = 3 * cfg.n_ensembles * cfg.n_walkers
+    if total_walks < PAPER_WALKS_PER_ENTRY // 10:
+        sys.stderr.write(
+            f"    ⚠ Only {total_walks:,} walks per library entry "
+            f"(paper target ~{PAPER_WALKS_PER_ENTRY:,}). "
+            f"High-b decays will be noisy.\n")
+
+    # Per-kio accumulators, one list-of-3-lists per kio
+    dM_per_axis_per_kio = {k: [[], [], []] for k in kios}
+    n_escaped_per_kio   = {k: 0 for k in kios}
+
+    # Outer loops: axes × ensembles.  Geometry is built here, walks run
+    # for every kio inside the inner loop before the ensemble is freed.
+    for ax in range(3):
+        for ei in range(cfg.n_ensembles):
+            ens_seed = (seed + ax * 10_000_000 + ei * 1000) & 0x7FFFFFFF
+
+            if verbose:
+                print(f"  Axis {['x','y','z'][ax]}  "
+                      f"Ensemble {ei+1}/{cfg.n_ensembles}  "
+                      f"(rho={rho:.0f}, V={V:.2f})  "
+                      f"building once, sweeping {len(kios)} kio values")
+
+            if rho <= 0 or V <= 0:
+                ens = create_dummy_ensemble(cfg)
+            else:
+                ens = create_ensemble(rho, V, cfg,
+                                      seed=ens_seed, verbose=False)
+
+            # Sweep kios on this single ensemble
+            for kio in kios:
+                # Walker RNG differs per kio so we don't get correlated
+                # random walks across the kio sweep.
+                kio_tag = int(round(kio * 1000))
+                walk_seed = (ens_seed
+                             + 1
+                             + (kio_tag * 7919) % 1_000_003) & 0x7FFFFFFF
+
+                dM, n_esc = _run_walks_single(
+                    ens, kio, cfg, walk_seed, verbose=False)
+
+                dM_per_axis_per_kio[kio][ax].append(dM[:, :, ax].copy())
+                n_escaped_per_kio[kio] += n_esc
+
+            # `ens` goes out of scope at next iteration → freed
+
+    # Build WalkResult per kio
+    results: dict = {}
+    for kio in kios:
+        merged = [np.concatenate(chunks, axis=0)
+                  for chunks in dM_per_axis_per_kio[kio]]
+        n_per_axis = tuple(arr.shape[0] for arr in merged)
+        results[kio] = WalkResult(
+            dM_per_axis=merged,
+            n_walkers_per_axis=n_per_axis,
+            deltas=list(cfg.Deltas),
+            n_escaped=n_escaped_per_kio[kio],
+        )
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Backwards-compat shim: run_walks for a single ensemble (used by tests?)
 # ---------------------------------------------------------------------------

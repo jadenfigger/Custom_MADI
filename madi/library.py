@@ -18,8 +18,10 @@ import time
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
+from collections import defaultdict
+
 from .config     import SimConfig, BVALS_UNIQUE, DELTAS_BIG
-from .walker_gpu import run_simulation
+from .walker_gpu import run_simulation, run_simulation_multi_kio
 from .signal     import compute_signals, signals_to_flat
 
 
@@ -103,20 +105,62 @@ def build_library_from_triplets(
         return library
 
     t0 = time.time()
-    for idx, (kio, rho, V) in enumerate(new_triplets):
+
+    # -----------------------------------------------------------------
+    # Group triplets by (rho, V).  Ensemble geometry depends ONLY on
+    # (rho, V); kio only affects the membrane-crossing probability in
+    # the walk kernel.  So we build each ensemble once and sweep all
+    # kios for that (rho, V) on it — ~N_kios× speedup on the CPU
+    # scipy Voronoi / HalfspaceIntersection cost, which dominates at
+    # high ρ.
+    # -----------------------------------------------------------------
+    groups: dict = defaultdict(list)
+    for kio, rho, V in new_triplets:
+        groups[(rho, V)].append(kio)
+
+    if verbose:
+        print(f"  Grouped into {len(groups)} unique (ρ,V) pairs "
+              f"(ensembles reused across kio values)")
+
+    # Process groups in order of increasing cost proxy so a shard makes
+    # progress on cheap entries first — makes checkpointing useful.
+    sorted_groups = sorted(groups.items(), key=lambda kv: kv[0][0] * kv[0][1])
+
+    entry_idx = 0
+    for (rho, V), kios_for_group in sorted_groups:
+        kios_for_group = sorted(kios_for_group)
+
         if verbose:
-            print(f"  [{idx+1}/{len(new_triplets)}] kio={kio}, "
-                  f"rho={rho/1e3:.0f}k, V={V:.2f}  ...", end="", flush=True)
+            print(f"  [(ρ,V)=({rho/1e3:.0f}k, {V:.2f})] "
+                  f"{len(kios_for_group)} kio values "
+                  f"→ {[f'{k:g}' for k in kios_for_group]}",
+                  flush=True)
 
         tt = time.time()
-        seed = int(abs(hash((kio, rho, V)))) % (2**31)
-        wr = run_simulation(rho, V, kio, cfg, seed=seed, verbose=False)
-        res = compute_signals(wr, cfg)
-        vec = signals_to_flat(res)
-        library.append(LibraryEntry(kio=kio, rho=rho, V=V, vector=vec))
+        geom_seed = int(abs(hash((round(rho, 1), round(V, 6))))) % (2**31)
 
+        results = run_simulation_multi_kio(
+            rho, V, kios_for_group, cfg,
+            seed=geom_seed, verbose=False,
+        )
+
+        for kio in kios_for_group:
+            res = compute_signals(results[kio], cfg)
+            vec = signals_to_flat(res)
+            library.append(LibraryEntry(kio=kio, rho=rho, V=V, vector=vec))
+            entry_idx += 1
+
+        dt = time.time() - tt
         if verbose:
-            print(f"  {time.time()-tt:.1f}s")
+            print(f"    → {len(kios_for_group)} entries in {dt:.1f}s "
+                  f"({dt/len(kios_for_group):.1f}s/entry)  "
+                  f"[{entry_idx}/{len(new_triplets)} done]",
+                  flush=True)
+
+        # Checkpoint after every (rho, V) group — cheap insurance
+        # against SLURM preemption / walltime kills.
+        if save_path:
+            _save_library(library, save_path)
 
     elapsed = time.time() - t0
     if verbose:

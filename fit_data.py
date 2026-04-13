@@ -98,7 +98,9 @@ PRESETS = {
                 2_000_000, 3_000_000],
         "Vs":   [0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5,
                 3.0, 4.0, 5.0, 7.0, 9.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=50_000,
+        # n_ensembles = 40 → 3 × 40 × 100k = 12 M walks/entry,
+        # matching the paper's stated statistical target (SI §2).
+        "cfg":  dict(n_walkers=100_000, n_ensembles=40, n_steps=50_000,
                      L=250.0, buffer=60.0, grid_spacing=1.0),
     },
 }
@@ -269,6 +271,14 @@ FITTING EXAMPLES:
     ap.add_argument("--triplets", type=str, nargs="+",
                     help="Exact 'kio,rho,V' triplets (e.g. 12,1500000,0.5)")
 
+    # -- Parallel sharding (SLURM job array) --
+    ap.add_argument("--shard-id", type=int, default=None,
+                    help="Shard index for parallel builds, 0-based. "
+                         "Triplets are split across shards by (ρ,V) "
+                         "pairs, load-balanced by ρ·V.")
+    ap.add_argument("--n-shards", type=int, default=None,
+                    help="Total number of shards. Required if --shard-id set.")
+
     # -- Fitting --
     ap.add_argument("--input", type=str, nargs="+",
                     help="'delta:path' pairs (e.g. 15:dwi15.nii.gz)")
@@ -362,6 +372,49 @@ FITTING EXAMPLES:
         print(f"  kio ({len(kios)}): {kios}")
         print(f"  rho ({len(rhos)}): {[f'{r/1e3:.0f}k' for r in rhos]}")
         print(f"  V   ({len(Vs)}):   {Vs}")
+
+        # ---- Optional sharding for SLURM job arrays ----
+        if args.shard_id is not None:
+            if args.n_shards is None or args.n_shards < 1:
+                print("ERROR: --shard-id requires --n-shards >= 1")
+                return
+            if not (0 <= args.shard_id < args.n_shards):
+                print(f"ERROR: --shard-id must be in [0, {args.n_shards})")
+                return
+
+            # Build full triplet list, filter by vi, slice by (ρ,V) pair.
+            all_triplets = [(k, r, v) for k in kios for r in rhos for v in Vs]
+            valid = [(k, r, v) for k, r, v in all_triplets
+                     if (r / 1e9) * (v * 1e3) <= 0.95]
+
+            # Unique (ρ,V) pairs, sorted by cost proxy (ρ·V), round-robin
+            # across shards so each shard gets a mix of cheap + expensive.
+            pairs = sorted(set((r, v) for _, r, v in valid),
+                           key=lambda p: p[0] * p[1])
+            my_pairs = set(pairs[i] for i in range(len(pairs))
+                           if i % args.n_shards == args.shard_id)
+            shard_triplets = [(k, r, v) for (k, r, v) in valid
+                              if (r, v) in my_pairs]
+
+            print(f"\n  Sharding: shard {args.shard_id}/{args.n_shards}")
+            print(f"    (ρ,V) pairs in shard : {len(my_pairs)}/{len(pairs)}")
+            print(f"    triplets in shard    : {len(shard_triplets)}/{len(valid)}")
+
+            # Tag the output file with shard id unless user explicitly
+            # supplied a per-shard path already.
+            save_path = args.library
+            if "{shard" not in save_path and "shard" not in os.path.basename(save_path):
+                root, ext = os.path.splitext(save_path)
+                save_path = f"{root}.shard{args.shard_id:03d}{ext}"
+            else:
+                save_path = save_path.format(shard=args.shard_id,
+                                             n_shards=args.n_shards)
+            print(f"    output               : {save_path}")
+
+            build_library_from_triplets(
+                shard_triplets, cfg=cfg, save_path=save_path,
+                existing_library=existing)
+            return
 
         build_library(
             kios=kios, rhos=rhos, Vs=Vs, cfg=cfg,
