@@ -12,6 +12,7 @@ Answers:
 Usage:
     python analyze_library.py --library madi_library.npz
     python analyze_library.py --library madi_library.npz --output analysis/
+    python analyze_library.py --library madi_dense.npz --output analysis_dense/
 """
 
 import argparse, os, sys
@@ -22,7 +23,8 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D
 
-sys.path.insert(0, os.path.dirname(__file__))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(current_dir))
 from madi.library import load_library, load_library_meta, library_summary
 
 
@@ -454,23 +456,23 @@ def main():
     print(f"\nSignal matrix shape: {vectors.shape}")
     print(f"  (rows = parameter sets, columns = signal measurements)")
 
-    # # 1. PCA
-    # print("\n" + "─" * 40)
-    # print("1. PRINCIPAL COMPONENT ANALYSIS")
-    # print("─" * 40)
-    # mean, S, Vt, n99 = analyze_pca(vectors, args.output)
+    # 1. PCA
+    print("\n" + "─" * 40)
+    print("1. PRINCIPAL COMPONENT ANALYSIS")
+    print("─" * 40)
+    mean, S, Vt, n99 = analyze_pca(vectors, args.output)
 
-    # # 2. Smoothness
-    # print("\n" + "─" * 40)
-    # print("2. SMOOTHNESS ALONG PARAMETER AXES")
-    # print("─" * 40)
-    # analyze_smoothness(kios, rhos, Vs, vectors, args.output)
+    # 2. Smoothness
+    print("\n" + "─" * 40)
+    print("2. SMOOTHNESS ALONG PARAMETER AXES")
+    print("─" * 40)
+    analyze_smoothness(kios, rhos, Vs, vectors, args.output)
 
-    # # 3. Correlation
-    # print("\n" + "─" * 40)
-    # print("3. SIGNAL COMPONENT CORRELATIONS")
-    # print("─" * 40)
-    # analyze_correlations(vectors, args.output, meta)
+    # 3. Correlation
+    print("\n" + "─" * 40)
+    print("3. SIGNAL COMPONENT CORRELATIONS")
+    print("─" * 40)
+    analyze_correlations(vectors, args.output, meta)
 
     # 4. PCA landscape
     print("\n" + "─" * 40)
@@ -478,49 +480,49 @@ def main():
     print("─" * 40)
     analyze_signal_landscape(kios, rhos, Vs, vectors, args.output)
 
-    # # 5. Interpolation test
-    # print("\n" + "─" * 40)
-    # print("5. LEAVE-ONE-OUT INTERPOLATION TEST")
-    # print("─" * 40)
-    # interp_results = analyze_interpolation(kios, rhos, Vs, vectors, args.output)
+    # 5. Interpolation test
+    print("\n" + "─" * 40)
+    print("5. LEAVE-ONE-OUT INTERPOLATION TEST")
+    print("─" * 40)
+    interp_results = analyze_interpolation(kios, rhos, Vs, vectors, args.output)
 
-    # # 6. Surrogate model
-    # print("\n" + "─" * 40)
-    # print("6. CONTINUOUS SURROGATE MODEL")
-    # print("─" * 40)
-    # analyze_surrogate_potential(kios, rhos, Vs, vectors, args.output)
+    # 6. Surrogate model
+    print("\n" + "─" * 40)
+    print("6. CONTINUOUS SURROGATE MODEL")
+    print("─" * 40)
+    analyze_surrogate_potential(kios, rhos, Vs, vectors, args.output)
 
-    # # Summary
-    # print("\n" + "=" * 60)
-    # print("SUMMARY")
-    # print("=" * 60)
-    # print(f"  PCA: {n99} components explain 99% of variance (out of {vectors.shape[1]})")
-    # if n99 <= 4:
-    #     print(f"  → STRONG structure: signals live in a {n99}D subspace")
-    #     print(f"    A continuous surrogate should work very well.")
-    # elif n99 <= 8:
-    #     print(f"  → MODERATE structure: {n99}D effective dimensionality")
-    #     print(f"    Surrogate modeling feasible with enough training points.")
-    # else:
-    #     print(f"  → WEAK structure: high effective dimensionality")
+    # Summary
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"  PCA: {n99} components explain 99% of variance (out of {vectors.shape[1]})")
+    if n99 <= 4:
+        print(f"  → STRONG structure: signals live in a {n99}D subspace")
+        print(f"    A continuous surrogate should work very well.")
+    elif n99 <= 8:
+        print(f"  → MODERATE structure: {n99}D effective dimensionality")
+        print(f"    Surrogate modeling feasible with enough training points.")
+    else:
+        print(f"  → WEAK structure: high effective dimensionality")
 
-    # if interp_results:
-    #     imp = interp_results["improvement"]
-    #     if imp > 3:
-    #         print(f"  Interpolation: RBF is {imp:.1f}× better than nearest-neighbor")
-    #         print(f"    → Continuous surrogate would significantly improve fitting")
-    #     elif imp > 1.5:
-    #         print(f"  Interpolation: RBF is {imp:.1f}× better than nearest-neighbor")
-    #         print(f"    → Surrogate would help, especially in sparse regions")
-    #     else:
-    #         print(f"  Interpolation: only {imp:.1f}× improvement over NN")
-    #         print(f"    → Library is already dense enough, or signals are very flat")
+    if interp_results:
+        imp = interp_results["improvement"]
+        if imp > 3:
+            print(f"  Interpolation: RBF is {imp:.1f}× better than nearest-neighbor")
+            print(f"    → Continuous surrogate would significantly improve fitting")
+        elif imp > 1.5:
+            print(f"  Interpolation: RBF is {imp:.1f}× better than nearest-neighbor")
+            print(f"    → Surrogate would help, especially in sparse regions")
+        else:
+            print(f"  Interpolation: only {imp:.1f}× improvement over NN")
+            print(f"    → Library is already dense enough, or signals are very flat")
 
-    # print(f"\n  All plots saved to {args.output}/")
-    # print(f"\n  Next steps if structure is good:")
-    # print(f"    1. Replace NN matching with RBF interpolation for continuous fits")
-    # print(f"    2. Or train a small neural network: (kio,ρ,V) → signal vector")
-    # print(f"    3. Then use scipy.optimize.minimize to find best (kio,ρ,V) per voxel")
+    print(f"\n  All plots saved to {args.output}/")
+    print(f"\n  Next steps if structure is good:")
+    print(f"    1. Replace NN matching with RBF interpolation for continuous fits")
+    print(f"    2. Or train a small neural network: (kio,ρ,V) → signal vector")
+    print(f"    3. Then use scipy.optimize.minimize to find best (kio,ρ,V) per voxel")
 
 
 if __name__ == "__main__":

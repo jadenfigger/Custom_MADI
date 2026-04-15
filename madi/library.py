@@ -286,46 +286,116 @@ def _subset_vectors(lib_mat: np.ndarray, delta_indices: list[int],
     return np.hstack(cols)
 
 
+# def match_voxels_batch(
+#     measured_batch: np.ndarray,
+#     library: list[LibraryEntry],
+#     fit_deltas: list[float] | None = None,
+#     lib_deltas: list[float] | None = None,
+#     n_b: int = 4,
+# ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+#     """Vectorised nearest-neighbour matching.
+
+#     Parameters
+#     ----------
+#     measured_batch : (n_voxels, n_fit_deltas * n_b)
+#     library : list of LibraryEntry
+#     fit_deltas : Δ values [ms] present in data.  None = use all.
+#     lib_deltas : all Δ values in library.  None = DELTAS_BIG.
+#     n_b : b-values per Δ (default 4).
+
+#     Returns
+#     -------
+#     kio_map, rho_map, V_map, residual_map : each (n_voxels,)
+#     """
+#     if lib_deltas is None:
+#         lib_deltas = list(DELTAS_BIG)
+
+#     full_mat = np.array([e.vector for e in library])  # (n_lib, full_len)
+
+#     if fit_deltas is not None:
+#         di_idx = _delta_indices(fit_deltas, lib_deltas)
+#         lib_mat = _subset_vectors(full_mat, di_idx, n_b)
+#     else:
+#         lib_mat = full_mat
+
+#     kios = np.array([e.kio for e in library])
+#     rhos = np.array([e.rho for e in library])
+#     Vs   = np.array([e.V for e in library])
+
+#     m2 = np.sum(measured_batch ** 2, axis=1, keepdims=True)
+#     l2 = np.sum(lib_mat ** 2, axis=1, keepdims=True).T
+#     dists = m2 + l2 - 2.0 * measured_batch @ lib_mat.T
+
+#     best_idx = np.argmin(dists, axis=1)
+#     return kios[best_idx], rhos[best_idx], Vs[best_idx], \
+#            dists[np.arange(len(best_idx)), best_idx]
+
+
 def match_voxels_batch(
     measured_batch: np.ndarray,
     library: list[LibraryEntry],
     fit_deltas: list[float] | None = None,
     lib_deltas: list[float] | None = None,
     n_b: int = 4,
+    log_space: bool = True,
+    s_floor: float = 1e-3,
+    vi_min: float = 0.050,     # exclude near-acellular entries; paper uses 0.5
+    vi_max: float = 0.95,     # hard cap already applied at build time, but explicit here
+    rho_max: float | None = None,  # optional: cap library rho (e.g. 1_500_000 for brain)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorised nearest-neighbour matching.
+    """Log-space nearest-neighbour matching with optional vi and rho filters.
 
-    Parameters
-    ----------
-    measured_batch : (n_voxels, n_fit_deltas * n_b)
-    library : list of LibraryEntry
-    fit_deltas : Δ values [ms] present in data.  None = use all.
-    lib_deltas : all Δ values in library.  None = DELTAS_BIG.
-    n_b : b-values per Δ (default 4).
-
-    Returns
-    -------
-    kio_map, rho_map, V_map, residual_map : each (n_voxels,)
+    vi_min=0.50 matches the paper's stated library constraint (MADI II §4.4.1).
+    rho_max can be set to restrict the search to biologically plausible values
+    for the tissue of interest without rebuilding the library.
     """
     if lib_deltas is None:
         lib_deltas = list(DELTAS_BIG)
 
-    full_mat = np.array([e.vector for e in library])  # (n_lib, full_len)
+    # ── 1.  Build candidate mask ────────────────────────────────────────────
+    vis  = np.array([(e.rho / 1e9) * (e.V * 1e3) for e in library])
+    rhos = np.array([e.rho for e in library])
+
+    mask = (vis >= vi_min) & (vis <= vi_max)
+    if rho_max is not None:
+        mask &= (rhos <= rho_max)
+
+    n_candidates = int(mask.sum())
+    if n_candidates == 0:
+        raise ValueError(
+            f"No library entries survive vi in [{vi_min}, {vi_max}] "
+            f"and rho <= {rho_max}.  Relax the constraints.")
+    if n_candidates < 50:
+        import warnings
+        warnings.warn(f"Only {n_candidates} library entries pass the filter.")
+
+    # ── 2.  Build masked arrays ─────────────────────────────────────────────
+    lib_entries = [e for e, m in zip(library, mask) if m]
+    full_mat    = np.array([e.vector for e in lib_entries])
 
     if fit_deltas is not None:
-        di_idx = _delta_indices(fit_deltas, lib_deltas)
+        di_idx  = _delta_indices(fit_deltas, lib_deltas)
         lib_mat = _subset_vectors(full_mat, di_idx, n_b)
     else:
         lib_mat = full_mat
 
-    kios = np.array([e.kio for e in library])
-    rhos = np.array([e.rho for e in library])
-    Vs   = np.array([e.V for e in library])
+    kios_arr = np.array([e.kio for e in lib_entries])
+    rhos_arr = np.array([e.rho for e in lib_entries])
+    Vs_arr   = np.array([e.V   for e in lib_entries])
 
-    m2 = np.sum(measured_batch ** 2, axis=1, keepdims=True)
-    l2 = np.sum(lib_mat ** 2, axis=1, keepdims=True).T
-    dists = m2 + l2 - 2.0 * measured_batch @ lib_mat.T
+    # ── 3.  Transform signals ───────────────────────────────────────────────
+    if log_space:
+        measured = np.log(np.clip(measured_batch, s_floor, 1.0))
+        lib_m    = np.log(np.clip(lib_mat,         s_floor, 1.0))
+    else:
+        measured = measured_batch
+        lib_m    = lib_mat
+
+    # ── 4.  Vectorised L2 ───────────────────────────────────────────────────
+    m2 = np.sum(measured ** 2, axis=1, keepdims=True)
+    l2 = np.sum(lib_m   ** 2, axis=1, keepdims=True).T
+    dists = m2 + l2 - 2.0 * measured @ lib_m.T
 
     best_idx = np.argmin(dists, axis=1)
-    return kios[best_idx], rhos[best_idx], Vs[best_idx], \
+    return kios_arr[best_idx], rhos_arr[best_idx], Vs_arr[best_idx], \
            dists[np.arange(len(best_idx)), best_idx]

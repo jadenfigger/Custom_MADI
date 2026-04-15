@@ -492,6 +492,8 @@ FITTING EXAMPLES:
             fit_deltas=fit_deltas,
             lib_deltas=lib_deltas,
             n_b=n_b,
+            vi_min = 0.5,
+            vi_max=0.9
         )
         print(f"  Done in {time.time()-t0:.1f}s")
 

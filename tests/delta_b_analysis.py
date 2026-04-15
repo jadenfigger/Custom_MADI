@@ -85,6 +85,7 @@ TISSUES = {
     "th": dict(name="Thalamus",       kio=22.0, rho=6.20e5, V=1.20),
     "pu": dict(name="Putamen",        kio=17.0, rho=2.90e5, V=2.60),
     "pl": dict(name="Prostate lesion",kio=39.0, rho=1.20e6, V=0.54),
+    "NE": dict(name="Prostate lesion", kio=0.0,  rho=1.10e5, V=6.00),
 }
 
 DELTAS_MS  = [15.0, 25.0, 30.0, 40.0]                      # your library's Δ

@@ -264,6 +264,18 @@ mamba create -y -n madi python=3.11 && source activate madi
 mamba install -y -c conda-forge numpy scipy matplotlib nibabel numba cudatoolkit=11.8
 python -c "import numpy, scipy, matplotlib, nibabel, numba; from numba import cuda; print('CUDA available:', cuda.is_availabl ()); print('GPU:', cuda.get_current_device().name if cuda.is_available() else 'none')"
 
+mkdir -p logs libraries
+sbatch --array=0 build_lib.sbatch
+squeue -u $USER
+bashtail -f logs/madi_dense_*_0.out
+<!-- Expected output at the top:
+/home/jfigger/.conda/envs/madi/bin/python
+imports OK
+CUDA: True
+GPU: NVIDIA A100-SXM4-80GB
+If you see that, Ctrl-C the tail, cancel the test if needed, and submit the full array: -->
+bashsbatch build_lib.sbatch
+
 ## License
 
 Research/educational use.  The MADI method is described in US Provisional

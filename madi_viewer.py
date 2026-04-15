@@ -356,17 +356,42 @@ def main():
         measured = get_signal_vec(vx, vy)
         if np.all(measured < 1e-10):
             return None, measured
-        dists = np.sum((lib_sub - measured[np.newaxis, :]) ** 2, axis=1)
+
+        # Pipeline matching parameters (from library.py)
+        s_floor = 1e-3
+        vi_min = 0.050
+        vi_max = 0.95
+
+        # 1. Filter candidates by vi bounds
+        vis = (lib_rhos / 1e9) * (lib_Vs * 1e3)
+        valid_mask = (vis >= vi_min) & (vis <= vi_max)
+
+        # 2. Transform to log-space with signal floor
+        meas_log = np.log(np.clip(measured, s_floor, 1.0))
+        lib_log = np.log(np.clip(lib_sub, s_floor, 1.0))
+
+        # 3. Calculate distances (SSE) in log-space
+        # Initialize with infinity so invalid entries are pushed to the bottom
+        dists = np.full(len(lib_sub), np.inf)
+        dists[valid_mask] = np.sum((lib_log[valid_mask] - meas_log[np.newaxis, :]) ** 2, axis=1)
+
+        # 4. Sort and retrieve top matches
         order = np.argsort(dists)[:N_TOP]
         matches = []
         for rank, idx in enumerate(order):
+            if dists[idx] == np.inf:
+                break # We ran out of valid matches
+                
             matches.append({
                 'rank': rank + 1,
-                'kio': lib_kios[idx], 'rho': lib_rhos[idx], 'V': lib_Vs[idx],
-                'residual': dists[idx],
-                'pred': lib_sub[idx],
+                'kio': lib_kios[idx], 
+                'rho': lib_rhos[idx], 
+                'V': lib_Vs[idx],
+                'residual': dists[idx], # Log-space SSE
+                'pred': lib_sub[idx],   # Keep linear space for plotting!
             })
-        return matches, measured
+            
+        return matches if matches else None, measured
 
     # ================================================================
     # DRAW SIGNAL PLOT
