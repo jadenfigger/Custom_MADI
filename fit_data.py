@@ -426,10 +426,116 @@ def main():
         print(f"  b-values per Δ: {meta['n_b']}")
         return
 
+# ================================================================
+    #  BUILD LIBRARY
+    # ================================================================
     if args.build_library:
-        # ... (same as your existing build branch — unchanged)
-        # Keeping short here; copy your existing build_library logic.
-        print("Build branch unchanged — use the existing logic from your fit_data.py.")
+        print("=" * 60)
+        print("Building MADI library")
+        print("=" * 60)
+
+        # Get simulation config from preset
+        preset = PRESETS[args.lib_preset]
+        cfg = SimConfig(**preset["cfg"])
+
+        # Load existing if appending
+        existing = None
+        if args.append and os.path.exists(args.library):
+            print(f"\n  Loading existing library: {args.library}")
+            existing = load_library(args.library)
+        elif args.append:
+            print(f"\n  --append: {args.library} not found, starting fresh.")
+
+        # ---- Mode: exact triplets ----
+        if args.triplets:
+            triplets = [parse_triplet(s) for s in args.triplets]
+            print(f"\n  Mode: exact triplets ({len(triplets)})")
+            for k, r, v in triplets:
+                print(f"    kio={k}, rho={r/1e3:.0f}k, V={v:.2f}")
+
+            build_library_from_triplets(
+                triplets, cfg=cfg, save_path=args.library,
+                existing_library=existing)
+            return
+
+        # ---- Mode: explicit sub-grid ----
+        if args.explicit:
+            gk = args.grid_kios or preset["kios"]
+            gr = [int(r) for r in (args.grid_rhos or preset["rhos"])]
+            gv = args.grid_Vs or preset["Vs"]
+            print(f"\n  Mode: explicit sub-grid")
+            print(f"  kio ({len(gk)}): {gk}")
+            print(f"  rho ({len(gr)}): {[f'{r/1e3:.0f}k' for r in gr]}")
+            print(f"  V   ({len(gv)}): {gv}")
+
+            build_library(
+                kios=gk, rhos=gr, Vs=gv, cfg=cfg,
+                save_path=args.library, existing_library=existing)
+            return
+
+        # ---- Mode: preset grid + optional custom additions ----
+        kios = list(preset["kios"])
+        rhos = list(preset["rhos"])
+        Vs   = list(preset["Vs"])
+
+        if args.custom_kios:
+            kios = sorted(set(kios + args.custom_kios))
+        if args.custom_rhos:
+            rhos = sorted(set(rhos + [int(r) for r in args.custom_rhos]))
+        if args.custom_Vs:
+            Vs = sorted(set(Vs + args.custom_Vs))
+
+        print(f"\n  Mode: preset '{args.lib_preset}' + custom additions")
+        print(f"  kio ({len(kios)}): {kios}")
+        print(f"  rho ({len(rhos)}): {[f'{r/1e3:.0f}k' for r in rhos]}")
+        print(f"  V   ({len(Vs)}):   {Vs}")
+
+        # ---- Optional sharding for SLURM job arrays ----
+        if args.shard_id is not None:
+            if args.n_shards is None or args.n_shards < 1:
+                print("ERROR: --shard-id requires --n-shards >= 1")
+                return
+            if not (0 <= args.shard_id < args.n_shards):
+                print(f"ERROR: --shard-id must be in [0, {args.n_shards})")
+                return
+
+            # Build full triplet list, filter by vi, slice by (ρ,V) pair.
+            all_triplets = [(k, r, v) for k in kios for r in rhos for v in Vs]
+            valid = [(k, r, v) for k, r, v in all_triplets
+                     if (r / 1e9) * (v * 1e3) <= 0.95]
+
+            # Unique (ρ,V) pairs, sorted by cost proxy (ρ·V), round-robin
+            # across shards so each shard gets a mix of cheap + expensive.
+            pairs = sorted(set((r, v) for _, r, v in valid),
+                           key=lambda p: p[0] * p[1])
+            my_pairs = set(pairs[i] for i in range(len(pairs))
+                           if i % args.n_shards == args.shard_id)
+            shard_triplets = [(k, r, v) for (k, r, v) in valid
+                              if (r, v) in my_pairs]
+
+            print(f"\n  Sharding: shard {args.shard_id}/{args.n_shards}")
+            print(f"    (ρ,V) pairs in shard : {len(my_pairs)}/{len(pairs)}")
+            print(f"    triplets in shard    : {len(shard_triplets)}/{len(valid)}")
+
+            # Tag the output file with shard id unless user explicitly
+            # supplied a per-shard path already.
+            save_path = args.library
+            if "{shard" not in save_path and "shard" not in os.path.basename(save_path):
+                root, ext = os.path.splitext(save_path)
+                save_path = f"{root}.shard{args.shard_id:03d}{ext}"
+            else:
+                save_path = save_path.format(shard=args.shard_id,
+                                             n_shards=args.n_shards)
+            print(f"    output               : {save_path}")
+
+            build_library_from_triplets(
+                shard_triplets, cfg=cfg, save_path=save_path,
+                existing_library=existing)
+            return
+
+        build_library(
+            kios=kios, rhos=rhos, Vs=Vs, cfg=cfg,
+            save_path=args.library, existing_library=existing)
         return
 
     # ================================================================
