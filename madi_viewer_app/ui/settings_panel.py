@@ -48,6 +48,10 @@ class VizSettings:
     # Signal plot
     delta_idx:     int = 0                # which Δ is visible
     log_y:         bool = False
+    # Observed-signal display modes (can be combined)
+    show_obs_per_delta: bool = True
+    show_obs_avg_s0:    bool = False
+    show_obs_fit_s0:    bool = False
 
     # Match table
     visible_cols:  set[str] = field(default_factory=lambda: set(DEFAULT_VISIBLE))
@@ -242,6 +246,28 @@ class SettingsPanel(QWidget):
         self.cb_log_y.stateChanged.connect(
             lambda _: self._set("log_y", self.cb_log_y.isChecked()))
         f.addRow("", self.cb_log_y)
+
+        f.addRow(QLabel("<b>Observed display</b>"))
+        self.cb_obs_per_delta = QCheckBox("S / S0_Δ   (per-Δ, default)")
+        self.cb_obs_per_delta.setChecked(self.settings.show_obs_per_delta)
+        self.cb_obs_per_delta.stateChanged.connect(
+            lambda _: self._set("show_obs_per_delta",
+                                 self.cb_obs_per_delta.isChecked()))
+        f.addRow("", self.cb_obs_per_delta)
+
+        self.cb_obs_avg_s0 = QCheckBox("S / S0_avg  (Δ-averaged S0)")
+        self.cb_obs_avg_s0.setChecked(self.settings.show_obs_avg_s0)
+        self.cb_obs_avg_s0.stateChanged.connect(
+            lambda _: self._set("show_obs_avg_s0",
+                                 self.cb_obs_avg_s0.isChecked()))
+        f.addRow("", self.cb_obs_avg_s0)
+
+        self.cb_obs_fit_s0 = QCheckBox("S / S0_fit  (best match's fitted S0)")
+        self.cb_obs_fit_s0.setChecked(self.settings.show_obs_fit_s0)
+        self.cb_obs_fit_s0.stateChanged.connect(
+            lambda _: self._set("show_obs_fit_s0",
+                                 self.cb_obs_fit_s0.isChecked()))
+        f.addRow("", self.cb_obs_fit_s0)
 
         parent_layout.addWidget(g)
 

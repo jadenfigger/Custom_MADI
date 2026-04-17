@@ -260,6 +260,30 @@ class ProfileData:
             return self.signal_vol[vx, sl, vy, :]
         return self.signal_vol[vx, vy, sl, :]
 
+    def s0_per_delta_at(self, vx: int, vy: int, sl: int, axis: int) -> Optional[np.ndarray]:
+        """Return the per-Δ b=0 values at a voxel, ordered by ``fit_deltas``.
+
+        Used by the signal plot's alternative observed-display modes
+        (avg-S0 and fit-S0). Returns ``None`` if any Δ scan is missing.
+        """
+        deltas = self.fit_deltas or [float(d) for d, _ in
+                                      sorted(self.profile.inputs,
+                                             key=lambda x: float(x[0]))]
+        if not deltas:
+            return None
+        out = np.zeros(len(deltas), dtype=np.float32)
+        for i, d in enumerate(deltas):
+            data = self.ensure_raw(float(d))
+            if data is None:
+                return None
+            if axis == 0:
+                out[i] = float(data[sl, vx, vy, 0])
+            elif axis == 1:
+                out[i] = float(data[vx, sl, vy, 0])
+            else:
+                out[i] = float(data[vx, vy, sl, 0])
+        return out
+
     def map_at(self, name: str, vx: int, vy: int, sl: int, axis: int) -> Optional[float]:
         m = self.ensure_map(name)
         if m is None:

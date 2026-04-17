@@ -59,6 +59,7 @@ class ViewerWidget(QWidget):
         self.canvas_map.set_hover_callback(self._on_hover)
 
         self.canvas_signal = SignalCanvas(self)
+        self.canvas_signal.hoverInfo.connect(self._on_signal_hover)
         self.table = MatchTable(self)
         self.table.ranksChanged.connect(self._on_selection_changed)
 
@@ -262,12 +263,24 @@ class ViewerWidget(QWidget):
             n_b = int(self.pd.lib_bundle["meta"]["n_b"]) if self.pd.lib_bundle else N_SHELLS
             di = int(np.clip(self.settings.delta_idx, 0, n_fit - 1))
             delta_ms = self.pd.fit_deltas[di] if self.pd.fit_deltas else 0.0
+            # Per-Δ S0 values at the selected voxel, needed for the
+            # avg-S0 observed variant.
+            s0_per_delta = None
+            if (self.settings.show_obs_avg_s0 or self.settings.show_obs_fit_s0) \
+                    and self._selected_vx is not None:
+                s0_per_delta = self.pd.s0_per_delta_at(
+                    self._selected_vx, self._selected_vy,
+                    self.settings.slice_idx, self.settings.axis)
             self.canvas_signal.plot_matches(
                 self._measured, self._matches,
                 self.settings.selected_ranks,
                 delta_idx=di, delta_ms=delta_ms,
                 n_b=n_b, n_fit=n_fit,
                 log_y=self.settings.log_y,
+                s0_per_delta=s0_per_delta,
+                show_obs_per_delta=self.settings.show_obs_per_delta,
+                show_obs_avg_s0=self.settings.show_obs_avg_s0,
+                show_obs_fit_s0=self.settings.show_obs_fit_s0,
             )
         self._refresh_info()
 
@@ -319,6 +332,17 @@ class ViewerWidget(QWidget):
             return
         self.status.setText(f"({vx}, {vy})  slice {self.settings.slice_idx}")
 
+    def _on_signal_hover(self, x, y, text):
+        if x is None:
+            self.status.setText("")
+            return
+        if text:
+            # collapse newlines so the status bar stays one-line
+            flat = text.replace("\n", "  |  ")
+            self.status.setText(f"b={x:.0f}  S/S0={y:.4f}   {flat}")
+        else:
+            self.status.setText(f"b={x:.0f}  S/S0={y:.4f}")
+
     def _on_selection_changed(self, ranks: set[int]):
         self.settings.selected_ranks = ranks or {1}
         self._redraw_signal_and_table()
@@ -344,7 +368,9 @@ class ViewerWidget(QWidget):
                         "rho_max", "fit_s0"}:
             self._recompute_matches()
             self._redraw_signal_and_table()
-        elif field in {"delta_idx", "log_y"}:
+        elif field in {"delta_idx", "log_y",
+                        "show_obs_per_delta", "show_obs_avg_s0",
+                        "show_obs_fit_s0"}:
             self._redraw_signal_and_table()
         elif field == "visible_cols":
             self.table.set_visible_columns(self.settings.visible_cols)

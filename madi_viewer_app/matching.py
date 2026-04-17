@@ -112,8 +112,16 @@ def find_top_matches(
     n = int(min(top_n, int(finite_mask.sum())))
     order = np.argsort(key)[:n]
 
+    # Always populate s0_fit (L2-optimal scalar multiplier for this match
+    # applied to the normalised library curve). This is the same number used
+    # by the fit_s0 ranker, but we expose it for every match so the viewer
+    # can show "observed under fitted S0" regardless of how the user ranks.
     rows = []
+    M = measured.astype(np.float64)
     for rank, idx in enumerate(order):
+        R = lib_sub[idx].astype(np.float64)
+        rr_i = max(float(np.sum(R * R)), 1e-30)
+        s0_i = float(R @ M) / rr_i
         rows.append(MatchRow(
             rank=rank + 1,
             idx=int(idx),
@@ -124,6 +132,6 @@ def find_top_matches(
             sse_lin=float(dists_lin[idx]),
             sse_log=float(dists_log[idx]),
             pred=lib_sub[idx].copy(),
-            s0_fit=float(s0_cand[idx]) if fit_s0 else None,
+            s0_fit=s0_i,
         ))
     return rows, measured
