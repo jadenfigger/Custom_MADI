@@ -1,4 +1,10 @@
-"""Matplotlib-embedded parametric-map / raw-DWI slice canvas."""
+"""Matplotlib-embedded parametric-map / raw-DWI slice canvas.
+
+Left-click selects a voxel. Left-drag or right-drag pans the view,
+scroll zooms around the cursor, and double-click restores the
+default auto-zoom. A mask-aware hover callback forwards the voxel
+index under the mouse to the parent widget.
+"""
 from __future__ import annotations
 
 from typing import Optional
@@ -12,12 +18,7 @@ from ..constants import MAP_CMAPS, MAP_LABELS, DEFAULT_MARGIN_MM
 
 
 class MapCanvas(FigureCanvasQTAgg):
-    """2-D slice viewer with click + crosshair.
-
-    Accepts either a parameter map (``set_map``) or a raw DWI volume-index
-    slice (``set_raw``). Emits ``voxelClicked(vx, vy)`` when the user
-    clicks inside the mask.
-    """
+    """2-D slice viewer with click + crosshair."""
 
     voxelClicked = pyqtSignal(int, int)
 
@@ -29,8 +30,10 @@ class MapCanvas(FigureCanvasQTAgg):
         self.ax = self.fig.add_axes([0.09, 0.13, 0.88, 0.82])
         self.cbar_ax = self.fig.add_axes([0.09, 0.07, 0.88, 0.028])
 
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.fig.canvas.mpl_connect("button_press_event",   self._on_press)
+        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
+        self.fig.canvas.mpl_connect("motion_notify_event",  self._on_motion)
+        self.fig.canvas.mpl_connect("scroll_event",         self._on_scroll)
 
         # Geometry
         self._zooms = np.array([1.0, 1.0, 1.0])
@@ -44,6 +47,15 @@ class MapCanvas(FigureCanvasQTAgg):
         self._crosshair = None
         self._hover_cb = None  # optional external hover callback
         self._title = ""
+
+        # Interactive state
+        self._home_xlim: Optional[tuple] = None
+        self._home_ylim: Optional[tuple] = None
+        self._pan_origin = None   # (xdata, ydata, xlim, ylim)
+        self._press_px:  Optional[tuple] = None  # pixel coords on press
+        self._press_data: Optional[tuple] = None
+        self._press_btn = None
+        self._DRAG_PX = 4
 
     # --------------- public API ---------------
     def set_geometry(self, shape: tuple, zooms: np.ndarray,
@@ -164,6 +176,8 @@ class MapCanvas(FigureCanvasQTAgg):
             self.ax.set_xlim(xlim); self.ax.set_ylim(ylim)
         else:
             self._auto_zoom(mask_rot)
+        self._home_xlim = self.ax.get_xlim()
+        self._home_ylim = self.ax.get_ylim()
 
         self.ax.set_title(title, color="#111827", pad=4)
         self.ax.set_xlabel("mm"); self.ax.set_ylabel("mm")
@@ -196,15 +210,71 @@ class MapCanvas(FigureCanvasQTAgg):
         self.ax.set_ylim(ymin, ymax)
 
     # --------------- events ---------------
-    def _on_click(self, event):
+    def reset_view(self):
+        if self._home_xlim is None:
+            return
+        self.ax.set_xlim(self._home_xlim)
+        self.ax.set_ylim(self._home_ylim)
+        self.draw_idle()
+
+    def _on_press(self, event):
         if event.inaxes is not self.ax or event.xdata is None:
             return
-        vx, vy = self.disp_to_vx(event.xdata, event.ydata)
-        if self._mask_slice is not None and not self._mask_slice[vx, vy]:
+        if event.dblclick:
+            self.reset_view()
             return
-        self.voxelClicked.emit(vx, vy)
+        self._press_px = (event.x, event.y)
+        self._press_data = (event.xdata, event.ydata)
+        self._press_btn = event.button
+        # Right button OR shift+left → pan directly
+        if event.button == 3 or (event.key and "shift" in event.key):
+            self._pan_origin = (event.xdata, event.ydata,
+                                 self.ax.get_xlim(), self.ax.get_ylim())
+
+    def _on_release(self, event):
+        if self._press_px is None:
+            return
+        moved_px = 0
+        if event.x is not None and event.y is not None:
+            moved_px = max(abs(event.x - self._press_px[0]),
+                           abs(event.y - self._press_px[1]))
+        was_pan = self._pan_origin is not None
+        self._pan_origin = None
+
+        # Left-click (no drag) inside the mask → voxel pick
+        if (not was_pan and self._press_btn == 1
+                and moved_px <= self._DRAG_PX
+                and event.inaxes is self.ax and event.xdata is not None):
+            vx, vy = self.disp_to_vx(event.xdata, event.ydata)
+            if self._mask_slice is None or self._mask_slice[vx, vy]:
+                self.voxelClicked.emit(vx, vy)
+
+        self._press_px = None
+        self._press_data = None
+        self._press_btn = None
 
     def _on_motion(self, event):
+        # Pan handling (either initiated by right-click or by left-drag
+        # after exceeding the click/drag threshold).
+        if self._pan_origin is None and self._press_btn == 1 \
+                and event.x is not None and self._press_px is not None:
+            if max(abs(event.x - self._press_px[0]),
+                   abs(event.y - self._press_px[1])) > self._DRAG_PX \
+                    and self._press_data is not None:
+                self._pan_origin = (self._press_data[0], self._press_data[1],
+                                     self.ax.get_xlim(), self.ax.get_ylim())
+
+        if self._pan_origin is not None and event.inaxes is self.ax \
+                and event.xdata is not None:
+            x0, y0, xlim0, ylim0 = self._pan_origin
+            dx = event.xdata - x0
+            dy = event.ydata - y0
+            self.ax.set_xlim(xlim0[0] - dx, xlim0[1] - dx)
+            self.ax.set_ylim(ylim0[0] - dy, ylim0[1] - dy)
+            self.draw_idle()
+            return
+
+        # Hover callback
         if self._hover_cb is None:
             return
         if event.inaxes is not self.ax or event.xdata is None:
@@ -212,3 +282,16 @@ class MapCanvas(FigureCanvasQTAgg):
             return
         vx, vy = self.disp_to_vx(event.xdata, event.ydata)
         self._hover_cb(vx, vy)
+
+    def _on_scroll(self, event):
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        factor = 1.25 if event.button == "down" else (1.0 / 1.25)
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        xd, yd = event.xdata, event.ydata
+        self.ax.set_xlim(xd - (xd - xlim[0]) * factor,
+                          xd + (xlim[1] - xd) * factor)
+        self.ax.set_ylim(yd - (yd - ylim[0]) * factor,
+                          yd + (ylim[1] - yd) * factor)
+        self.draw_idle()
