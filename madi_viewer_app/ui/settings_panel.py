@@ -45,6 +45,13 @@ class VizSettings:
     rho_max:       float = float("nan")
     fit_s0:        bool = False
 
+    # Pre-processing (mirrors scripts/fit_data.py flags). When a profile
+    # is opened these default to whatever the batch fit used, so live
+    # matching sees the same signal the saved maps were fit against.
+    rician_correct: bool = False
+    noise_sigma:    float = float("nan")   # NaN → auto-estimate
+    avg_s0:         bool = False
+
     # Signal plot
     delta_idx:     int = 0                # which Δ is visible
     log_y:         bool = False
@@ -82,6 +89,7 @@ class SettingsPanel(QWidget):
 
         self._build_display_box(layout)
         self._build_geometry_box(layout)
+        self._build_preproc_box(layout)
         self._build_matcher_box(layout)
         self._build_signal_box(layout)
         self._build_table_box(layout)
@@ -180,6 +188,55 @@ class SettingsPanel(QWidget):
         f.addRow("Zoom margin (mm)", margin)
 
         parent_layout.addWidget(g)
+
+    def _build_preproc_box(self, parent_layout):
+        """Pre-processing toggles (Rician debias, σ, S0 averaging).
+
+        These affect the signal VOLUME the live matcher consumes — i.e.
+        flipping them triggers a rebuild of ``signal_vol`` upstream. They
+        default to the values the opening profile was fit with.
+        """
+        g = QGroupBox("Pre-processing")
+        f = QFormLayout(g)
+
+        self.cb_rician = QCheckBox("Rician noise-bias correction")
+        self.cb_rician.setChecked(self.settings.rician_correct)
+        self.cb_rician.stateChanged.connect(
+            lambda _: self._set("rician_correct", self.cb_rician.isChecked()))
+        f.addRow("", self.cb_rician)
+
+        self.sb_sigma = QDoubleSpinBox()
+        self.sb_sigma.setRange(0, 1e6)
+        self.sb_sigma.setDecimals(2)
+        self.sb_sigma.setSpecialValueText("auto")
+        self.sb_sigma.setValue(0)
+        if self.settings.noise_sigma == self.settings.noise_sigma:
+            self.sb_sigma.setValue(float(self.settings.noise_sigma))
+        self.sb_sigma.editingFinished.connect(
+            lambda: self._set(
+                "noise_sigma",
+                float("nan") if self.sb_sigma.value() == self.sb_sigma.minimum()
+                else float(self.sb_sigma.value())))
+        f.addRow("σ (noise)", self.sb_sigma)
+
+        self.cb_avg_s0 = QCheckBox("Average S0 across Δ scans")
+        self.cb_avg_s0.setChecked(self.settings.avg_s0)
+        self.cb_avg_s0.stateChanged.connect(
+            lambda _: self._set("avg_s0", self.cb_avg_s0.isChecked()))
+        f.addRow("", self.cb_avg_s0)
+
+        self.lbl_sigma_used = QLabel("")
+        self.lbl_sigma_used.setStyleSheet("color:#6b7280;font-size:10px;")
+        f.addRow("", self.lbl_sigma_used)
+
+        parent_layout.addWidget(g)
+
+    def set_sigma_display(self, sigma: float | None):
+        """Called by the viewer after rebuild so the user sees the σ in use."""
+        if sigma is None:
+            self.lbl_sigma_used.setText("")
+        else:
+            self.lbl_sigma_used.setText(f"σ in use: {sigma:.2f}")
 
     def _build_matcher_box(self, parent_layout):
         g = QGroupBox("Matcher")
