@@ -36,7 +36,7 @@ class ViewerWidget(QWidget):
         self.profile = profile
         self.pd = ProfileData(profile)
         self.settings = VizSettings()
-        self.settings.map_name = profile and "kio" or "kio"
+        self._inherit_profile_defaults()
 
         self._selected_vx: Optional[int] = None
         self._selected_vy: Optional[int] = None
@@ -44,11 +44,46 @@ class ViewerWidget(QWidget):
         self._measured: Optional[np.ndarray] = None
         self._hover_text = ""
 
-        # Layout
+        # Layout (panel reads self.settings so defaults must be set first)
         self._build_ui()
         self._install_shortcuts()
 
         self._load_profile()
+
+    def _inherit_profile_defaults(self) -> None:
+        """Populate VizSettings from the profile's saved fit configuration.
+
+        This is what makes the live view agree with the on-disk maps by
+        default: same preprocessing, same matcher options, same error
+        function used for ranking.
+        """
+        p = self.profile
+        self.settings.map_name = "kio"
+        # Matcher / library filters
+        self.settings.fit_s0  = bool(p.fit_s0)
+        self.settings.vi_min  = float(p.vi_min)
+        self.settings.vi_max  = float(p.vi_max)
+        self.settings.rho_max = (float("nan") if p.rho_max is None
+                                  else float(p.rho_max))
+        # Pre-processing
+        self.settings.rician_correct = bool(p.rician_correct)
+        self.settings.noise_sigma    = (float("nan") if p.noise_sigma is None
+                                         else float(p.noise_sigma))
+        self.settings.avg_s0         = bool(p.avg_s0)
+        # Default ranking key to whatever error the profile's batch fit
+        # minimised: log-space → "log"; fit-S0 uses the linear branch of
+        # find_top_matches (which becomes the fit-S0 residual when
+        # fit_s0=True), so "lin" is correct for both fit_s0 and default.
+        if p.log_space:
+            self.settings.sort_by = "log"
+        else:
+            self.settings.sort_by = "lin"
+        # Apply preprocessing to the data model so signal_vol is built right
+        self.pd.set_preprocessing(
+            self.settings.rician_correct,
+            None if self.settings.noise_sigma != self.settings.noise_sigma
+                 else float(self.settings.noise_sigma),
+            self.settings.avg_s0)
 
     # ================================================================
     #  UI
@@ -70,7 +105,7 @@ class ViewerWidget(QWidget):
             "background:#f8fafc; padding:8px; border:1px solid #cbd5e1; "
             "font-family:monospace;")
         self.info_label.setWordWrap(True)
-        self.info_label.setMinimumHeight(90)
+        self.info_label.setMinimumHeight(110)
         right.addWidget(self.info_label)
         right.addWidget(self.canvas_signal)
         right.addWidget(self.table)
@@ -248,6 +283,8 @@ class ViewerWidget(QWidget):
         self.settings.selected_ranks &= ranks
         if self._matches and not self.settings.selected_ranks:
             self.settings.selected_ranks = {1}
+        # σ may have just been auto-estimated on the first build — surface it
+        self.settings_panel.set_sigma_display(self.pd.sigma_used)
 
     def _redraw_signal_and_table(self):
         # Table
@@ -311,10 +348,35 @@ class ViewerWidget(QWidget):
         else:
             live_line = "No live matches."
 
+        # One line describing what the live ranking is minimising, so a
+        # user can see at a glance whether it matches the profile's fit.
+        sort_lbl = {
+            "lin": ("fit-S0 linear residual" if self.settings.fit_s0
+                     else "SSE (linear)"),
+            "log": "SSE (log)",
+            "kio": "k_io (not an error)",
+            "rho": "ρ (not an error)",
+            "V":   "V (not an error)",
+            "vi":  "v_i (not an error)",
+        }.get(self.settings.sort_by, self.settings.sort_by)
+        pre_bits = []
+        if self.settings.rician_correct:
+            pre_bits.append(
+                f"Rician (σ={self.pd.sigma_used:.2f})"
+                if self.pd.sigma_used else "Rician (σ auto pending)")
+        if self.settings.avg_s0:
+            pre_bits.append("avg-S0")
+        if self.settings.fit_s0:
+            pre_bits.append("fit-S0")
+        pre_line = ("Pre-proc: " + ", ".join(pre_bits)) if pre_bits else \
+                   "Pre-proc: per-Δ S0 (no Rician)"
+        err_line = f"Ranked by: {sort_lbl}   |   {pre_line}"
+
         self.info_label.setText(
             f"Voxel ({vx}, {vy})  —  slice {sl}  axis {self.settings.axis}\n"
             f"{disk_line}\n"
-            f"{live_line}")
+            f"{live_line}\n"
+            f"{err_line}")
 
     # ================================================================
     #  Events
@@ -366,6 +428,17 @@ class ViewerWidget(QWidget):
             self._redraw_signal_and_table()
         elif field in {"top_n", "sort_by", "vi_min", "vi_max",
                         "rho_max", "fit_s0"}:
+            self._recompute_matches()
+            self._redraw_signal_and_table()
+        elif field in {"rician_correct", "noise_sigma", "avg_s0"}:
+            # Rebuild the normalised signal volume with new preprocessing,
+            # then re-match (matcher reads from signal_vol).
+            sigma = (None if self.settings.noise_sigma != self.settings.noise_sigma
+                     else float(self.settings.noise_sigma))
+            if self.pd.set_preprocessing(
+                    self.settings.rician_correct, sigma, self.settings.avg_s0):
+                self.pd.ensure_signal_vol()
+                self.settings_panel.set_sigma_display(self.pd.sigma_used)
             self._recompute_matches()
             self._redraw_signal_and_table()
         elif field in {"delta_idx", "log_y",
