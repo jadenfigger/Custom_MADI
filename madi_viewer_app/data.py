@@ -234,19 +234,18 @@ class ProfileData:
         shape = self.mask.shape
         n_fit = len(deltas)
         vol = np.zeros((*shape, n_fit * N_SHELLS), dtype=np.float32)
-        mi = np.where(self.mask)
-        for di, (delta_ms, path) in enumerate(inputs):
+        mask = self.mask
+        for di, (delta_ms, _path) in enumerate(inputs):
             data = self.ensure_raw(float(delta_ms))
             if data is None:
                 return False
-            for vi in range(len(mi[0])):
-                ix, iy, iz = mi[0][vi], mi[1][vi], mi[2][vi]
-                s0 = data[ix, iy, iz, 0]
-                if s0 < 1e-10:
-                    continue
-                for si, (_, vol_sl) in enumerate(SHELLS):
-                    sm = float(np.mean(data[ix, iy, iz, vol_sl]))
-                    vol[ix, iy, iz, di * N_SHELLS + si] = np.clip(sm / s0, 0, 1)
+            s0 = data[..., 0].astype(np.float32)
+            safe_s0 = np.where(s0 > 1e-10, s0, 1.0)
+            for si, (_, vol_sl) in enumerate(SHELLS):
+                shell_mean = data[..., vol_sl].mean(axis=-1).astype(np.float32)
+                ratio = np.clip(shell_mean / safe_s0, 0.0, 1.0)
+                ratio = np.where((s0 > 1e-10) & mask, ratio, 0.0)
+                vol[..., di * N_SHELLS + si] = ratio
         self.signal_vol = vol
         self.fit_deltas = deltas
         return True
