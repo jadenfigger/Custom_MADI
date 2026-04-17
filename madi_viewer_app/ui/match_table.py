@@ -26,8 +26,12 @@ DEFAULT_VISIBLE = {"rank", "kio", "rho", "V", "vi", "sse_lin", "sse_log"}
 
 class MatchTable(QTableWidget):
 
-    # set of ranks (1-based) currently selected for overlay
-    selectionChanged = pyqtSignal(set)
+    # set of ranks (1-based) currently selected for overlay.
+    # Named ``ranksChanged`` rather than ``selectionChanged`` because
+    # QAbstractItemView already has a protected ``selectionChanged``
+    # virtual slot — overriding its name with a pyqtSignal causes Qt's
+    # C++ side to raise ``TypeError: native Qt signal is not callable``.
+    ranksChanged = pyqtSignal(set)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -133,4 +137,4 @@ class MatchTable(QTableWidget):
     def _emit_selection(self):
         if self._suppress_signal:
             return
-        self.selectionChanged.emit(self.selected_ranks())
+        self.ranksChanged.emit(self.selected_ranks())

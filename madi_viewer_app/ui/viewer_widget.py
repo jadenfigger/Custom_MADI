@@ -60,7 +60,7 @@ class ViewerWidget(QWidget):
 
         self.canvas_signal = SignalCanvas(self)
         self.table = MatchTable(self)
-        self.table.selectionChanged.connect(self._on_selection_changed)
+        self.table.ranksChanged.connect(self._on_selection_changed)
 
         # Right column (top = info, middle = signal, bottom = table)
         right = QSplitter(Qt.Vertical)

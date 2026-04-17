@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout,
-                              QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                              QPushButton, QVBoxLayout, QWidget, QSpinBox,
-                              QDoubleSpinBox, QCheckBox, QTabWidget,
+from PyQt5.QtGui import QCursor
+from PyQt5.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
+                              QFormLayout, QGridLayout, QHBoxLayout, QLabel,
+                              QLineEdit, QPushButton, QVBoxLayout, QWidget,
+                              QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
                               QFileDialog, QTextEdit, QListWidget,
                               QListWidgetItem, QMessageBox, QComboBox)
 
@@ -294,11 +295,18 @@ class ProfileDialog(QDialog):
             self.info_text.setPlainText(
                 "Library path is empty or does not exist.")
             return
+        self.info_text.setPlainText(
+            f"Loading {lib_path} … (this can take a while for large libraries).")
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        QApplication.processEvents()
         try:
             bundle = _cache.get_library(lib_path)
         except Exception as e:
+            QApplication.restoreOverrideCursor()
             self.info_text.setPlainText(f"Failed to load library:\n{e}")
             return
+        finally:
+            QApplication.restoreOverrideCursor()
         meta = bundle["meta"]
         kios = sorted(set(bundle["kios"].tolist()))
         rhos = sorted(set(bundle["rhos"].tolist()))
