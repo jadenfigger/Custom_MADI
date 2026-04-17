@@ -45,7 +45,8 @@ FITTING
 import argparse, os, sys, time
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(current_dir))
 
 from madi.config   import SimConfig, BVALS_S_MM2, BVALS_UNIQUE, DELTAS_BIG
 from madi.library  import (build_library, build_library_from_triplets,
@@ -397,7 +398,8 @@ def main():
                     help="Treat S0 as a free per-voxel parameter in the "
                          "matcher (analytic L2-optimal projection per "
                          "library entry).  Diagnostic for S0 reliability.")
-
+    ap.add_argument("--log_space", action="store_true",
+                    help="Whether to preform fitting within log space or to use no transformations.")
     # -- Matcher tuning (already exposed in library.py but worth making CLI) --
     ap.add_argument("--vi-min", type=float, default=0.5,
                     help="Lower bound on intracellular volume fraction "
@@ -641,6 +643,7 @@ def main():
                 vi_min=args.vi_min,
                 vi_max=args.vi_max,
                 rho_max=args.rho_max,
+                log_space=args.log_space
             )
             print(f"  Done in {time.time()-t0:.1f}s")
 

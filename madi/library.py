@@ -374,7 +374,7 @@ def match_voxels_batch(
     measured_batch,
     library,
     fit_deltas=None, lib_deltas=None, n_b=4,
-    log_space=True, s_floor=1e-3,
+    log_space=False, s_floor=1e-3,
     vi_min=0.5, vi_max=0.95, rho_max=None,
 ):
     """Log-space nearest-neighbour matching, S0 fixed (data already
@@ -382,6 +382,7 @@ def match_voxels_batch(
  
     Inputs are S/S0 ratios.
     """
+
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
         library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max)
  
