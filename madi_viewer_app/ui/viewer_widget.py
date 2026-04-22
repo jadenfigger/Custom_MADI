@@ -300,11 +300,14 @@ class ViewerWidget(QWidget):
             n_b = int(self.pd.lib_bundle["meta"]["n_b"]) if self.pd.lib_bundle else N_SHELLS
             di = int(np.clip(self.settings.delta_idx, 0, n_fit - 1))
             delta_ms = self.pd.fit_deltas[di] if self.pd.fit_deltas else 0.0
-            # Per-Δ S0 values at the selected voxel, needed for the
-            # avg-S0 observed variant.
+            # Per-Δ S0 values at the selected voxel are needed by any
+            # overlay that rescales (avg-S0, fit-S0, raw, S0@b=0).
+            needs_s0 = (self.settings.show_obs_avg_s0 or
+                        self.settings.show_obs_fit_s0 or
+                        self.settings.show_raw_signal or
+                        self.settings.show_s0_at_b0)
             s0_per_delta = None
-            if (self.settings.show_obs_avg_s0 or self.settings.show_obs_fit_s0) \
-                    and self._selected_vx is not None:
+            if needs_s0 and self._selected_vx is not None:
                 s0_per_delta = self.pd.s0_per_delta_at(
                     self._selected_vx, self._selected_vy,
                     self.settings.slice_idx, self.settings.axis)
@@ -318,6 +321,8 @@ class ViewerWidget(QWidget):
                 show_obs_per_delta=self.settings.show_obs_per_delta,
                 show_obs_avg_s0=self.settings.show_obs_avg_s0,
                 show_obs_fit_s0=self.settings.show_obs_fit_s0,
+                show_raw_signal=self.settings.show_raw_signal,
+                show_s0_at_b0=self.settings.show_s0_at_b0,
             )
         self._refresh_info()
 
@@ -443,7 +448,8 @@ class ViewerWidget(QWidget):
             self._redraw_signal_and_table()
         elif field in {"delta_idx", "log_y",
                         "show_obs_per_delta", "show_obs_avg_s0",
-                        "show_obs_fit_s0"}:
+                        "show_obs_fit_s0",
+                        "show_raw_signal", "show_s0_at_b0"}:
             self._redraw_signal_and_table()
         elif field == "visible_cols":
             self.table.set_visible_columns(self.settings.visible_cols)

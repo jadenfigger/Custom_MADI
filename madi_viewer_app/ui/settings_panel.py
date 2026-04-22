@@ -59,6 +59,9 @@ class VizSettings:
     show_obs_per_delta: bool = True
     show_obs_avg_s0:    bool = False
     show_obs_fit_s0:    bool = False
+    # Raw / S0 overlays
+    show_raw_signal:    bool = False    # un-normalised S (multiplied by S0)
+    show_s0_at_b0:      bool = False    # mark S0_meas + S0_fit at b=0
 
     # Match table
     visible_cols:  set[str] = field(default_factory=lambda: set(DEFAULT_VISIBLE))
@@ -325,6 +328,21 @@ class SettingsPanel(QWidget):
             lambda _: self._set("show_obs_fit_s0",
                                  self.cb_obs_fit_s0.isChecked()))
         f.addRow("", self.cb_obs_fit_s0)
+
+        f.addRow(QLabel("<b>Raw / S0 overlays</b>"))
+        self.cb_raw_signal = QCheckBox("Raw signal (un-normalised S)")
+        self.cb_raw_signal.setChecked(self.settings.show_raw_signal)
+        self.cb_raw_signal.stateChanged.connect(
+            lambda _: self._set("show_raw_signal",
+                                 self.cb_raw_signal.isChecked()))
+        f.addRow("", self.cb_raw_signal)
+
+        self.cb_s0_at_b0 = QCheckBox("Plot S0 at b=0  (measured + fit)")
+        self.cb_s0_at_b0.setChecked(self.settings.show_s0_at_b0)
+        self.cb_s0_at_b0.stateChanged.connect(
+            lambda _: self._set("show_s0_at_b0",
+                                 self.cb_s0_at_b0.isChecked()))
+        f.addRow("", self.cb_s0_at_b0)
 
         parent_layout.addWidget(g)
 
