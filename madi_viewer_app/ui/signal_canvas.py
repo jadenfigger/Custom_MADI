@@ -80,7 +80,9 @@ class SignalCanvas(FigureCanvasQTAgg):
                      s0_per_delta: Optional[np.ndarray] = None,
                      show_obs_per_delta: bool = True,
                      show_obs_avg_s0:   bool = False,
-                     show_obs_fit_s0:   bool = False) -> None:
+                     show_obs_fit_s0:   bool = False,
+                     show_raw_signal:   bool = False,
+                     show_s0_at_b0:     bool = False) -> None:
         self.ax.clear()
         self._scatter_points = []
         self._n_b_current = n_b
@@ -88,19 +90,41 @@ class SignalCanvas(FigureCanvasQTAgg):
         obs = measured[delta_idx * n_b : (delta_idx + 1) * n_b]
         bvals = BVALS_DISPLAY[:len(obs)]
 
+        # --- raw-signal mode: un-normalise by the per-Δ measured S0. ---
+        # Each selected match gets its own rescale (pred * s0_fit) so the
+        # predicted curve sits where the library would sit in raw units.
+        raw_scale = None
+        s0_measured = None
+        if (show_raw_signal or show_s0_at_b0) \
+                and s0_per_delta is not None and s0_per_delta.size \
+                and 0 <= delta_idx < s0_per_delta.size:
+            s0_measured = float(s0_per_delta[delta_idx])
+        if show_raw_signal and s0_measured is not None:
+            raw_scale = s0_measured   # applied to obs; pred uses its own s0_fit
+
         # --- match predictions (faded: unselected; bold: selected) ---
+        # In raw-signal mode, each match's curve is scaled by its own
+        # fit-S0 (or the measured S0 if s0_fit is unavailable) so the
+        # curve lives in the same raw-signal units as the observed.
+        def _pred_scale(m) -> float:
+            if not show_raw_signal:
+                return 1.0
+            if m.s0_fit is not None and abs(m.s0_fit) > 1e-12:
+                return float(m.s0_fit)
+            return s0_measured if s0_measured is not None else 1.0
+
         # We draw faded first so selected curves are on top.
         for m in matches:
             if m.rank in selected_ranks:
                 continue
-            pred = m.pred[delta_idx * n_b : (delta_idx + 1) * n_b]
+            pred = m.pred[delta_idx * n_b : (delta_idx + 1) * n_b] * _pred_scale(m)
             c = MATCH_COLORS[(m.rank - 1) % len(MATCH_COLORS)]
             self.ax.plot(bvals[:len(pred)], pred, "o-",
                          color=c, ms=3, lw=0.8, alpha=0.22, zorder=2)
         for m in matches:
             if m.rank not in selected_ranks:
                 continue
-            pred = m.pred[delta_idx * n_b : (delta_idx + 1) * n_b]
+            pred = m.pred[delta_idx * n_b : (delta_idx + 1) * n_b] * _pred_scale(m)
             c = MATCH_COLORS[(m.rank - 1) % len(MATCH_COLORS)]
             lbl = (f"#{m.rank} "
                    f"kio={m.kio:.1f} "
@@ -116,9 +140,13 @@ class SignalCanvas(FigureCanvasQTAgg):
                     "label": lbl, "color": c, "kind": "pred"})
 
         # --- observed variants ---
+        # In raw-signal mode everything is multiplied by the measured S0
+        # so points sit in the same units as the rescaled predictions.
+        obs_mul = float(raw_scale) if raw_scale is not None else 1.0
+
         # per-Δ is the "raw" observed (measured is already S/S0_Δ).
         if show_obs_per_delta:
-            self._scatter_obs(bvals, obs, OBS_COLOR, "per_delta",
+            self._scatter_obs(bvals, obs * obs_mul, OBS_COLOR, "per_delta",
                               tag=obs_label)
 
         # avg-S0: rescale by (S0_delta / S0_avg). Requires s0_per_delta.
@@ -126,7 +154,7 @@ class SignalCanvas(FigureCanvasQTAgg):
             s0_avg = float(np.mean(s0_per_delta))
             if s0_avg > 1e-10 and 0 <= delta_idx < s0_per_delta.size:
                 factor = float(s0_per_delta[delta_idx]) / s0_avg
-                self._scatter_obs(bvals, obs * factor,
+                self._scatter_obs(bvals, obs * factor * obs_mul,
                                   "#0ea5e9", "avg_s0",
                                   tag=f"S0_avg factor ×{factor:.3f}")
 
@@ -138,38 +166,100 @@ class SignalCanvas(FigureCanvasQTAgg):
             best = next((m for m in matches if m.rank == target_rank),
                         matches[0])
             if best.s0_fit is not None and abs(best.s0_fit) > 1e-10:
-                self._scatter_obs(bvals, obs / best.s0_fit,
+                self._scatter_obs(bvals, obs / best.s0_fit * obs_mul,
                                   "#a855f7", "fit_s0",
                                   tag=f"using #{best.rank} s0_fit="
                                       f"{best.s0_fit:.3g}")
+
+        # --- S0 at b=0 overlay ---
+        # Measured S0 as a black diamond; each selected match's fitted S0
+        # as a colored star on the same x=0 column. In normalised mode the
+        # values are divided by the measured S0 so the ratio (which is
+        # 1 for the measured anchor) is visually meaningful.
+        if show_s0_at_b0 and s0_measured is not None:
+            norm_div = 1.0 if show_raw_signal else max(s0_measured, 1e-12)
+            y_meas = s0_measured / norm_div
+            self.ax.scatter([0.0], [y_meas], c=OBS_COLOR,
+                            marker="D", s=70, edgecolors="white",
+                            linewidths=1.0, zorder=7,
+                            label=f"S0_meas={s0_measured:.3g}")
+            self._scatter_points.append({
+                "x": 0.0, "y": float(y_meas),
+                "label": f"S0 measured = {s0_measured:.4g}",
+                "color": OBS_COLOR, "kind": "s0_meas"})
+            for m in matches:
+                if m.rank not in selected_ranks:
+                    continue
+                if m.s0_fit is None:
+                    continue
+                y_fit = float(m.s0_fit) / norm_div
+                c = MATCH_COLORS[(m.rank - 1) % len(MATCH_COLORS)]
+                self.ax.scatter([0.0], [y_fit], c=c,
+                                marker="*", s=140, edgecolors="white",
+                                linewidths=1.0, zorder=8,
+                                label=f"#{m.rank} S0_fit={m.s0_fit:.3g}")
+                self._scatter_points.append({
+                    "x": 0.0, "y": y_fit,
+                    "label": (f"#{m.rank} S0_fit = {m.s0_fit:.4g}"
+                              f"  (ratio {m.s0_fit / max(s0_measured, 1e-12):.3f})"),
+                    "color": c, "kind": "s0_fit"})
 
         # --- axes + legend ---
         self.ax.set_title(f"Δ = {delta_ms:.0f} ms   "
                           f"({delta_idx + 1}/{n_fit})",
                           color="#111827", pad=4)
         self.ax.set_xlabel("b-value  (s/mm²)")
-        self.ax.set_ylabel(r"$S(b)\,/\,S_0$")
+        if show_raw_signal:
+            self.ax.set_ylabel(r"$S(b)$   (raw signal)")
+        else:
+            self.ax.set_ylabel(r"$S(b)\,/\,S_0$")
 
-        # Y scale / bounds
-        all_y = [obs]
+        # Y scale / bounds — include every variant the user turned on so
+        # the autoscale doesn't clip raw-mode curves / S0 markers.
+        obs_scale = float(raw_scale) if raw_scale is not None else 1.0
+        all_y = [obs * obs_scale]
         if show_obs_avg_s0 and s0_per_delta is not None and s0_per_delta.size:
-            all_y.append(obs * (float(s0_per_delta[delta_idx]) /
-                                 max(float(np.mean(s0_per_delta)), 1e-12)))
+            factor = (float(s0_per_delta[delta_idx]) /
+                      max(float(np.mean(s0_per_delta)), 1e-12))
+            all_y.append(obs * factor * obs_scale)
         if show_obs_fit_s0 and matches and selected_ranks:
             m = next((mm for mm in matches if mm.rank in selected_ranks),
                      matches[0])
             if m.s0_fit and abs(m.s0_fit) > 1e-10:
-                all_y.append(obs / m.s0_fit)
-        all_y_arr = np.concatenate([a for a in all_y if a is not None])
-        ymax = max(1.05, float(np.nanmax(all_y_arr)) * 1.15
-                         if all_y_arr.size else 1.05)
+                all_y.append(obs / m.s0_fit * obs_scale)
+        if show_raw_signal:
+            # Include selected predictions' raw-scaled maxima so the view
+            # breathes for high-S0 curves.
+            for m in matches:
+                if m.rank in selected_ranks:
+                    all_y.append(
+                        m.pred[delta_idx * n_b : (delta_idx + 1) * n_b]
+                        * _pred_scale(m))
+        if show_s0_at_b0 and s0_measured is not None:
+            norm_div = 1.0 if show_raw_signal else max(s0_measured, 1e-12)
+            all_y.append(np.array([s0_measured / norm_div]))
+            for m in matches:
+                if m.rank in selected_ranks and m.s0_fit is not None:
+                    all_y.append(np.array([float(m.s0_fit) / norm_div]))
+        all_y_arr = np.concatenate(
+            [np.asarray(a).ravel() for a in all_y if a is not None])
+        ymax = (float(np.nanmax(all_y_arr)) * 1.15
+                if all_y_arr.size else 1.05)
+        if show_raw_signal:
+            ymin_default = -0.03 * max(ymax, 1.0)
+        else:
+            ymax = max(1.05, ymax)
+            ymin_default = -0.03
         if log_y:
             self.ax.set_yscale("log")
-            self.ax.set_ylim(1e-3, max(1.2, ymax))
+            floor = max(1e-3, ymax * 1e-4) if show_raw_signal else 1e-3
+            self.ax.set_ylim(floor, max(1.2, ymax))
         else:
             self.ax.set_yscale("linear")
-            self.ax.set_ylim(-0.03, max(1.05, ymax))
-        self.ax.set_xlim(600, 6800)
+            self.ax.set_ylim(ymin_default, ymax)
+        # When the S0 marker is on, extend the x-axis to include b=0.
+        xmin = -150 if show_s0_at_b0 else 600
+        self.ax.set_xlim(xmin, 6800)
 
         leg = self.ax.legend(loc="upper left",
                               bbox_to_anchor=(1.01, 1.0),
