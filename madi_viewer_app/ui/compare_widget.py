@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
@@ -64,6 +65,17 @@ class CompareWidget(QWidget):
         self.btn_refresh_diff = QPushButton("Refresh diff")
         self.btn_refresh_diff.clicked.connect(self._redraw_diff)
         bar.addWidget(self.btn_refresh_diff)
+
+        # Raw-mode toggle for the merged signal plot. In raw mode each
+        # profile's observed signal is un-normalised by its own measured
+        # S0 and its fit curve is scaled by its own s0_fit, letting the
+        # user see whether different preprocessing pipelines even agree
+        # on raw scanner intensity — the thing all normalisations erase.
+        self.cb_merged_raw = QCheckBox("Merged: raw signal")
+        self.cb_merged_raw.setChecked(False)
+        self.cb_merged_raw.stateChanged.connect(
+            lambda _: self._redraw_merged_signal())
+        bar.addWidget(self.cb_merged_raw)
 
         bar.addStretch(1)
 
@@ -140,7 +152,6 @@ class CompareWidget(QWidget):
         if mx == 0:
             mx = 1e-6
         # We adapt MapCanvas to plot the diff with a symmetric range
-        import matplotlib.pyplot as plt
         self.diff_canvas.ax.clear()
         self.diff_canvas.cbar_ax.clear()
         sl = va.settings.slice_idx
@@ -175,6 +186,7 @@ class CompareWidget(QWidget):
 
     # ---------------- merged signal plot ----------------
     def _redraw_merged_signal(self):
+        raw_mode = bool(self.cb_merged_raw.isChecked())
         entries = []
         delta_ms = None
         for v in self.viewers:
@@ -183,15 +195,30 @@ class CompareWidget(QWidget):
             n_fit = len(v.pd.fit_deltas) or 1
             di = int(np.clip(v.settings.delta_idx, 0, n_fit - 1))
             delta_ms = v.pd.fit_deltas[di]
+            m0 = v._matches[0]
+            # For raw mode, pull this profile's own per-Δ S0 so its
+            # observed can be un-normalised; for the fit curve, scale
+            # by that profile's s0_fit (falling back to the measured S0
+            # if the library didn't project to a positive scalar).
+            s0_meas = None
+            if raw_mode and v._selected_vx is not None:
+                s0_arr = v.pd.s0_per_delta_at(
+                    v._selected_vx, v._selected_vy,
+                    v.settings.slice_idx, v.settings.axis)
+                if s0_arr is not None and di < s0_arr.size:
+                    s0_meas = float(s0_arr[di])
             entries.append({
                 "label":    v.profile.name,
                 "color":    v.profile.color,
                 "measured": v._measured,
-                "pred":     v._matches[0].pred,
+                "pred":     m0.pred,
                 "delta_idx": di,
-                "kio": v._matches[0].kio,
-                "rho": v._matches[0].rho,
-                "V":   v._matches[0].V,
+                "kio": m0.kio,
+                "rho": m0.rho,
+                "V":   m0.V,
+                "s0_meas": s0_meas,
+                "s0_fit":  (None if m0.s0_fit is None else float(m0.s0_fit)),
+                "fit_s0_active": bool(v.settings.fit_s0),
             })
         if not entries:
             self.merged_signal.clear_plot()
@@ -199,4 +226,5 @@ class CompareWidget(QWidget):
         n_b = int(self.viewers[0].pd.lib_bundle["meta"]["n_b"]) \
               if self.viewers[0].pd.lib_bundle else N_SHELLS
         self.merged_signal.plot_compare(entries, delta_ms or 0.0, n_b,
-                                        log_y=self.viewers[0].settings.log_y)
+                                        log_y=self.viewers[0].settings.log_y,
+                                        raw_mode=raw_mode)
