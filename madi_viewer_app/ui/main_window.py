@@ -10,7 +10,7 @@ import base64
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QByteArray
+from PyQt5.QtCore import Qt, QByteArray, QTimer
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QListWidget, QListWidgetItem, QPushButton,
@@ -175,6 +175,11 @@ class MainWindow(QMainWindow):
 
         self._open_viewers: dict[str, ViewerWidget] = {}
         self._compare_views: dict[tuple, CompareWidget] = {}
+        # Cross-tab voxel synchronisation. When True, selecting a voxel
+        # in one standalone profile tab mirrors into every other one so
+        # the user can flip between methods without losing their place.
+        self._cross_tab_sync = True
+        self._cross_tab_busy = False
 
         # Central tabs
         self.tabs = QTabWidget()
@@ -198,15 +203,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Workspace: {workspace.ws_path}")
 
-        # Restore window geometry
-        self._restore_geometry()
+        # Defer geometry restore + tab re-opening until after the Qt event
+        # loop starts and the window is actually shown. On WSL/X11 in
+        # particular, creating a FigureCanvasQTAgg inside __init__ (before
+        # show()) can race the GL/X-surface setup and produce a segfault.
+        QTimer.singleShot(0, self._deferred_startup)
 
-        # Re-open tabs from last session
-        for pid in list(workspace.open_profile_ids):
-            self.open_profile(pid)
-        if workspace.compare_profile_ids:
+    def _deferred_startup(self):
+        """Runs on the event loop once the window is visible."""
+        self._restore_geometry()
+        for pid in list(self.workspace.open_profile_ids):
             try:
-                self.open_compare(workspace.compare_profile_ids)
+                self.open_profile(pid)
+            except Exception as e:
+                self.statusBar().showMessage(
+                    f"Could not reopen profile {pid}: {e}")
+        if self.workspace.compare_profile_ids:
+            try:
+                self.open_compare(self.workspace.compare_profile_ids)
             except Exception:
                 pass
 
@@ -238,6 +252,16 @@ class MainWindow(QMainWindow):
         act_toggle_side.setText("Toggle profile sidebar")
         view_menu.addAction(act_toggle_side)
 
+        act_sync = QAction("Sync voxel across tabs", self, checkable=True)
+        act_sync.setChecked(self._cross_tab_sync)
+        act_sync.setToolTip(
+            "When on, clicking a voxel in one profile tab also selects "
+            "the same voxel in every other open profile tab (for direct "
+            "method-to-method comparison).")
+        act_sync.toggled.connect(self._set_cross_tab_sync)
+        view_menu.addAction(act_sync)
+        self._act_sync = act_sync
+
         help_menu = mb.addMenu("&Help")
         act_about = QAction("About", self)
         act_about.triggered.connect(self._about)
@@ -245,6 +269,9 @@ class MainWindow(QMainWindow):
         act_help = QAction("Controls", self)
         act_help.triggered.connect(self._controls)
         help_menu.addAction(act_help)
+
+    def _set_cross_tab_sync(self, enabled: bool):
+        self._cross_tab_sync = bool(enabled)
 
     def _about(self):
         QMessageBox.information(
@@ -283,10 +310,32 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Profile {pid} missing")
             return None
         w = ViewerWidget(prof, self)
+        w.voxelChanged.connect(self._on_viewer_voxel_changed)
         self._open_viewers[pid] = w
         self.tabs.addTab(w, prof.name)
         self.tabs.setCurrentWidget(w)
         return w
+
+    def _on_viewer_voxel_changed(self, vx: int, vy: int,
+                                  sl: int, axis: int):
+        """Forward a voxel pick from one standalone tab to the others."""
+        if not self._cross_tab_sync or self._cross_tab_busy:
+            return
+        sender = self.sender()
+        self._cross_tab_busy = True
+        try:
+            for v in self._open_viewers.values():
+                if v is sender:
+                    continue
+                # Skip viewers whose mask has a different shape — they're
+                # on a different grid and we can't meaningfully sync.
+                if v.pd.mask is None or sender.pd.mask is None:
+                    continue
+                if v.pd.mask.shape != sender.pd.mask.shape:
+                    continue
+                v.sync_voxel(vx, vy, sl, axis)
+        finally:
+            self._cross_tab_busy = False
 
     def open_compare(self, pids: list[str]):
         key = tuple(sorted(pids))
