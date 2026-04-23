@@ -371,41 +371,6 @@ class ProfileData:
             return self.signal_vol[vx, sl, vy, :]
         return self.signal_vol[vx, vy, sl, :]
 
-    def raw_signal_at(self, vx: int, vy: int, sl: int,
-                      axis: int) -> Optional[np.ndarray]:
-        """Un-normalised per-shell means at a voxel, in scanner units.
-
-        Same ordering as :meth:`signal_at` (n_fit × n_b flattened) but each
-        entry is the plain mean of the shell's magnitude samples (Rician
-        debiased if enabled). Intended for the fit-S0 live matcher so its
-        residual sees the same raw vector the batch fitter consumed.
-        """
-        deltas = self.fit_deltas or [float(d) for d, _ in
-                                      sorted(self.profile.inputs,
-                                             key=lambda x: float(x[0]))]
-        if not deltas:
-            return None
-        apply_rician = self.rician_correct and self.sigma_used is not None
-        out = np.zeros(len(deltas) * N_SHELLS, dtype=np.float32)
-        for di, d in enumerate(deltas):
-            data = self.ensure_raw(float(d))
-            if data is None:
-                return None
-            # Pull this voxel's time series (all volumes).
-            if axis == 0:
-                ts = data[sl, vx, vy, :]
-            elif axis == 1:
-                ts = data[vx, sl, vy, :]
-            else:
-                ts = data[vx, vy, sl, :]
-            ts = np.asarray(ts, dtype=np.float64)
-            if apply_rician:
-                ts = np.sqrt(np.maximum(
-                    ts * ts - 2.0 * self.sigma_used ** 2, 0.0))
-            for si, (_, vol_sl) in enumerate(SHELLS):
-                out[di * N_SHELLS + si] = float(ts[vol_sl].mean())
-        return out
-
     def s0_per_delta_at(self, vx: int, vy: int, sl: int, axis: int) -> Optional[np.ndarray]:
         """Return the per-Δ b=0 values at a voxel, ordered by ``fit_deltas``.
 
