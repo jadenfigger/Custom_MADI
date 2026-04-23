@@ -323,8 +323,31 @@ class ViewerWidget(QWidget):
                 show_obs_fit_s0=self.settings.show_obs_fit_s0,
                 show_raw_signal=self.settings.show_raw_signal,
                 show_s0_at_b0=self.settings.show_s0_at_b0,
+                preproc_note=self._preproc_note(),
             )
         self._refresh_info()
+
+    def _preproc_note(self) -> str:
+        """One-line summary of the active preprocessing + rank key.
+
+        Embedded inside the signal plot so a screenshot of the plot
+        carries the method info with it — no need to cross-reference
+        the settings panel when comparing profiles.
+        """
+        bits = [self.profile.name]
+        if self.settings.fit_s0:
+            bits.append("fit-S0")
+        if self.settings.rician_correct:
+            sig = self.pd.sigma_used
+            bits.append(f"Rician σ={sig:.1f}" if sig else "Rician σ=auto")
+        if self.settings.avg_s0:
+            bits.append("avg-S0")
+        sort_short = {
+            "lin": "fit-S0 L2" if self.settings.fit_s0 else "SSE-lin",
+            "log": "SSE-log",
+        }.get(self.settings.sort_by, self.settings.sort_by)
+        bits.append(f"rank:{sort_short}")
+        return "  ·  ".join(bits)
 
     def _refresh_info(self):
         if self._selected_vx is None:

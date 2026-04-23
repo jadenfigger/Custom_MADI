@@ -67,30 +67,61 @@ def find_top_matches(
     if not mask.any():
         return None, measured
 
+    # -------------------------------------------------------------
+    # Build the vector the batch matcher would actually see:
+    #   fit_s0=False → S/S0 normalised ratios (same units as library)
+    #   fit_s0=True  → raw per-shell means (in scanner intensity)
+    # This is the vector used for *ranking* and for computing s0_fit.
+    # `measured` returned to the caller stays normalised so plotting
+    # defaults (S/S0) keep their semantics; the plot's "raw-signal"
+    # mode rescales by s0_measured / s0_fit on the fly.
+    # -------------------------------------------------------------
+    if fit_s0:
+        raw = pd.raw_signal_at(vx, vy, sl, axis)
+        if raw is None:
+            return None, measured
+        M_match = raw.astype(np.float64)
+    else:
+        M_match = measured.astype(np.float64)
+
     # Linear-space SSE (either normalised ratios, or with free S0)
     dists_lin = np.full(len(lib_sub), np.inf, dtype=np.float64)
     s0_cand = np.full(len(lib_sub), np.nan, dtype=np.float64)
 
     if fit_s0:
         R = lib_sub[mask].astype(np.float64)
-        M = measured.astype(np.float64)
         rr = np.maximum(np.sum(R * R, axis=1), 1e-30)
-        mr = R @ M
+        mr = R @ M_match
         s0 = mr / rr
-        resid = float(np.sum(M * M)) - (mr ** 2) / rr
+        resid = float(np.sum(M_match * M_match)) - (mr ** 2) / rr
         resid = np.where(s0 > 0, resid, np.inf)
         dists_lin[mask] = resid
         s0_cand[mask] = s0
     else:
-        diff = lib_sub[mask] - measured[None, :]
+        diff = lib_sub[mask] - M_match[None, :]
         dists_lin[mask] = np.sum(diff * diff, axis=1)
 
-    # Log-space SSE — always computed (cheap) so table can show both
-    meas_log = np.log(np.clip(measured, s_floor, 1.0))
-    lib_log = np.log(np.clip(lib_sub[mask], s_floor, 1.0))
+    # Log-space SSE — always computed (cheap) so table can show both.
+    # In fit-S0 mode we compare log(M_raw) vs log(s0 * R); otherwise
+    # log(M/S0) vs log(R) (both already in [s_floor, 1]).
     dists_log = np.full(len(lib_sub), np.inf, dtype=np.float64)
-    diff_log = lib_log - meas_log[None, :]
-    dists_log[mask] = np.sum(diff_log * diff_log, axis=1)
+    if fit_s0:
+        # Use the per-candidate scaled library curve.
+        Rsel = lib_sub[mask].astype(np.float64)
+        s0_sel = s0_cand[mask].reshape(-1, 1)
+        floor = max(s_floor, 1e-6)
+        scaled = np.clip(Rsel * s0_sel, floor, None)
+        meas_floor = float(np.max(M_match)) * s_floor
+        meas_floor = max(meas_floor, 1e-6)
+        log_meas = np.log(np.clip(M_match, meas_floor, None))
+        log_scal = np.log(scaled)
+        dlog = log_scal - log_meas[None, :]
+        dists_log[mask] = np.sum(dlog * dlog, axis=1)
+    else:
+        meas_log = np.log(np.clip(M_match, s_floor, 1.0))
+        lib_log = np.log(np.clip(lib_sub[mask], s_floor, 1.0))
+        diff_log = lib_log - meas_log[None, :]
+        dists_log[mask] = np.sum(diff_log * diff_log, axis=1)
 
     # Pick ranking key
     if sort_by == "log":
@@ -113,15 +144,16 @@ def find_top_matches(
     order = np.argsort(key)[:n]
 
     # Always populate s0_fit (L2-optimal scalar multiplier for this match
-    # applied to the normalised library curve). This is the same number used
-    # by the fit_s0 ranker, but we expose it for every match so the viewer
-    # can show "observed under fitted S0" regardless of how the user ranks.
+    # applied to the normalised library curve). When fit_s0=True this is the
+    # same number used by the ranker and lives in physical scanner units
+    # (matching s0_fit_map). Otherwise it's an L2 projection of the already-
+    # normalised measured vector onto the library curve (≈1 for a good fit)
+    # and is shown mainly as a sanity diagnostic.
     rows = []
-    M = measured.astype(np.float64)
     for rank, idx in enumerate(order):
         R = lib_sub[idx].astype(np.float64)
         rr_i = max(float(np.sum(R * R)), 1e-30)
-        s0_i = float(R @ M) / rr_i
+        s0_i = float(R @ M_match) / rr_i
         rows.append(MatchRow(
             rank=rank + 1,
             idx=int(idx),

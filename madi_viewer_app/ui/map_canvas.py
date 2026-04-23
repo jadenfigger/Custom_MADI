@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 from PyQt5.QtCore import pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
@@ -185,7 +186,6 @@ class MapCanvas(FigureCanvasQTAgg):
 
         # colorbar
         self.cbar_ax.clear()
-        import matplotlib.pyplot as plt
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         cb = self.fig.colorbar(sm, cax=self.cbar_ax, orientation="horizontal")

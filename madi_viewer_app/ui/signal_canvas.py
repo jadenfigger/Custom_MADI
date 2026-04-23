@@ -82,7 +82,8 @@ class SignalCanvas(FigureCanvasQTAgg):
                      show_obs_avg_s0:   bool = False,
                      show_obs_fit_s0:   bool = False,
                      show_raw_signal:   bool = False,
-                     show_s0_at_b0:     bool = False) -> None:
+                     show_s0_at_b0:     bool = False,
+                     preproc_note:      str = "") -> None:
         self.ax.clear()
         self._scatter_points = []
         self._n_b_current = n_b
@@ -130,9 +131,21 @@ class SignalCanvas(FigureCanvasQTAgg):
                    f"kio={m.kio:.1f} "
                    f"ρ={m.rho/1e3:.0f}k "
                    f"V={m.V:.2f}")
-            self.ax.plot(bvals[:len(pred)], pred, "o-",
-                         color=c, ms=7, lw=2.2, alpha=0.95, zorder=5,
-                         label=lbl)
+            # In raw + S0@b=0 mode, extend the fit curve to x=0 at
+            # s0_fit (which equals the library curve's implicit b=0
+            # value — the library is S/S0, so its b=0 is 1.0 → scaled
+            # to s0_fit). This makes the L2 projection visible.
+            if (show_raw_signal and show_s0_at_b0
+                    and m.s0_fit is not None):
+                xs = np.concatenate(([0.0], bvals[:len(pred)].astype(float)))
+                ys = np.concatenate(([float(m.s0_fit)], pred))
+                self.ax.plot(xs, ys, "o-",
+                             color=c, ms=7, lw=2.2, alpha=0.95, zorder=5,
+                             label=lbl)
+            else:
+                self.ax.plot(bvals[:len(pred)], pred, "o-",
+                             color=c, ms=7, lw=2.2, alpha=0.95, zorder=5,
+                             label=lbl)
             # register each point for hover picking
             for b, y in zip(bvals[:len(pred)], pred):
                 self._scatter_points.append({
@@ -194,6 +207,11 @@ class SignalCanvas(FigureCanvasQTAgg):
                     continue
                 y_fit = float(m.s0_fit) / norm_div
                 c = MATCH_COLORS[(m.rank - 1) % len(MATCH_COLORS)]
+                # Dashed residual connector from measured to fitted S0
+                # at b=0 makes the fit-S0 error visible at a glance.
+                self.ax.plot([0.0, 0.0], [y_meas, y_fit],
+                             color=c, lw=1.0, ls="--", alpha=0.55,
+                             zorder=6)
                 self.ax.scatter([0.0], [y_fit], c=c,
                                 marker="*", s=140, edgecolors="white",
                                 linewidths=1.0, zorder=8,
@@ -269,6 +287,20 @@ class SignalCanvas(FigureCanvasQTAgg):
             leg.set_draggable(True)
             leg.set_title("Click & drag", prop={"size": 7})
 
+        # Embed the active preprocessing + ranking key on the plot itself
+        # so screenshots of different methods can be compared side-by-side
+        # without having to reference the settings panel.
+        if preproc_note:
+            self.ax.text(
+                0.01, 0.99, preproc_note,
+                transform=self.ax.transAxes,
+                ha="left", va="top", fontsize=7.5,
+                color="#334155",
+                bbox=dict(boxstyle="round,pad=0.3",
+                          fc="#f1f5f9", ec="#94a3b8", lw=0.6,
+                          alpha=0.9),
+                zorder=11)
+
         # Save "home" for reset view
         self._home_xlim = self.ax.get_xlim()
         self._home_ylim = self.ax.get_ylim()
@@ -294,42 +326,118 @@ class SignalCanvas(FigureCanvasQTAgg):
     def plot_compare(self, entries: list[dict],
                      delta_ms: float,
                      n_b: int,
-                     log_y: bool = False):
-        """Overlay observed + top-1 match for multiple profiles."""
+                     log_y: bool = False,
+                     raw_mode: bool = False):
+        """Overlay observed + top-1 match for multiple profiles.
+
+        When ``raw_mode`` is True each entry's observed signal is
+        un-normalised by its own ``s0_meas`` and each fit curve is
+        scaled by its own ``s0_fit`` (falling back to ``s0_meas``).
+        This makes the fit-S0 projection directly comparable across
+        methods: the star at b=0 is the fitted S0, the diamond is the
+        measured S0 — the gap between them is the b=0 residual.
+        """
         self.ax.clear()
         self._scatter_points = []
         self._n_b_current = n_b
-        for i, e in enumerate(entries):
-            obs = e["measured"][e["delta_idx"] * n_b : (e["delta_idx"] + 1) * n_b]
-            pred = e["pred"][e["delta_idx"] * n_b : (e["delta_idx"] + 1) * n_b]
+        all_y: list[np.ndarray] = []
+        for e in entries:
+            obs = np.asarray(
+                e["measured"][e["delta_idx"] * n_b:(e["delta_idx"] + 1) * n_b],
+                dtype=float)
+            pred = np.asarray(
+                e["pred"][e["delta_idx"] * n_b:(e["delta_idx"] + 1) * n_b],
+                dtype=float)
             c = e["color"]
             bvals = BVALS_DISPLAY[:len(pred)]
-            self.ax.plot(bvals, pred, "-",
-                         color=c, lw=2.2, alpha=0.9, zorder=4,
-                         label=f"{e['label']} fit")
-            self.ax.scatter(bvals[:len(obs)], obs,
-                            facecolor="white", edgecolor=c, s=55, lw=1.2,
-                            zorder=5, label=f"{e['label']} obs")
-            for b, y in zip(bvals[:len(obs)], obs):
-                self._scatter_points.append({
-                    "x": float(b), "y": float(y),
-                    "label": f"{e['label']} obs",
-                    "color": c, "kind": "obs"})
-        self.ax.set_title(f"Compare — Δ = {delta_ms:.0f} ms",
+
+            s0_meas = e.get("s0_meas")
+            s0_fit  = e.get("s0_fit")
+            if raw_mode and s0_meas is not None:
+                obs_r  = obs  * float(s0_meas)
+                scale  = float(s0_fit) if (s0_fit is not None and s0_fit > 0) \
+                                       else float(s0_meas)
+                pred_r = pred * scale
+                # Extend the fit line to x=0 at the fitted S0 so the
+                # projection geometry is visible per-profile.
+                xs = np.concatenate(([0.0], bvals.astype(float)))
+                ys = np.concatenate(([scale], pred_r))
+                self.ax.plot(xs, ys, "-",
+                             color=c, lw=2.2, alpha=0.9, zorder=4,
+                             label=f"{e['label']} fit (S0={scale:.3g})")
+                self.ax.scatter(bvals[:len(obs_r)], obs_r,
+                                facecolor="white", edgecolor=c, s=55,
+                                lw=1.2, zorder=5,
+                                label=f"{e['label']} obs")
+                # Measured S0 (diamond, profile-coloured) + fitted S0
+                # (star) on the x=0 column; dashed residual connector.
+                self.ax.scatter([0.0], [float(s0_meas)], c=c,
+                                marker="D", s=55, edgecolors="white",
+                                linewidths=1.0, zorder=6,
+                                label=f"{e['label']} S0_meas={s0_meas:.3g}")
+                if s0_fit is not None and e.get("fit_s0_active", False):
+                    self.ax.scatter([0.0], [float(s0_fit)], c=c,
+                                    marker="*", s=120, edgecolors="white",
+                                    linewidths=1.0, zorder=7,
+                                    label=(f"{e['label']} S0_fit="
+                                           f"{s0_fit:.3g}"))
+                    self.ax.plot([0.0, 0.0],
+                                 [float(s0_meas), float(s0_fit)],
+                                 color=c, lw=1.0, ls="--", alpha=0.55,
+                                 zorder=5)
+                all_y.extend([obs_r, pred_r, np.array([float(s0_meas)])])
+                if s0_fit is not None and e.get("fit_s0_active", False):
+                    all_y.append(np.array([float(s0_fit)]))
+                for b, y in zip(bvals[:len(obs_r)], obs_r):
+                    self._scatter_points.append({
+                        "x": float(b), "y": float(y),
+                        "label": f"{e['label']} obs (raw)",
+                        "color": c, "kind": "obs"})
+            else:
+                self.ax.plot(bvals, pred, "-",
+                             color=c, lw=2.2, alpha=0.9, zorder=4,
+                             label=f"{e['label']} fit")
+                self.ax.scatter(bvals[:len(obs)], obs,
+                                facecolor="white", edgecolor=c, s=55,
+                                lw=1.2, zorder=5,
+                                label=f"{e['label']} obs")
+                all_y.extend([obs, pred])
+                for b, y in zip(bvals[:len(obs)], obs):
+                    self._scatter_points.append({
+                        "x": float(b), "y": float(y),
+                        "label": f"{e['label']} obs",
+                        "color": c, "kind": "obs"})
+
+        self.ax.set_title(f"Compare — Δ = {delta_ms:.0f} ms"
+                          + ("   (raw signal)" if raw_mode else ""),
                           color="#111827", pad=4)
         self.ax.set_xlabel("b-value  (s/mm²)")
-        self.ax.set_ylabel(r"$S(b)\,/\,S_0$")
+        if raw_mode:
+            self.ax.set_ylabel(r"$S(b)$   (raw signal)")
+        else:
+            self.ax.set_ylabel(r"$S(b)\,/\,S_0$")
         leg = self.ax.legend(loc="upper left",
                               bbox_to_anchor=(1.01, 1.0),
                               frameon=True, fontsize=7, ncol=1,
                               borderaxespad=0.0)
         if leg is not None:
             leg.set_draggable(True)
-        self.ax.set_xlim(600, 6800)
-        if log_y:
-            self.ax.set_yscale("log"); self.ax.set_ylim(1e-3, 1.2)
+
+        xmin = -150 if raw_mode else 600
+        self.ax.set_xlim(xmin, 6800)
+        if all_y:
+            flat = np.concatenate([np.asarray(a).ravel() for a in all_y])
+            ymax = float(np.nanmax(flat)) * 1.15 if flat.size else 1.05
         else:
-            self.ax.set_yscale("linear"); self.ax.set_ylim(-0.03, 1.1)
+            ymax = 1.05
+        if log_y:
+            self.ax.set_yscale("log")
+            floor = max(1e-3, ymax * 1e-4) if raw_mode else 1e-3
+            self.ax.set_ylim(floor, max(1.2, ymax))
+        else:
+            self.ax.set_yscale("linear")
+            ymin = -0.03 * max(ymax, 1.0) if raw_mode else -0.03
+            self.ax.set_ylim(ymin, ymax if raw_mode else max(1.1, ymax))
         self._home_xlim = self.ax.get_xlim()
         self._home_ylim = self.ax.get_ylim()
         self._hover_annot = None
@@ -462,9 +570,12 @@ class SignalCanvas(FigureCanvasQTAgg):
         # emit a hover-info tuple with the text for the status bar
         self.hoverInfo.emit(float(event.xdata), float(event.ydata), txt)
 
-        # Draw via blitting (fast even on big plots)
+        # Draw via blitting (fast even on big plots). If we don't have a
+        # cached background yet, just schedule an idle redraw — calling
+        # self.draw() synchronously from a motion callback can re-enter
+        # the Qt paint path and has been observed to segfault on WSL/X11.
         if self._bg is None:
-            self.draw()   # force a fresh cache
+            self.draw_idle()
             return
         self.fig.canvas.restore_region(self._bg)
         if self._hover_pt is None:
