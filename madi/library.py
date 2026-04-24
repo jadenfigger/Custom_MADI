@@ -396,7 +396,7 @@ def match_voxels_batch(
     m2 = np.sum(measured ** 2, axis=1, keepdims=True)
     l2 = np.sum(lib_m   ** 2, axis=1, keepdims=True).T
     dists = m2 + l2 - 2.0 * measured @ lib_m.T
- 
+
     best_idx = np.argmin(dists, axis=1)
     return (kios_arr[best_idx], rhos_arr[best_idx], Vs_arr[best_idx],
             dists[np.arange(len(best_idx)), best_idx])

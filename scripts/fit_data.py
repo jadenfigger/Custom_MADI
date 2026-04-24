@@ -410,6 +410,22 @@ def main():
                          "for matching (e.g. 1500000 for brain).")
 
     args = ap.parse_args()
+    
+    # # Manually overridden arguments matching the terminal command
+    # args.fit = True
+    # args.input = [
+    #     "15:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data/2026-02-05_NEXI_H/preprocessed_4/DWI_15ms/eddy_corrected.nii.gz",
+    #     "25:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data/2026-02-05_NEXI_H/preprocessed_4/DWI_25ms/eddy_corrected.nii.gz",
+    #     "30:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data/2026-02-05_NEXI_H/preprocessed_4/DWI_30ms/eddy_corrected.nii.gz",
+    #     "40:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data/2026-02-05_NEXI_H/preprocessed_4/DWI_40ms/eddy_corrected.nii.gz"
+    # ]
+    # args.mask = "/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data/2026-02-05_NEXI_H/preprocessed_4/DWI_15ms/mask_cropped.nii.gz"
+    # args.out = "out_baseline"
+    # args.library = "data/libraries/madi_dense.npz"
+
+    # args.fit_s0 = False
+    # args.rician_correct = False
+    # args.avg_s0 = False
 
     if not any([args.build_library, args.fit, args.info]):
         ap.print_help(); return
