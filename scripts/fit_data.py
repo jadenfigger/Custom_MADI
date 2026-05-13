@@ -5,41 +5,51 @@ fit_data.py — Build MADI libraries & fit in-vivo DWI data
 
 NEW IN THIS VERSION
 -------------------
+1. **Bvals/bvecs-driven shell detection**
+       The hardcoded SHELLS table is gone.  Each input acquisition
+       carries its own bvals (FSL format) and optional bvecs file.
+       b=0 indices and shell groupings are detected from bvals.  This
+       lets you fit datasets with arbitrary numbers of shells, arbitrary
+       direction counts, and interleaved b=0 volumes — as long as the
+       (Δ, b) pairs you have are a subset of what the library covers.
+
+2. **(Δ, b) pair-level matching**
+       Library entries store an n_deltas × n_b signal vector.  The
+       matcher now subsets to whatever (Δ, b) pairs the data provides,
+       not just whatever Δ values.  A single-shell dataset against a
+       4-shell library will match on the column for that one b-value.
+
+3. **Acquisition consistency checks**
+       Pre-fit: small δ must match library, every input Δ must be in
+       the library, every measured b-value must be in the library's
+       b-values for that Δ.  Underdetermined fits (fewer measurements
+       than free parameters) trigger a loud warning.
+
+4. **Multi-b=0 averaging**
+       Each input file may have many b=0 volumes scattered throughout.
+       They are averaged within each Δ acquisition to produce that Δ's
+       S0.  --avg-s0 still cross-averages S0 across Δ.
+
+LEGACY FEATURES (unchanged)
+---------------------------
 1. **Rician noise-bias correction** (--rician-correct)
-       Uses the second-moment identity  E[M^2] = A^2 + 2 sigma^2
-       to recover the underlying true signal A from magnitude data M
-       before normalization.  sigma is auto-estimated from a background
-       (air) region of each volume, or supplied via --noise-sigma.
-
 2. **S0 averaging across Delta scans** (--avg-s0)
-       Because TE is fixed across all Delta acquisitions in this
-       protocol (PPR confirms TE=54 ms regardless of big_delta), the
-       four b=0 images should differ only by noise.  Averaging gives
-       up to 2x SNR on S0, which propagates as reduced noise in EVERY
-       normalized data point.  ONLY safe if the four scans are well
-       co-registered or motion is negligible.
-
 3. **Optional S0 fitting in the matcher** (--fit-s0)
-       Instead of dividing by the measured b=0 and matching ratios,
-       treat S0 as a free linear parameter per voxel and find the
-       (kio, rho, V, S0) combo that best matches the *un-normalized*
-       signal.  S0 is solved analytically per library entry as the
-       L2-optimal projection.  Compare against the default (fixed S0)
-       to diagnose S0-related biases.
 
-LIBRARY BUILDING
-----------------
-[unchanged - see previous docstring]
+INPUT FORMAT
+------------
+  New (recommended):
+    --input "Δ:dwi.nii.gz:bvals.bval[:bvecs.bvec]"
+  Legacy (still works for old protocol):
+    --input "Δ:dwi.nii.gz"   (uses LEGACY_SHELLS)
 
-FITTING
--------
+EXAMPLES
+--------
   python fit_data.py --fit \\
-      --input 15:dwi15.nii.gz 25:dwi25.nii.gz 30:dwi30.nii.gz 40:dwi40.nii.gz \\
+      --input 25:dwi25.nii.gz:dwi25.bval:dwi25.bvec \\
       --mask mask.nii.gz \\
-      --rician-correct --avg-s0
-
-  Compare with S0 fitted as free parameter:
-  python fit_data.py --fit --input ... --mask ... --rician-correct --fit-s0
+      --small-delta 6.0 \\
+      --rician-correct
 """
 
 import argparse, os, sys, time
@@ -57,16 +67,26 @@ from madi.signal   import signals_to_flat
 
 
 # ===================================================================
-# Acquisition protocol
+# Acquisition protocol — LEGACY fallback only
 # ===================================================================
+# Used only when an --input has no bvals path attached (old workflow).
+# New code paths use bvals files directly.
 
-SHELLS = [
-    (1000, slice(1, 25)),
-    (2500, slice(25, 49)),
-    (4000, slice(49, 73)),
-    (6000, slice(73, 97)),
+LEGACY_SHELLS = [
+    (1000.0, slice(1, 25)),
+    (2500.0, slice(25, 49)),
+    (4000.0, slice(49, 73)),
+    (6000.0, slice(73, 97)),
 ]
-N_SHELLS = len(SHELLS)
+LEGACY_B0_INDEX = 0
+LEGACY_N_VOLS   = 97
+
+
+# Tolerance for clustering bvals into shells (s/mm²).  Anything below
+# B0_THRESHOLD is treated as b=0; non-zero bvals within B_TOL of each
+# other are grouped into the same shell.
+B0_THRESHOLD = 50.0
+B_TOL        = 50.0
 
 
 # ===================================================================
@@ -103,7 +123,7 @@ PRESETS = {
                 2_000_000, 3_000_000],
         "Vs":   [0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5,
                 3.0, 4.0, 5.0, 7.0, 9.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=40, n_steps=50_000,
+        "cfg":  dict(n_walkers=100_000, n_ensembles=40, n_steps=75_000,
                      L=250.0, buffer=60.0, grid_spacing=1.0),
     },
 }
@@ -121,10 +141,173 @@ def parse_triplet(s: str):
 
 
 def parse_input(s: str):
-    if ":" not in s:
-        raise ValueError(f"Input must be 'delta:/path/to/file.nii.gz', got '{s}'")
-    delta_str, path = s.split(":", 1)
-    return (float(delta_str), path)
+    """Parse a single --input spec.
+
+    Supported forms:
+        Δ:dwi.nii.gz                          — legacy, uses LEGACY_SHELLS
+        Δ:dwi.nii.gz:bvals.bval               — bvals-driven, no bvecs
+        Δ:dwi.nii.gz:bvals.bval:bvecs.bvec    — bvals + bvecs
+
+    Returns
+    -------
+    (delta_ms, dwi_path, bvals_path_or_None, bvecs_path_or_None)
+    """
+    parts = s.split(":")
+    if len(parts) < 2:
+        raise ValueError(
+            f"Input must be 'Δ:dwi.nii.gz[:bvals[:bvecs]]', got '{s}'")
+    try:
+        delta = float(parts[0])
+    except ValueError:
+        raise ValueError(f"First field of --input must be Δ in ms; got '{parts[0]}'")
+    dwi   = parts[1]
+    bvals = parts[2] if len(parts) >= 3 and parts[2] else None
+    bvecs = parts[3] if len(parts) >= 4 and parts[3] else None
+    if len(parts) > 4:
+        raise ValueError(f"Too many ':'-separated fields in --input '{s}'")
+    return (delta, dwi, bvals, bvecs)
+
+
+def parse_z_slice(s):
+    """Parse a --z-slice spec into a Python slice object (or None).
+
+    Examples
+    --------
+        '50'    → slice(50, 51)        — single Z-slice
+        '40:60' → slice(40, 60)        — Z in [40, 60)
+        ':60'   → slice(None, 60)      — Z in [0, 60)
+        '40:'   → slice(40, None)      — Z in [40, end)
+        None    → None                 — no restriction
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"--z-slice range must be 'a:b', got '{s}'")
+        a = int(parts[0]) if parts[0] else None
+        b = int(parts[1]) if parts[1] else None
+        return slice(a, b)
+    return slice(int(s), int(s) + 1)
+
+
+# ===================================================================
+# bvals / bvecs parsing
+# ===================================================================
+
+def parse_bvals(path: str, b0_thresh: float = B0_THRESHOLD,
+                b_tol: float = B_TOL):
+    """Read an FSL-format bvals file and group into b=0 + shells.
+
+    Parameters
+    ----------
+    path : str
+        Path to a whitespace-delimited bvals file (typically one row).
+    b0_thresh : float
+        Anything with b < this is treated as b=0 [s/mm²].
+    b_tol : float
+        Non-zero bvals within ±b_tol of each other are grouped into the
+        same shell [s/mm²].
+
+    Returns
+    -------
+    bvals : (n_vols,) float ndarray  — raw values from the file
+    b0_idx : (n_b0,) int ndarray
+    shells : list of (b_value, idx_array) sorted by ascending b
+        b_value is the rounded representative for that shell [s/mm²].
+    """
+    raw = np.loadtxt(path).ravel().astype(float)
+    if raw.size == 0:
+        raise ValueError(f"bvals file is empty: {path}")
+
+    b0_mask = raw < b0_thresh
+    b0_idx  = np.where(b0_mask)[0]
+    nz_idx  = np.where(~b0_mask)[0]
+
+    if nz_idx.size == 0:
+        raise ValueError(f"No non-zero b-values in {path}")
+
+    nz_vals = raw[nz_idx]
+
+    # Cluster by sorting and walking with b_tol gap.  Robust to scanner
+    # rounding (e.g. 998, 1001 → one cluster at 1000).
+    order = np.argsort(nz_vals)
+    sorted_vals = nz_vals[order]
+    sorted_idx  = nz_idx[order]
+
+    shells = []
+    cur_lo = sorted_vals[0]
+    cur_idx = [sorted_idx[0]]
+    cur_vals = [sorted_vals[0]]
+    for v, i in zip(sorted_vals[1:], sorted_idx[1:]):
+        if v - cur_lo <= b_tol:
+            cur_idx.append(i)
+            cur_vals.append(v)
+        else:
+            b_rep = round(float(np.mean(cur_vals)) / 50.0) * 50.0
+            shells.append((b_rep, np.array(sorted(cur_idx), dtype=int)))
+            cur_lo = v
+            cur_idx = [i]
+            cur_vals = [v]
+    b_rep = round(float(np.mean(cur_vals)) / 50.0) * 50.0
+    shells.append((b_rep, np.array(sorted(cur_idx), dtype=int)))
+
+    return raw, b0_idx, shells
+
+
+def parse_bvecs(path: str, n_vols_expected: int):
+    """Read an FSL-format bvecs file (3 rows × N columns).
+
+    Returns
+    -------
+    bvecs : (3, n_vols) ndarray, or None if path is None
+    """
+    if path is None:
+        return None
+    arr = np.loadtxt(path)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[0] != 3:
+        # Some pipelines store bvecs as N×3; transpose if needed
+        if arr.shape[1] == 3:
+            arr = arr.T
+        else:
+            raise ValueError(
+                f"bvecs file {path} has shape {arr.shape}; expected (3, N) "
+                f"or (N, 3).")
+    if arr.shape[1] != n_vols_expected:
+        raise ValueError(
+            f"bvecs file {path}: {arr.shape[1]} columns, "
+            f"DWI has {n_vols_expected} volumes.")
+    return arr
+
+
+def check_direction_uniformity(bvecs, idx, label=""):
+    """Loose check that a set of directions is reasonably uniformly
+    distributed on the sphere.  Prints a warning if highly biased.
+
+    Heuristic: the mean of the unit vectors (after antipodal symmetry
+    folding) should have small magnitude for an isotropic set.  We use
+    the resultant length of v_k ⊗ v_k (rank-2 tensor) eigenvalue spread:
+    isotropic → all eigenvalues ≈ 1/3.
+    """
+    if bvecs is None or len(idx) < 3:
+        return
+    v = bvecs[:, idx]                   # (3, n)
+    norms = np.linalg.norm(v, axis=0)
+    keep = norms > 1e-6
+    if keep.sum() < 3:
+        return
+    v = v[:, keep] / norms[keep]
+    T = (v @ v.T) / v.shape[1]          # (3,3) rank-2 tensor
+    eigvals = np.sort(np.linalg.eigvalsh(T))[::-1]
+    spread = eigvals[0] - eigvals[2]
+    # spread = 0 → perfect isotropy; spread ≥ ~0.4 → strongly biased
+    if spread > 0.4:
+        print(f"    ⚠ {label}: directions look biased "
+              f"(eigenvalue spread = {spread:.2f}, isotropic = 0). "
+              f"Powder average may be skewed.")
 
 
 # ===================================================================
@@ -192,132 +375,265 @@ def rician_correct_secondmoment(M, sigma):
 # ===================================================================
 
 def load_dwi_and_average(input_specs, mask_path,
+                         lib_b_values,
                          rician_correct=False,
                          noise_sigma=None,
                          avg_s0=False,
-                         return_raw=False):
-    """Load DWI NIfTIs for arbitrary delta values.
+                         return_raw=False,
+                         z_slice=None,
+                         b_tol=B_TOL):
+    """Load DWI NIfTIs, derive (Δ, b) layout from each input's bvals,
+    and assemble the measured matrix in a column order matching
+    ``fit_pairs``.
 
     Parameters
     ----------
-    input_specs : list of (delta_ms, path) tuples
-    mask_path : str
-    rician_correct : if True, apply E[M^2]=A^2+2*sigma^2 correction
-                     to every voxel of every volume before averaging
-                     and normalization.
-    noise_sigma : float or None.  If None and rician_correct, sigma
-                  is estimated from background voxels of the FIRST
-                  acquisition's b=0 volume.
-    avg_s0 : if True, average the b=0 volumes across all Delta scans
-             into a single S0 image and use it for normalizing every
-             shell at every Delta.  Only safe if scans are co-registered.
-    return_raw : if True, also return the un-normalized per-shell
-                 means and the S0 used (for --fit-s0 mode).
+    input_specs : list of (delta_ms, dwi_path, bvals_path_or_None,
+                          bvecs_path_or_None)
+        For each input either bvals_path is given (preferred) or it is
+        None (legacy path: assumes LEGACY_SHELLS protocol).
+    mask_path : str or None
+        Path to a brain mask NIfTI.  If None, fit every voxel of the
+        full DWI volume — affine and shape are taken from the first
+        input DWI.  Required when ``rician_correct`` is True and
+        ``noise_sigma`` is None (auto-σ estimation needs background
+        voxels, which need a mask to find).
+    z_slice : slice or None
+        Optional Python slice along the third spatial axis to restrict
+        fitting to a Z-slice or range.  Combined (intersected) with
+        ``mask_path`` if both are given.  Noise σ estimation continues
+        to use the un-sliced mask so air voxels from outside the slice
+        range still contribute.
+    lib_b_values : list of float
+        b-values present in the library [s/mm²].  Used to filter shells
+        in the data: only shells whose b matches a library b-value
+        (within b_tol) are retained.
+    rician_correct : bool
+    noise_sigma : float or None
+    avg_s0 : bool
+        If True, replace each Δ's S0 with the grand mean across Δs.
+    return_raw : bool
+    b_tol : float
+        Tolerance for matching data b-values to library b-values.
 
     Returns
     -------
-    measured : ndarray (n_voxels, n_deltas * n_shells)  S/S0
-    fit_deltas : list of delta values [ms]
+    measured : (n_voxels, n_features) ndarray  — S/S0 ratios
+    fit_pairs : list of (Δ, b) tuples in the column order of ``measured``
     affine, mask_indices, shape
-    extras (if return_raw) : dict with 'raw' (n_voxels, n_deltas*n_shells),
-                             's0' (n_voxels,), 'sigma' (float or None)
+    extras (if return_raw) : dict with 'raw', 's0', 'sigma'
     """
     import nibabel as nib
 
-    mask_img = nib.load(mask_path)
-    mask = mask_img.get_fdata().astype(bool)
-    affine = mask_img.affine
-    shape = mask.shape
-    mask_idx = np.where(mask)
-    n_vox = len(mask_idx[0])
-
-    print(f"  Mask voxels: {n_vox}")
-
     input_specs = sorted(input_specs, key=lambda x: x[0])
-    fit_deltas = [d for d, _ in input_specs]
     n_deltas = len(input_specs)
 
-    # ---- Pass 1: load all volumes and (optionally) estimate sigma ----
-    all_data = []
-    sigma_used = None
+    # ----------------------------------------------------------------
+    # Mask (optional).  If absent, fit every voxel of the volume —
+    # spatial reference is taken from the first DWI input.
+    # ----------------------------------------------------------------
+    if mask_path is not None:
+        mask_img = nib.load(mask_path)
+        mask = mask_img.get_fdata().astype(bool)
+        affine = mask_img.affine
+        shape = mask.shape
+        print(f"  Mask: {mask.sum()} voxels (from --mask)")
+    else:
+        first_img = nib.load(input_specs[0][1])
+        affine = first_img.affine
+        shape  = tuple(first_img.shape[:3])
+        mask   = np.ones(shape, dtype=bool)
+        print(f"  No --mask: starting from full volume "
+              f"(shape {shape}, {int(np.prod(shape))} voxels). "
+              f"Output maps will contain garbage in air regions; "
+              f"mask the maps post-hoc if desired.")
 
-    for di, (delta_ms, dwi_path) in enumerate(input_specs):
-        print(f"  Loading Δ={delta_ms:.0f}ms: {os.path.basename(dwi_path)} ...",
-              end=" ", flush=True)
+    # Keep the un-sliced mask around for noise estimation (background
+    # voxels should be drawn from the whole volume regardless of
+    # whether we're only fitting one slice).
+    mask_for_noise = mask.copy()
+
+    # Optional z-slice restriction.
+    if z_slice is not None:
+        if len(shape) < 3:
+            raise ValueError(f"z_slice given but volume has shape {shape} "
+                             f"(need ≥3 spatial dims).")
+        z_keep = np.zeros(shape, dtype=bool)
+        z_keep[:, :, z_slice] = True
+        before = int(mask.sum())
+        mask = mask & z_keep
+        after = int(mask.sum())
+        # Pretty-print the slice
+        a = z_slice.start if z_slice.start is not None else 0
+        b = z_slice.stop  if z_slice.stop  is not None else shape[2]
+        print(f"  --z-slice: restricting to Z in [{a}, {b}) "
+              f"→ {after} voxels (was {before})")
+
+    mask_idx = np.where(mask)
+    n_vox = len(mask_idx[0])
+    if n_vox == 0:
+        raise ValueError("Mask (after --z-slice intersection) contains "
+                         "zero voxels.")
+
+    # ----------------------------------------------------------------
+    # Pass 1: load DWI volumes and parse each input's shell layout
+    # ----------------------------------------------------------------
+    all_data         = []         # list of (X, Y, Z, N_vols) arrays
+    all_b0_idx       = []         # list of int arrays
+    all_shells_kept  = []         # list of [(b, idx)] retained against library
+
+    for di, (delta_ms, dwi_path, bvals_path, bvecs_path) in enumerate(input_specs):
+        print(f"  Δ={delta_ms:.1f}ms  ({os.path.basename(dwi_path)})", flush=True)
         img = nib.load(dwi_path)
         data = img.get_fdata().astype(np.float64)
-        all_data.append(data)
-        print(f"shape={data.shape}")
+        n_vols = data.shape[-1]
+        print(f"    DWI shape: {data.shape}")
 
-    # ---- Noise sigma estimation (uses first scan's b=0 + background) ----
+        if bvals_path is None:
+            # Legacy path: rebuild shell layout from LEGACY_SHELLS
+            if n_vols != LEGACY_N_VOLS:
+                print(f"    ⚠ legacy mode expected {LEGACY_N_VOLS} volumes, "
+                      f"got {n_vols}.  Pass a bvals file for non-default "
+                      f"protocols.")
+            b0_idx = np.array([LEGACY_B0_INDEX], dtype=int)
+            shells = [(float(b), np.arange(sl.start, sl.stop, dtype=int))
+                      for b, sl in LEGACY_SHELLS]
+            print(f"    LEGACY mode: 1 b=0 vol, {len(shells)} shells")
+        else:
+            bvals, b0_idx, shells = parse_bvals(bvals_path)
+            if bvals.size != n_vols:
+                raise ValueError(
+                    f"bvals length ({bvals.size}) ≠ DWI volumes ({n_vols}) "
+                    f"for {dwi_path}")
+            print(f"    bvals: {len(b0_idx)} b=0 vols, "
+                  f"{len(shells)} non-zero shells "
+                  f"({[f'b={int(b)}×{len(idx)}' for b, idx in shells]})")
+
+            # Optional bvecs uniformity check
+            bvecs = parse_bvecs(bvecs_path, n_vols_expected=n_vols)
+            if bvecs is not None:
+                for b, idx in shells:
+                    check_direction_uniformity(bvecs, idx,
+                                               label=f"Δ={delta_ms:g}, b={int(b)}")
+
+        # Filter shells against library
+        kept = []
+        dropped = []
+        for b, idx in shells:
+            match = next((lb for lb in lib_b_values if abs(b - lb) <= b_tol),
+                         None)
+            if match is not None:
+                kept.append((float(match), idx))   # use library's canonical b
+            else:
+                dropped.append(b)
+        if dropped:
+            print(f"    ⚠ dropping shells not in library: "
+                  f"{[f'{b:g}' for b in dropped]}  "
+                  f"(library has {[f'{b:g}' for b in lib_b_values]})")
+        if not kept:
+            raise ValueError(
+                f"No shells in {dwi_path} match any library b-value "
+                f"(library: {lib_b_values}).")
+        kept.sort(key=lambda x: x[0])
+
+        all_data.append(data)
+        all_b0_idx.append(b0_idx)
+        all_shells_kept.append(kept)
+
+    # ----------------------------------------------------------------
+    # Build the column ordering: (Δ, b) pairs sorted by Δ then by b
+    # ----------------------------------------------------------------
+    fit_pairs = []
+    for (delta_ms, *_), kept in zip(input_specs, all_shells_kept):
+        for b, _ in kept:
+            fit_pairs.append((float(delta_ms), float(b)))
+    n_features = len(fit_pairs)
+    print(f"  → {n_features} (Δ,b) features per voxel")
+
+    # ----------------------------------------------------------------
+    # Noise sigma estimation (optional) — uses first scan's first b=0
+    # ----------------------------------------------------------------
+    sigma_used = None
     if rician_correct:
         if noise_sigma is not None:
             sigma_used = float(noise_sigma)
             print(f"  Rician correction ENABLED, user-provided sigma={sigma_used:.2f}")
         else:
-            sigma_used = estimate_noise_sigma(all_data[0], mask)
-            if sigma_used is None:
-                print("  Could not estimate sigma; disabling Rician correction.")
+            b0_for_sigma = all_data[0][..., all_b0_idx[0][0]]
+            bg = ~mask_for_noise
+            bg_vals = b0_for_sigma[bg]
+            bg_vals = bg_vals[bg_vals > 0]
+            if len(bg_vals) < 100:
+                print("    ⚠ very few background voxels — disabling Rician correction.")
                 rician_correct = False
             else:
-                # Report SNR of typical brain b=0 voxel for context
-                b0_brain_median = float(np.median(all_data[0][..., 0][mask]))
+                sigma_used = float(np.sqrt(np.mean(bg_vals.astype(np.float64) ** 2) / 2.0))
+                b0_brain_med = float(np.median(b0_for_sigma[mask_for_noise]))
                 print(f"  Rician correction ENABLED")
                 print(f"    sigma (auto, background)  = {sigma_used:.2f}")
-                print(f"    median brain b=0 signal   = {b0_brain_median:.1f}")
-                print(f"    median brain b=0 SNR      = {b0_brain_median/sigma_used:.1f}")
+                print(f"    median brain b=0 signal   = {b0_brain_med:.1f}")
+                print(f"    median brain b=0 SNR      = {b0_brain_med/sigma_used:.1f}")
 
-    # ---- Apply Rician correction in-place to all volumes ----
-    if rician_correct:
+    if rician_correct and sigma_used is not None:
         for di in range(n_deltas):
             all_data[di] = rician_correct_secondmoment(all_data[di], sigma_used)
 
-    # ---- S0 handling: per-Delta or averaged across Deltas ----
-    s0_per_delta = []  # list of (n_vox,) arrays
+    # ----------------------------------------------------------------
+    # Per-Δ S0 = mean of all b=0 volumes within that input
+    # ----------------------------------------------------------------
+    s0_per_delta = []
     for di in range(n_deltas):
-        vox_data = all_data[di][mask, :]   # (n_vox, 97)
-        s0_per_delta.append(vox_data[:, 0].copy())
+        b0_idx = all_b0_idx[di]
+        # (X, Y, Z, n_b0)  →  per-voxel mean → flatten with mask
+        b0_block = all_data[di][..., b0_idx]
+        b0_mean_vol = np.mean(b0_block, axis=-1)
+        s0_vox = b0_mean_vol[mask]
+        s0_per_delta.append(s0_vox)
+        print(f"  Δ={input_specs[di][0]:g}: S0 from {len(b0_idx)} b=0 vols, "
+              f"median brain S0 = {np.median(s0_vox):.1f}")
 
-    if avg_s0:
-        # Stack and average; shape (n_deltas, n_vox)
-        s0_stack = np.stack(s0_per_delta, axis=0)
+    if avg_s0 and n_deltas > 1:
+        s0_stack = np.stack(s0_per_delta, axis=0)             # (n_d, n_vox)
         s0_common = np.mean(s0_stack, axis=0)
-        # Per-voxel CV of the four S0s, useful diagnostic
         s0_cv = np.std(s0_stack, axis=0) / (s0_common + 1e-10)
-        print(f"  S0 averaging ENABLED (TE constant across Δ confirmed by PPR)")
-        print(f"    median S0 across-Δ CV = {np.median(s0_cv)*100:.2f}%   "
-              f"(low = scans well registered / no drift)")
+        print(f"  --avg-s0: averaging S0 across {n_deltas} Δ scans")
+        print(f"    median across-Δ S0 CV = {np.median(s0_cv)*100:.2f}%   "
+              f"(low = scans well registered)")
         print(f"    95th-pct CV           = {np.percentile(s0_cv, 95)*100:.2f}%")
         if np.median(s0_cv) > 0.10:
-            print(f"    ⚠ High S0 variability across Δ — check for motion/drift "
-                  f"before trusting averaged S0.")
-        # Use the average for every Delta
+            print(f"    ⚠ High S0 variability across Δ — check motion/drift "
+                  f"before trusting the averaged S0.")
         s0_used = [s0_common.copy() for _ in range(n_deltas)]
     else:
+        if avg_s0 and n_deltas == 1:
+            print("  --avg-s0 is a no-op for single-Δ input "
+                  "(b=0 vols within the input are already averaged).")
         s0_used = s0_per_delta
 
-    # ---- Build normalized measured matrix and (optionally) raw matrix ----
-    measured = np.zeros((n_vox, n_deltas * N_SHELLS))
-    raw_signal = np.zeros((n_vox, n_deltas * N_SHELLS))
+    # ----------------------------------------------------------------
+    # Build measured matrix in fit_pairs order
+    # ----------------------------------------------------------------
+    measured   = np.zeros((n_vox, n_features), dtype=np.float64)
+    raw_signal = np.zeros((n_vox, n_features), dtype=np.float64)
 
-    for di, (delta_ms, _) in enumerate(input_specs):
-        vox_data = all_data[di][mask, :]
+    col = 0
+    for di, kept in enumerate(all_shells_kept):
+        vox_data = all_data[di][mask, :]            # (n_vox, n_vols)
         S0 = s0_used[di].copy()
         S0[S0 < 1e-10] = 1e-10
-
-        for si, (b_val, vol_slice) in enumerate(SHELLS):
-            shell_mean = np.mean(vox_data[:, vol_slice], axis=1)
-            measured[:, di * N_SHELLS + si] = shell_mean / S0
-            raw_signal[:, di * N_SHELLS + si] = shell_mean
+        for b, idx in kept:
+            shell_mean = np.mean(vox_data[:, idx], axis=1)
+            measured[:, col]   = shell_mean / S0
+            raw_signal[:, col] = shell_mean
+            col += 1
+    assert col == n_features
 
     if return_raw:
-        # For --fit-s0 mode we need a single per-voxel S0 reference
-        # (only used as a starting estimate / scale).
         s0_ref = np.mean(np.stack(s0_used, axis=0), axis=0)
         extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used)
-        return measured, fit_deltas, affine, mask_idx, shape, extras
+        return measured, fit_pairs, affine, mask_idx, shape, extras
 
-    return measured, fit_deltas, affine, mask_idx, shape
+    return measured, fit_pairs, affine, mask_idx, shape
 
 
 # ===================================================================
@@ -377,7 +693,18 @@ def main():
                     help="'delta:path' pairs (e.g. 15:dwi15.nii.gz)")
     ap.add_argument("--dwi15"); ap.add_argument("--dwi25")
     ap.add_argument("--dwi30"); ap.add_argument("--dwi40")
-    ap.add_argument("--mask")
+    ap.add_argument("--mask", default=None,
+                    help="Optional brain mask NIfTI.  If omitted, the "
+                         "fit is run over every voxel of the volume.  "
+                         "Required when --rician-correct is used without "
+                         "an explicit --noise-sigma.")
+    ap.add_argument("--z-slice", default=None,
+                    help="Restrict fitting to a single Z-slice or range. "
+                         "Examples: '50' (just slice 50), '40:60' "
+                         "(slices 40-59), ':60' (slices 0-59), '40:' "
+                         "(slices 40 to end).  Intersects with --mask "
+                         "if both are given.  Noise σ estimation still "
+                         "uses the un-sliced volume.")
     ap.add_argument("--out", default="madi_output")
 
     # -- NEW: Rician + S0 options --
@@ -400,6 +727,12 @@ def main():
                          "library entry).  Diagnostic for S0 reliability.")
     ap.add_argument("--log_space", action="store_true",
                     help="Whether to preform fitting within log space or to use no transformations.")
+    # -- NEW: acquisition metadata (must match library) --
+    ap.add_argument("--small-delta", type=float, default=None,
+                    help="δ (PFG duration) [ms] of the data being fit.  "
+                         "Must match the library's small δ (within 0.05 ms).  "
+                         "If omitted, the library's stored small δ is used "
+                         "and a warning is printed.")
     # -- Matcher tuning (already exposed in library.py but worth making CLI) --
     ap.add_argument("--vi-min", type=float, default=0.5,
                     help="Lower bound on intracellular volume fraction "
@@ -439,9 +772,7 @@ def main():
         lib = load_library(args.library)
         meta = load_library_meta(args.library)
         print(f"\nLibrary: {args.library}")
-        library_summary(lib)
-        print(f"  Δ values: {meta['deltas']} ms")
-        print(f"  b-values per Δ: {meta['n_b']}")
+        library_summary(lib, meta=meta)
         return
 
 # ================================================================
@@ -570,21 +901,25 @@ def main():
                           (30.0, args.dwi30), (40.0, args.dwi40)]
             for delta, path in legacy_map:
                 if path is not None:
-                    input_specs.append((delta, path))
+                    # Legacy CLI args have no bvals/bvecs — fall back to
+                    # LEGACY_SHELLS by passing None.
+                    input_specs.append((delta, path, None, None))
 
         if not input_specs:
             print("ERROR: No DWI inputs specified."); return
-        if args.mask is None:
-            print("ERROR: --mask is required for --fit"); return
+        if args.mask is None and args.rician_correct and args.noise_sigma is None:
+            print("ERROR: --rician-correct without --mask requires "
+                  "--noise-sigma <value>.  Auto-estimation of σ needs "
+                  "background (air) voxels, which requires a brain mask "
+                  "to identify."); return
 
         input_specs.sort(key=lambda x: x[0])
-        fit_deltas = [d for d, _ in input_specs]
+        fit_deltas = [d for d, _, _, _ in input_specs]
 
         print("=" * 60)
         print("MADI Fitting")
         print("=" * 60)
         print(f"  Δ values to fit:        {fit_deltas} ms")
-        print(f"  Signal vector length:   {len(fit_deltas) * N_SHELLS}")
         print(f"  Rician correction:      {args.rician_correct}")
         print(f"  S0 averaging across Δ:  {args.avg_s0}")
         print(f"  S0 fitted per voxel:    {args.fit_s0}")
@@ -598,45 +933,96 @@ def main():
             print(f"ERROR: Library not found: {args.library}"); return
         lib = load_library(args.library)
         meta = load_library_meta(args.library)
-        lib_deltas = meta['deltas']
-        n_b = meta['n_b']
-        print(f"  {len(lib)} entries, lib Δ = {lib_deltas} ms")
-        library_summary(lib)
+        lib_deltas    = meta['deltas']
+        lib_n_b       = meta['n_b']
+        lib_small_d   = meta['small_delta']
+        lib_b_values  = meta['b_values']
 
+        if lib_b_values is None:
+            print(f"ERROR: library has no stored b-values metadata and no "
+                  f"safe default could be inferred.  Rebuild the library "
+                  f"with the updated _save_library, or patch lib_b_values "
+                  f"manually."); return
+
+        print(f"  {len(lib)} entries")
+        library_summary(lib, meta=meta)
+
+        # ---- Acquisition consistency checks ----
+        # 1. small δ
+        if args.small_delta is not None:
+            if lib_small_d is None:
+                print(f"  ⚠ library was built before small δ was saved; "
+                      f"trusting --small-delta={args.small_delta} ms.")
+            elif abs(args.small_delta - lib_small_d) > 0.05:
+                print(f"ERROR: --small-delta ({args.small_delta} ms) does not "
+                      f"match library small δ ({lib_small_d} ms)."); return
+            else:
+                print(f"  ✓ small δ matches library: {args.small_delta} ms")
+        else:
+            if lib_small_d is None:
+                print(f"  ⚠ no --small-delta supplied and library has none "
+                      f"stored.  Assuming default {SimConfig().delta} ms.")
+            else:
+                print(f"  ⓘ no --small-delta supplied; assuming library value "
+                      f"{lib_small_d} ms.")
+
+        # 2. Δ values
         for d in fit_deltas:
             if not any(abs(d - ld) < 0.01 for ld in lib_deltas):
-                print(f"ERROR: Δ = {d} ms not in library ({lib_deltas})"); return
+                print(f"ERROR: Δ = {d} ms not in library {list(lib_deltas)}"); return
 
-        # Load data — get raw signals too if we'll fit S0
+        # Load data; produces fit_pairs ----
         print("\nLoading DWI data ...")
+        z_slice_obj = parse_z_slice(args.z_slice)
         load_out = load_dwi_and_average(
             input_specs, args.mask,
+            lib_b_values=lib_b_values,
             rician_correct=args.rician_correct,
             noise_sigma=args.noise_sigma,
             avg_s0=args.avg_s0,
             return_raw=args.fit_s0,
+            z_slice=z_slice_obj,
         )
 
         if args.fit_s0:
-            measured, fit_deltas, affine, mask_idx, shape, extras = load_out
+            measured, fit_pairs, affine, mask_idx, shape, extras = load_out
+        else:
+            measured, fit_pairs, affine, mask_idx, shape = load_out
+
+        n_features = len(fit_pairs)
+        print(f"\n  Feature vector ({n_features} cols):")
+        for d, b in fit_pairs:
+            print(f"    Δ={d:g} ms,  b={b:g} s/mm²")
+
+        # Underdetermination warning (3 free params: kio, ρ, V)
+        if n_features < 3:
+            print(f"\n  ⚠ Only {n_features} measurement(s) per voxel for "
+                  f"3 free parameters (kio, ρ, V).  The fit is severely "
+                  f"underdetermined; many library entries will produce "
+                  f"essentially identical residuals.  Treat the maps as "
+                  f"diagnostic only.")
+        elif n_features < 6:
+            print(f"\n  ⓘ {n_features} measurements per voxel for 3 free "
+                  f"parameters — a workable but tight fit.")
+
+        # ---- Match ----
+        if args.fit_s0:
             raw_signal = extras['raw']
-            print(f"\nMatching {raw_signal.shape[0]} voxels with S0 FITTED "
-                  f"(using Δ = {fit_deltas} ms) ...")
+            print(f"\nMatching {raw_signal.shape[0]} voxels with S0 FITTED ...")
             t0 = time.time()
             kio_map, rho_map, V_map, res_map, s0_fit_map = match_voxels_batch_fits0(
                 raw_signal, lib,
-                fit_deltas=fit_deltas,
+                fit_pairs=fit_pairs,
                 lib_deltas=lib_deltas,
-                n_b=n_b,
+                lib_b_values=lib_b_values,
+                n_b=lib_n_b,
                 vi_min=args.vi_min,
                 vi_max=args.vi_max,
                 rho_max=args.rho_max,
             )
             print(f"  Done in {time.time()-t0:.1f}s")
-            # Save the fitted S0 map for inspection
             save_map(s0_fit_map, mask_idx, shape, affine,
                      os.path.join(args.out, "s0_fit_map.nii.gz"))
-            # Diagnostic: ratio of fitted S0 to measured b=0 mean
             s0_ratio = s0_fit_map / (extras['s0'] + 1e-10)
             save_map(s0_ratio, mask_idx, shape, affine,
                      os.path.join(args.out, "s0_fit_over_measured.nii.gz"))
@@ -644,22 +1030,19 @@ def main():
             print(f"    median = {np.median(s0_ratio):.3f}")
             print(f"    5-95%  = [{np.percentile(s0_ratio, 5):.3f}, "
                   f"{np.percentile(s0_ratio, 95):.3f}]")
-            print(f"    (deviation from 1.0 indicates S0 mismatch — "
-                  f"voxels with ratio >> 1 may have b=0 underestimated, "
-                  f"e.g. due to Rician bias on a low-SNR b=0)")
         else:
-            measured, fit_deltas, affine, mask_idx, shape = load_out
-            print(f"\nMatching {measured.shape[0]} voxels (using Δ = {fit_deltas} ms) ...")
+            print(f"\nMatching {measured.shape[0]} voxels ...")
             t0 = time.time()
             kio_map, rho_map, V_map, res_map = match_voxels_batch(
                 measured, lib,
-                fit_deltas=fit_deltas,
+                fit_pairs=fit_pairs,
                 lib_deltas=lib_deltas,
-                n_b=n_b,
+                lib_b_values=lib_b_values,
+                n_b=lib_n_b,
                 vi_min=args.vi_min,
                 vi_max=args.vi_max,
                 rho_max=args.rho_max,
-                log_space=args.log_space
+                log_space=args.log_space,
             )
             print(f"  Done in {time.time()-t0:.1f}s")
 

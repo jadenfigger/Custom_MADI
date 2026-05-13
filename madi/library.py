@@ -105,7 +105,7 @@ def build_library_from_triplets(
         if verbose:
             print("  Nothing new to compute!")
         if save_path:
-            _save_library(library, save_path)
+            _save_library(library, save_path, cfg=cfg)
         return library
 
     t0 = time.time()
@@ -164,7 +164,7 @@ def build_library_from_triplets(
         # Checkpoint after every (rho, V) group — cheap insurance
         # against SLURM preemption / walltime kills.
         if save_path:
-            _save_library(library, save_path)
+            _save_library(library, save_path, cfg=cfg)
 
     elapsed = time.time() - t0
     if verbose:
@@ -172,7 +172,7 @@ def build_library_from_triplets(
               f"({len(new_triplets)} new in {elapsed:.0f}s)")
 
     if save_path:
-        _save_library(library, save_path)
+        _save_library(library, save_path, cfg=cfg)
         if verbose:
             print(f"Saved to {save_path}")
 
@@ -207,15 +207,36 @@ def build_library(
 # I/O
 # ---------------------------------------------------------------------------
 
-def _save_library(lib: list[LibraryEntry], path: str):
+def _save_library(lib: list[LibraryEntry], path: str,
+                  cfg: SimConfig | None = None,
+                  b_values: np.ndarray | None = None):
+    """Persist library + acquisition metadata to npz.
+
+    Stores:
+        kios, rhos, Vs, vectors  — entry parameters and S/S0 vectors
+        deltas                   — list of Δ values [ms] used at build time
+        n_b                      — number of unique non-zero b-values per Δ
+        small_delta              — δ (PFG duration) [ms]            NEW
+        b_values                 — list of b-values [s/mm²] per Δ   NEW
+    """
+    if cfg is None:
+        cfg = SimConfig()
+    if b_values is None:
+        b_values = BVALS_UNIQUE
+
     kios = np.array([e.kio for e in lib])
     rhos = np.array([e.rho for e in lib])
     Vs   = np.array([e.V for e in lib])
     vecs = np.array([e.vector for e in lib])
-    deltas = np.array(DELTAS_BIG)
-    n_b = len(BVALS_UNIQUE)
-    np.savez(path, kios=kios, rhos=rhos, Vs=Vs, vectors=vecs,
-             deltas=deltas, n_b=np.array(n_b))
+    deltas = np.array(cfg.Deltas, dtype=float)
+    np.savez(
+        path,
+        kios=kios, rhos=rhos, Vs=Vs, vectors=vecs,
+        deltas=deltas,
+        n_b=np.array(len(b_values)),
+        small_delta=np.array(float(cfg.delta)),
+        b_values=np.asarray(b_values, dtype=float),
+    )
 
 
 def load_library(path: str) -> list[LibraryEntry]:
@@ -232,15 +253,43 @@ def load_library(path: str) -> list[LibraryEntry]:
 
 
 def load_library_meta(path: str) -> dict:
-    """Load metadata (deltas, n_b) from library file."""
+    """Load metadata from library file.
+
+    Returns
+    -------
+    dict with keys:
+        deltas      : list of Δ values [ms]
+        n_b         : number of b-values per Δ
+        small_delta : δ [ms]  (None for old libraries — see warning)
+        b_values    : list of b-values [s/mm²]  (None if not stored)
+    """
     data = np.load(path)
     meta = {}
     meta['deltas'] = list(data['deltas']) if 'deltas' in data else list(DELTAS_BIG)
-    meta['n_b'] = int(data['n_b']) if 'n_b' in data else len(BVALS_UNIQUE)
+    meta['n_b']    = int(data['n_b'])    if 'n_b'    in data else len(BVALS_UNIQUE)
+
+    if 'small_delta' in data.files:
+        meta['small_delta'] = float(data['small_delta'])
+    else:
+        meta['small_delta'] = None
+
+    if 'b_values' in data.files:
+        meta['b_values'] = list(np.asarray(data['b_values'], dtype=float))
+    elif meta['n_b'] == len(BVALS_UNIQUE):
+        # Old library built with default config — assume default b-values
+        meta['b_values'] = list(BVALS_UNIQUE.astype(float))
+    else:
+        meta['b_values'] = None
+
     return meta
 
 
-def library_summary(lib: list[LibraryEntry]):
+def library_summary(lib: list[LibraryEntry], meta: dict | None = None):
+    """Print a summary of a library.
+
+    If ``meta`` (from ``load_library_meta``) is provided, also reports
+    small δ and the b-value list.
+    """
     if not lib:
         print("  (empty library)")
         return
@@ -253,10 +302,27 @@ def library_summary(lib: list[LibraryEntry]):
     print(f"  rho  ({len(rhos)}): {[f'{r/1e3:.0f}k' for r in rhos]}")
     print(f"  V    ({len(Vs)}):   {[f'{v:.2f}' for v in Vs]}")
     print(f"  vi range: [{min(vis):.3f}, {max(vis):.3f}]")
-    n_b = lib[0].vector.size
-    n_deltas = len(DELTAS_BIG)
-    print(f"  Vector length: {n_b}  "
-          f"({n_b // n_deltas} b-values × {n_deltas} Δ values)")
+
+    vec_len = lib[0].vector.size
+    if meta is not None:
+        n_b = meta['n_b']
+        n_deltas = len(meta['deltas'])
+        sd = meta.get('small_delta')
+        bvs = meta.get('b_values')
+        print(f"  Vector length: {vec_len}  ({n_b} b-values × {n_deltas} Δ values)")
+        print(f"  Δ values [ms]: {[f'{d:g}' for d in meta['deltas']]}")
+        if sd is not None:
+            print(f"  small δ [ms]:  {sd:g}")
+        else:
+            print(f"  small δ [ms]:  (not stored — assumed {SimConfig().delta:g})")
+        if bvs is not None:
+            print(f"  b-values [s/mm²]: {[f'{b:g}' for b in bvs]}")
+        else:
+            print(f"  b-values [s/mm²]: (not stored)")
+    else:
+        n_deltas = len(DELTAS_BIG)
+        print(f"  Vector length: {vec_len}  "
+              f"({vec_len // n_deltas} b-values × {n_deltas} Δ values)")
 
 
 # ---------------------------------------------------------------------------
@@ -272,31 +338,80 @@ def _delta_indices(fit_deltas, lib_deltas):
         else:
             raise ValueError(f"Δ = {d} ms not in library deltas {lib_deltas}.")
     return indices
- 
- 
+
+
 def _subset_vectors(lib_mat, delta_indices, n_b):
     return np.hstack([lib_mat[:, di * n_b : (di + 1) * n_b] for di in delta_indices])
- 
- 
-def _build_candidate_lib_matrix(library, fit_deltas, lib_deltas,
-                                 n_b, vi_min, vi_max, rho_max):
-    """Apply candidate filtering and produce the masked, Δ-subset library matrix.
- 
+
+
+def _pair_indices(fit_pairs, lib_deltas, lib_b_values, n_b, b_tol=50.0):
+    """Column indices into a flat library vector for a list of (Δ, b) pairs.
+
+    Parameters
+    ----------
+    fit_pairs : list of (Δ_ms, b_s_mm2)
+        The (Δ, b) pairs in the order they appear in the measured vector.
+    lib_deltas : list of float
+        Δ values present in the library.
+    lib_b_values : list of float
+        b-values present in the library (assumed identical for every Δ).
+    n_b : int
+        Number of b-values per Δ in the flat library vector.
+    b_tol : float
+        Match tolerance for b-values [s/mm²] (handles rounding like 999/1001).
+
     Returns
     -------
-    lib_mat : (n_candidates, n_fit_deltas * n_b)
+    cols : (n_pairs,) int array
+    """
+    if lib_b_values is None:
+        raise ValueError(
+            "Library has no stored b-values. Either rebuild the library "
+            "with the updated _save_library, or pass lib_b_values explicitly."
+        )
+
+    cols = np.empty(len(fit_pairs), dtype=int)
+    for k, (d, b) in enumerate(fit_pairs):
+        di = next((i for i, ld in enumerate(lib_deltas) if abs(d - ld) < 0.01), None)
+        if di is None:
+            raise ValueError(f"Δ = {d} ms not in library deltas {list(lib_deltas)}.")
+        bi = next((j for j, lb in enumerate(lib_b_values) if abs(b - lb) < b_tol), None)
+        if bi is None:
+            raise ValueError(
+                f"b = {b} s/mm² not in library b-values {list(lib_b_values)} "
+                f"(tol ±{b_tol})."
+            )
+        cols[k] = di * n_b + bi
+    return cols
+
+
+def _build_candidate_lib_matrix(library, fit_deltas, lib_deltas,
+                                 n_b, vi_min, vi_max, rho_max,
+                                 fit_pairs=None, lib_b_values=None):
+    """Apply candidate filtering and produce the masked, subset library matrix.
+
+    Two ways to specify the subset:
+      * Legacy:  pass ``fit_deltas`` + ``n_b`` (selects all b-values for each Δ).
+      * New:     pass ``fit_pairs`` (list of (Δ, b)) + ``lib_b_values`` for
+                 arbitrary (Δ, b) selection.
+
+    If both are passed, ``fit_pairs`` wins.
+
+    Returns
+    -------
+    lib_mat : (n_candidates, n_features)
     kios_arr, rhos_arr, Vs_arr : (n_candidates,)
     """
     if lib_deltas is None:
         lib_deltas = list(DELTAS_BIG)
- 
+
     vis  = np.array([(e.rho / 1e9) * (e.V * 1e3) for e in library])
     rhos = np.array([e.rho for e in library])
- 
+
     mask = (vis >= vi_min) & (vis <= vi_max)
     if rho_max is not None:
         mask &= (rhos <= rho_max)
- 
+
     n_candidates = int(mask.sum())
     if n_candidates == 0:
         raise ValueError(
@@ -305,20 +420,23 @@ def _build_candidate_lib_matrix(library, fit_deltas, lib_deltas,
     if n_candidates < 50:
         import warnings
         warnings.warn(f"Only {n_candidates} library entries pass the filter.")
- 
+
     lib_entries = [e for e, m in zip(library, mask) if m]
     full_mat    = np.array([e.vector for e in lib_entries])
- 
-    if fit_deltas is not None:
+
+    if fit_pairs is not None:
+        col_idx = _pair_indices(fit_pairs, lib_deltas, lib_b_values, n_b)
+        lib_mat = full_mat[:, col_idx]
+    elif fit_deltas is not None:
         di_idx  = _delta_indices(fit_deltas, lib_deltas)
         lib_mat = _subset_vectors(full_mat, di_idx, n_b)
     else:
         lib_mat = full_mat
- 
+
     kios_arr = np.array([e.kio for e in lib_entries])
     rhos_arr = np.array([e.rho for e in lib_entries])
     Vs_arr   = np.array([e.V   for e in lib_entries])
- 
+
     return lib_mat, kios_arr, rhos_arr, Vs_arr
  
 
@@ -376,23 +494,31 @@ def match_voxels_batch(
     fit_deltas=None, lib_deltas=None, n_b=4,
     log_space=False, s_floor=1e-3,
     vi_min=0.5, vi_max=0.95, rho_max=None,
+    fit_pairs=None, lib_b_values=None,
 ):
     """Log-space nearest-neighbour matching, S0 fixed (data already
     divided by measured b=0).
- 
+
     Inputs are S/S0 ratios.
+
+    Two ways to specify the columns to match on:
+      * Legacy:  ``fit_deltas`` + ``n_b``  → all b-values per Δ.
+      * New:     ``fit_pairs`` (list of (Δ, b)) + ``lib_b_values``
+                 → arbitrary (Δ, b) subset.  Required when the
+                 measured data has fewer b-shells than the library.
     """
 
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
-        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max)
- 
+        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
+        fit_pairs=fit_pairs, lib_b_values=lib_b_values)
+
     if log_space:
         measured = np.log(np.clip(measured_batch, s_floor, 1.0))
         lib_m    = np.log(np.clip(lib_mat,         s_floor, 1.0))
     else:
         measured = measured_batch
         lib_m    = lib_mat
- 
+
     m2 = np.sum(measured ** 2, axis=1, keepdims=True)
     l2 = np.sum(lib_m   ** 2, axis=1, keepdims=True).T
     dists = m2 + l2 - 2.0 * measured @ lib_m.T
@@ -411,36 +537,25 @@ def match_voxels_batch_fits0(
     library,
     fit_deltas=None, lib_deltas=None, n_b=4,
     vi_min=0.5, vi_max=0.95, rho_max=None,
+    fit_pairs=None, lib_b_values=None,
 ):
     """Match un-normalized signals with S0 as a free per-voxel linear param.
- 
+
+    See ``match_voxels_batch`` for the ``fit_pairs`` / ``lib_b_values``
+    semantics.
+
     For each voxel m and each candidate library ratio vector r,
- 
+
         S0*(m, r) = (m . r) / (r . r)
         residual  = ||m||^2  -  (m . r)^2 / (r . r)
- 
-    The matcher picks the (kio, rho, V) entry that minimises the residual,
-    and reports the corresponding S0*.
- 
-    Notes
-    -----
-    - Uses LINEAR-space L2 (not log).  Log-space cannot accommodate a free
-      multiplicative scale cleanly because log(S0*r) = log(S0) + log(r)
-      makes S0 an additive offset, but then negative residuals from noise
-      can blow up under clipping.  Linear L2 with analytic S0 is the
-      cleanest and is widely used (Walsh et al., Jiang et al.).
-    - Adds one degree of freedom (S0) per voxel, so residuals are always
-      smaller than the fixed-S0 matcher even when the model is wrong.
-      Compare maps from both modes; large parameter shifts indicate
-      either S0 problems in the data OR that the model can't fit some
-      voxels and was being held in check by the S0 constraint.
- 
+
     Returns
     -------
     kio_map, rho_map, V_map, residual_map, s0_fit_map  (each shape (n_voxels,))
     """
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
-        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max)
+        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
+        fit_pairs=fit_pairs, lib_b_values=lib_b_values)
  
     M = raw_signal.astype(np.float64)            # (n_vox, n_feat)
     R = lib_mat.astype(np.float64)               # (n_lib, n_feat)

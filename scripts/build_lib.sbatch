@@ -23,7 +23,7 @@ python -c "import numpy, scipy, numba, nibabel; from numba import cuda; print('i
 cd "${SLURM_SUBMIT_DIR}"
 mkdir -p logs libraries
 
-python fit_data.py \
+python /scratch/jfigger/madi/Custom_MADI/scripts/fit_data.py \
     --build-library \
     --lib-preset dense \
     --library libraries/madi_dense.npz \

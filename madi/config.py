@@ -33,17 +33,17 @@ GAMMA_RAD  = 2.675222e8     # ¹H gyromagnetic ratio          [rad/(s·T)]
 # ---------------------------------------------------------------------------
 # Acquisition protocol
 # ---------------------------------------------------------------------------
-DELTA_SMALL = 6.0           # δ, PFG duration                [ms]
-DELTAS_BIG  = [15.0, 25.0, 30.0, 40.0]   # Δ values         [ms]
+DELTA_SMALL = 20.0          # δ, PFG duration                [ms]
+DELTAS_BIG  = [50.0]   # Δ values         [ms]
 
 # b-values in s/mm² (per acquisition, 97 volumes)
 BVALS_S_MM2 = np.array([
     0,
-    *([1000]*24), *([2500]*24), *([4000]*24), *([6000]*24)
+    *([500]*24), *([1000]*24), *([1500]*24), *([2000]*24), *([2500]*24)
 ])
 
 # Unique non-zero b-values for library matching
-BVALS_UNIQUE = np.array([1000, 2500, 4000, 6000])  # s/mm²
+BVALS_UNIQUE = np.array([500, 1000, 1500, 2000, 2500])  # s/mm²
 
 # Convert to internal units: ms/μm²  (divide s/mm² by 1e6)
 BVALS_UNIQUE_INT = BVALS_UNIQUE / 1e6               # [ms/μm²]
@@ -59,7 +59,7 @@ class SimConfig:
     # --- Random walk -------------------------------------------------------
     D0:          float = D0_UM2_MS      # diffusion coefficient       [μm²/ms]
     ts:          float = 1e-3           # step time                   [ms] (= 1 μs)
-    n_steps:     int   = 50_000         # steps per walk  (50 ms covers Δ=40 + δ=6 = 46 ms)
+    n_steps:     int   = 75_000         # steps per walk  (50 ms covers Δ=40 + δ=6 = 46 ms)
 
     # Walkers per ensemble (one ensemble = one gradient axis assignment).
     # Bumped from 20k → 50k so that the default library entry has:
