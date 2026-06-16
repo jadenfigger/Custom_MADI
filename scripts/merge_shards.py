@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 # Make the repo importable regardless of cwd
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from madi.library import load_library, _save_library, library_summary
 
 
