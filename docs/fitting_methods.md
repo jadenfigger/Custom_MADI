@@ -136,6 +136,62 @@ plus `fit_metadata.json`.
 
 ---
 
+## GPU acceleration (`--device`)
+
+All three methods can run on GPU via `numba.cuda` (no extra dependency —
+`numba` is already required, same as the random-walk simulator in
+`madi/walker_gpu.py`):
+
+```
+--device auto   # default: use CUDA if available, else CPU
+--device gpu    # force GPU; errors out if CUDA isn't available
+--device cpu    # force CPU
+```
+
+**MAP and Bayes GPU kernels are exact reorderings of the CPU math** — one
+CUDA thread per voxel streams over the library instead of NumPy building the
+full `(n_voxels, n_library_entries)` matrix, but the arithmetic is identical
+and output matches the CPU path to float64 precision.
+
+**AMICO's GPU path is an approximation, not a reimplementation.** The CPU
+solves each voxel's `argmin_{x≥0} ||Dx-m||² + λ₁||x||₁ + λ₂||x||²` exactly
+via `scipy.optimize.nnls` (active-set). On GPU, every voxel has to be solved
+in parallel, so exact active-set NNLS isn't an option — instead each voxel
+runs a fixed/adaptive-iteration **FISTA** (accelerated projected-gradient)
+solve of the same objective, with positivity enforced by clamping to zero
+each step. In practice this lands within a percent or so of the exact
+optimum (see `analysis/verify_gpu_fitters.py`), but AMICO-GPU and AMICO-CPU
+maps will be *close, not bit-identical* — unlike MAP/Bayes. Three flags tune
+the AMICO GPU solver (ignored otherwise):
+
+- `--gpu-chunk-voxels` (default 20000) — voxels processed per GPU launch.
+  Only AMICO needs this (its per-voxel workspace is `O(n_library)`); MAP/Bayes
+  process the whole volume in one launch since their device-memory use
+  scales with `n_voxels + n_library`, not the product.
+- `--amico-gpu-iters` (default 2000) — max FISTA iterations per voxel.
+- `--amico-gpu-tol` (default 1e-8) — early-exit once the per-voxel
+  elastic-net objective's relative change has stayed below this for 20
+  consecutive iterations.
+
+**Convergence depends strongly on `--lambda2`.** The ridge term isn't just
+a regularizer for AMICO-GPU — it's what conditions the problem for a
+first-order (FISTA) solver, and MADI library entries are highly correlated
+(similar decay-curve shapes), so the unregularized problem is genuinely
+ill-conditioned. At the library's own default (`--lambda2 0.01`) a couple
+thousand iterations converge to match CPU almost exactly. As `--lambda2`
+drops toward `0`, convergence gets much slower — `n_eff` can look stuck
+high (a diffuse, non-sparse solution) well past the default iteration
+budget, and *this is a real slow-convergence effect, not a stuck/broken
+solver* — raising `--amico-gpu-iters` into the tens of thousands recovers
+CPU-like sparsity, though exact agreement at `--lambda2 0` isn't
+guaranteed even then. If you need exact low-`lambda2` AMICO behavior, use
+`--device cpu`.
+
+The resolved device (`gpu`/`cpu`) is printed at the start of the run and
+recorded in `fit_metadata.json` as `"device"`.
+
+---
+
 ## Which method should I use?
 
 - **`map`** — fast default, reproducible, no uncertainty. Use for quick looks

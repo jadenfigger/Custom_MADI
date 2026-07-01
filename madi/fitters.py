@@ -38,6 +38,7 @@ from typing import Optional
 import numpy as np
 
 from .library import _build_candidate_lib_matrix
+from . import fitters_gpu
 
 
 # Default residual-noise std on the normalized signal, used when the user
@@ -108,6 +109,7 @@ def bayes_fit(
     fit_pairs=None, lib_b_values=None,
     log_space=False, s_floor=1e-3,
     fit_s0=False, raw_signal=None,
+    use_gpu=None,
 ):
     """Bayesian posterior-mean fit over the full candidate library.
 
@@ -115,6 +117,10 @@ def bayes_fit(
     residual of library entry ``i`` (fixed-S₀: ``||m - s_i||²``; free-S₀:
     ``||m||² - (m·s_i)²/(s_i·s_i)`` with negative-S₀ candidates excluded).
     Computed in log-space with a per-voxel max subtraction for stability.
+
+    ``use_gpu`` : None (default) = use CUDA if available, else CPU. The
+    GPU path (``fitters_gpu.bayes_fit_gpu``) is an exact reordering of this
+    function's math — same output to float64 precision.
 
     Returns
     -------
@@ -129,12 +135,22 @@ def bayes_fit(
     if sigma_m <= 0:
         raise ValueError(f"sigma_m must be > 0, got {sigma_m}")
 
+    if use_gpu is None:
+        use_gpu = fitters_gpu.HAS_CUDA
+    if use_gpu and not fitters_gpu.HAS_CUDA:
+        raise RuntimeError("use_gpu=True but CUDA is not available.")
+
     s0_mean = None
     if fit_s0:
         if raw_signal is None:
             raise ValueError("fit_s0=True requires raw_signal.")
         M = raw_signal.astype(np.float64)            # (n_vox, n_feat)
         R = lib_mat.astype(np.float64)               # (n_lib, n_feat)
+
+        if use_gpu:
+            return fitters_gpu.bayes_fit_gpu(M, R, kios_arr, rhos_arr,
+                                              Vs_arr, sigma_m, fit_s0=True)
+
         rr = np.maximum(np.sum(R * R, axis=1), 1e-30)
         mm = np.sum(M * M, axis=1)
         MR = M @ R.T                                 # (n_vox, n_lib)
@@ -149,15 +165,37 @@ def bayes_fit(
         else:
             measured = measured_batch.astype(np.float64)
             lib_m = lib_mat.astype(np.float64)
+
+        if use_gpu:
+            return fitters_gpu.bayes_fit_gpu(measured, lib_m, kios_arr,
+                                              rhos_arr, Vs_arr, sigma_m,
+                                              fit_s0=False)
+
         m2 = np.sum(measured ** 2, axis=1, keepdims=True)
         l2 = np.sum(lib_m ** 2, axis=1, keepdims=True).T
         resid = np.maximum(m2 + l2 - 2.0 * measured @ lib_m.T, 0.0)
 
     # Posterior weights in log-space, stabilized by per-voxel max subtraction.
+    #
+    # Degenerate-voxel guard (free-S0 only): if EVERY candidate is masked to
+    # +inf for a voxel (no library entry gives a positive fitted S0 — e.g. a
+    # background/low-SNR voxel after Rician correction), that voxel's whole
+    # log_w row is -inf. Subtracting the row max (-inf - (-inf)) is a NaN,
+    # which then poisons that voxel's outputs — and, because the caller's
+    # np.median/.min()/.max() calls aren't NaN-aware, a handful of such
+    # voxels anywhere in the volume made every printed summary stat show
+    # "nan" even though only those specific voxels were actually invalid.
+    # Route those rows to an explicit zero-weight result instead (same
+    # "no support" convention amico_fit already uses for degenerate voxels).
     log_w = -resid / (2.0 * sigma_m ** 2)
-    log_w -= np.max(log_w, axis=1, keepdims=True)
+    row_max = np.max(log_w, axis=1, keepdims=True)
+    invalid = ~np.isfinite(row_max)
+    log_w = log_w - np.where(invalid, 0.0, row_max)
     w = np.exp(log_w)
-    w /= np.sum(w, axis=1, keepdims=True)
+    w = np.where(invalid, 0.0, w)
+    w /= np.maximum(np.sum(w, axis=1, keepdims=True), 1e-300)
+    n_eff = np.where(invalid[:, 0], 0.0,
+                      1.0 / np.maximum(np.sum(w ** 2, axis=1), 1e-300))
 
     out = _weighted_mean_std(w, kios_arr, rhos_arr, Vs_arr)
 
@@ -165,6 +203,7 @@ def bayes_fit(
     # the 0·inf → nan that would otherwise appear).
     resid_finite = np.where(np.isfinite(resid), resid, 0.0)
     out["residual"] = np.sum(w * resid_finite, axis=1)
+    out["n_eff"] = n_eff
 
     if fit_s0:
         out["s0_fit"] = np.sum(w * S0_cand, axis=1)
@@ -249,6 +288,10 @@ def amico_fit(
     fit_pairs=None, lib_b_values=None,
     fit_s0=False, raw_signal=None,
     verbose=True, progress_every=2000,
+    use_gpu=None,
+    gpu_chunk_voxels=fitters_gpu.DEFAULT_GPU_CHUNK_VOXELS,
+    gpu_n_iters=fitters_gpu.DEFAULT_AMICO_ITERS,
+    gpu_tol=fitters_gpu.DEFAULT_AMICO_TOL,
 ):
     """AMICO-style elastic-net NNLS fit.
 
@@ -262,6 +305,14 @@ def amico_fit(
     ``s0_fit``) — the same "S₀ as a free linear parameter" semantics as the
     MAP free-S₀ matcher.
 
+    ``use_gpu`` : None (default) = use CUDA if available, else CPU. Unlike
+    the MAP/Bayes GPU paths, this one is an *approximation*: it replaces the
+    CPU's exact per-voxel ``scipy.optimize.nnls`` solve with a fixed/
+    adaptive-iteration FISTA (accelerated projected-gradient) solve of the
+    same elastic-net objective — see ``madi.fitters_gpu`` module docstring.
+    ``gpu_chunk_voxels``/``gpu_n_iters``/``gpu_tol`` tune that solver and
+    are ignored on the CPU path.
+
     Returns
     -------
     dict with keys kio_mean, rho_mean, V_mean, kio_std, rho_std, V_std,
@@ -272,14 +323,28 @@ def amico_fit(
         library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
         fit_pairs=fit_pairs, lib_b_values=lib_b_values)
 
-    D = np.ascontiguousarray(lib_mat.T, dtype=np.float64)  # (n_feat, n_lib)
-
     if fit_s0:
         if raw_signal is None:
             raise ValueError("fit_s0=True requires raw_signal.")
         M = raw_signal.astype(np.float64)
     else:
         M = measured_batch.astype(np.float64)
+
+    if use_gpu is None:
+        use_gpu = fitters_gpu.HAS_CUDA
+    if use_gpu:
+        if not fitters_gpu.HAS_CUDA:
+            raise RuntimeError("use_gpu=True but CUDA is not available.")
+        out = fitters_gpu.amico_fit_gpu(
+            M, lib_mat, kios_arr, rhos_arr, Vs_arr,
+            lambda1=lambda1, lambda2=lambda2,
+            n_iters=gpu_n_iters, tol=gpu_tol,
+            gpu_chunk_voxels=gpu_chunk_voxels, verbose=verbose)
+        if not fit_s0:
+            del out["s0_fit"]
+        return out
+
+    D = np.ascontiguousarray(lib_mat.T, dtype=np.float64)  # (n_feat, n_lib)
 
     n_vox = M.shape[0]
     n_lib = D.shape[1]

@@ -32,9 +32,10 @@ from typing import Optional, List, Tuple
  
 from collections import defaultdict
  
-from .config     import SimConfig, BVALS_UNIQUE, DELTAS_BIG
-from .walker_gpu import run_simulation, run_simulation_multi_kio
-from .signal     import compute_signals, signals_to_flat
+from .config       import SimConfig, BVALS_UNIQUE, DELTAS_BIG
+from .walker_gpu   import run_simulation, run_simulation_multi_kio
+from .signal       import compute_signals, signals_to_flat
+from . import fitters_gpu
  
  
 # ---------------------------------------------------------------------------
@@ -495,6 +496,7 @@ def match_voxels_batch(
     log_space=False, s_floor=1e-3,
     vi_min=0.5, vi_max=0.95, rho_max=None,
     fit_pairs=None, lib_b_values=None,
+    use_gpu=None,
 ):
     """Log-space nearest-neighbour matching, S0 fixed (data already
     divided by measured b=0).
@@ -506,6 +508,11 @@ def match_voxels_batch(
       * New:     ``fit_pairs`` (list of (Δ, b)) + ``lib_b_values``
                  → arbitrary (Δ, b) subset.  Required when the
                  measured data has fewer b-shells than the library.
+
+    ``use_gpu`` : None (default) = use CUDA if available, else CPU.
+    ``True``/``False`` force a path (``True`` raises if CUDA is
+    unavailable). The GPU path (``fitters_gpu.map_match_gpu``) is an exact
+    reordering of this function's math — same output to float64 precision.
     """
 
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
@@ -518,6 +525,14 @@ def match_voxels_batch(
     else:
         measured = measured_batch
         lib_m    = lib_mat
+
+    if use_gpu is None:
+        use_gpu = fitters_gpu.HAS_CUDA
+    if use_gpu:
+        if not fitters_gpu.HAS_CUDA:
+            raise RuntimeError("use_gpu=True but CUDA is not available.")
+        return fitters_gpu.map_match_gpu(measured, lib_m, kios_arr, rhos_arr,
+                                          Vs_arr)
 
     m2 = np.sum(measured ** 2, axis=1, keepdims=True)
     l2 = np.sum(lib_m   ** 2, axis=1, keepdims=True).T
@@ -538,11 +553,12 @@ def match_voxels_batch_fits0(
     fit_deltas=None, lib_deltas=None, n_b=4,
     vi_min=0.5, vi_max=0.95, rho_max=None,
     fit_pairs=None, lib_b_values=None,
+    use_gpu=None,
 ):
     """Match un-normalized signals with S0 as a free per-voxel linear param.
 
     See ``match_voxels_batch`` for the ``fit_pairs`` / ``lib_b_values``
-    semantics.
+    semantics and the ``use_gpu`` convention.
 
     For each voxel m and each candidate library ratio vector r,
 
@@ -556,10 +572,18 @@ def match_voxels_batch_fits0(
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
         library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
         fit_pairs=fit_pairs, lib_b_values=lib_b_values)
- 
+
     M = raw_signal.astype(np.float64)            # (n_vox, n_feat)
     R = lib_mat.astype(np.float64)               # (n_lib, n_feat)
- 
+
+    if use_gpu is None:
+        use_gpu = fitters_gpu.HAS_CUDA
+    if use_gpu:
+        if not fitters_gpu.HAS_CUDA:
+            raise RuntimeError("use_gpu=True but CUDA is not available.")
+        return fitters_gpu.map_match_fits0_gpu(M, R, kios_arr, rhos_arr,
+                                                Vs_arr)
+
     # Per-library-entry  r.r   shape (n_lib,)
     rr = np.sum(R * R, axis=1)
     rr = np.maximum(rr, 1e-30)

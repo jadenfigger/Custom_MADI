@@ -66,6 +66,7 @@ from madi.library  import (build_library, build_library_from_triplets,
 from madi.fitters  import (bayes_fit, amico_fit, estimate_sigma_m,
                            DEFAULT_SIGMA_M, DEFAULT_LAMBDA1, DEFAULT_LAMBDA2)
 from madi.signal   import signals_to_flat
+from madi import fitters_gpu
 
 
 # ===================================================================
@@ -424,6 +425,8 @@ def load_dwi_and_average(input_specs, mask_path,
     fit_pairs : list of (Δ, b) tuples in the column order of ``measured``
     affine, mask_indices, shape
     extras (if return_raw) : dict with 'raw', 's0', 'sigma'
+    sigma_used : float
+        The noise standard deviation used for fitting.
     """
     import nibabel as nib
 
@@ -638,9 +641,9 @@ def load_dwi_and_average(input_specs, mask_path,
         mean_n_dir = float(np.mean(n_dir)) if n_dir else 1.0
         extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used,
                       mean_n_dir=mean_n_dir, s0_median=float(np.median(s0_ref)))
-        return measured, fit_pairs, affine, mask_idx, shape, extras
+        return measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used
 
-    return measured, fit_pairs, affine, mask_idx, shape
+    return measured, fit_pairs, affine, mask_idx, shape, sigma_used
 
 
 # ===================================================================
@@ -758,6 +761,39 @@ def main():
     method_grp.add_argument(
         "--lambda2", type=float, default=DEFAULT_LAMBDA2,
         help=f"[amico only] L2 (ridge) penalty (default {DEFAULT_LAMBDA2}).")
+    method_grp.add_argument(
+        "--device", choices=["auto", "cpu", "gpu"], default="auto",
+        help="auto (default): use CUDA if available, else CPU.  gpu: force "
+             "GPU (errors if CUDA is unavailable).  cpu: force CPU.  MAP and "
+             "bayes GPU kernels are exact reorderings of the CPU math "
+             "(same output to float64 precision); amico's GPU path is an "
+             "approximate FISTA solve replacing the CPU's exact per-voxel "
+             "NNLS, so amico GPU/CPU outputs will be close but not "
+             "bit-identical (see docs/fitting_methods.md).")
+    method_grp.add_argument(
+        "--gpu-chunk-voxels", type=int,
+        default=fitters_gpu.DEFAULT_GPU_CHUNK_VOXELS,
+        help="[amico + --device gpu only] voxels per GPU batch for the "
+             f"FISTA solve (default {fitters_gpu.DEFAULT_GPU_CHUNK_VOXELS}). "
+             "MAP/bayes GPU kernels process all voxels in one launch and "
+             "ignore this.")
+    method_grp.add_argument(
+        "--amico-gpu-iters", type=int,
+        default=fitters_gpu.DEFAULT_AMICO_ITERS,
+        help="[amico + --device gpu only] max FISTA iterations per voxel "
+             f"(default {fitters_gpu.DEFAULT_AMICO_ITERS}).")
+    method_grp.add_argument(
+        "--amico-gpu-tol", type=float,
+        default=fitters_gpu.DEFAULT_AMICO_TOL,
+        help="[amico + --device gpu only] relative-objective-change "
+             f"early-exit tolerance for the FISTA solve (default "
+             f"{fitters_gpu.DEFAULT_AMICO_TOL}). Convergence speed depends "
+             "strongly on --lambda2 (it also conditions the problem for "
+             "this solver, since MADI library entries are highly "
+             "correlated): near --lambda2 0, n_eff can look stuck high even "
+             "though it is still slowly dropping — raise --amico-gpu-iters "
+             "substantially (tens of thousands) in that regime, or use "
+             "--device cpu for an exact answer.")
     # -- NEW: acquisition metadata (must match library) --
     ap.add_argument("--small-delta", type=float, default=None,
                     help="δ (PFG duration) [ms] of the data being fit.  "
@@ -962,10 +998,35 @@ def main():
             print(f"  ⚠ --log_space has no effect for --method amico "
                   f"(the regression is linear in signal); ignored.")
 
+        # ---- Resolve --device -> use_gpu, threaded into every fit call ----
+        if args.device == "auto":
+            use_gpu = None  # let each fitter auto-detect (None = HAS_CUDA)
+        elif args.device == "gpu":
+            if not fitters_gpu.HAS_CUDA:
+                print("ERROR: --device gpu requested but CUDA is not "
+                      "available in this environment."); return
+            use_gpu = True
+        else:  # cpu
+            use_gpu = False
+        resolved_device = ("gpu" if (use_gpu or
+                           (use_gpu is None and fitters_gpu.HAS_CUDA))
+                           else "cpu")
+
+        gpu_only_flags_touched = (
+            args.gpu_chunk_voxels != fitters_gpu.DEFAULT_GPU_CHUNK_VOXELS or
+            args.amico_gpu_iters != fitters_gpu.DEFAULT_AMICO_ITERS or
+            args.amico_gpu_tol != fitters_gpu.DEFAULT_AMICO_TOL)
+        if gpu_only_flags_touched and not (args.method == "amico" and resolved_device == "gpu"):
+            print("  ⚠ --gpu-chunk-voxels/--amico-gpu-iters/--amico-gpu-tol "
+                  "only affect --method amico with --device gpu (resolved: "
+                  f"method={args.method}, device={resolved_device}); ignored.")
+
         print("=" * 60)
         print("MADI Fitting")
         print("=" * 60)
         print(f"  Method:                 {args.method}")
+        print(f"  Device:                 {resolved_device} "
+              f"(--device {args.device})")
         print(f"  Δ values to fit:        {fit_deltas} ms")
         print(f"  Rician correction:      {args.rician_correct}")
         print(f"  S0 averaging across Δ:  {args.avg_s0}")
@@ -1035,10 +1096,11 @@ def main():
             z_slice=z_slice_obj,
         )
 
+
         if need_extras:
-            measured, fit_pairs, affine, mask_idx, shape, extras = load_out
+            measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used = load_out
         else:
-            measured, fit_pairs, affine, mask_idx, shape = load_out
+            measured, fit_pairs, affine, mask_idx, shape, sigma_used = load_out
             extras = None
 
         n_features = len(fit_pairs)
@@ -1075,6 +1137,7 @@ def main():
                     vi_min=args.vi_min,
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
+                    use_gpu=use_gpu,
                 )
                 print(f"  Done in {time.time()-t0:.1f}s")
                 save_map(s0_fit_map, mask_idx, shape, affine,
@@ -1099,6 +1162,7 @@ def main():
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
                     log_space=args.log_space,
+                    use_gpu=use_gpu,
                 )
                 print(f"  Done in {time.time()-t0:.1f}s")
 
@@ -1180,6 +1244,7 @@ def main():
                 vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 log_space=args.log_space,
                 fit_s0=args.fit_s0, raw_signal=raw_signal,
+                use_gpu=use_gpu,
             )
             print(f"  Done in {time.time()-t0:.1f}s")
 
@@ -1188,6 +1253,11 @@ def main():
                   f"λ2={args.lambda2:g} (L2)")
             method_meta = dict(lambda1=float(args.lambda1),
                                lambda2=float(args.lambda2))
+            if resolved_device == "gpu":
+                method_meta.update(
+                    gpu_chunk_voxels=args.gpu_chunk_voxels,
+                    amico_gpu_iters=args.amico_gpu_iters,
+                    amico_gpu_tol=args.amico_gpu_tol)
             print(f"\nAMICO NNLS over {measured.shape[0]} voxels "
                   f"({'S0 FITTED' if args.fit_s0 else 'S0 fixed'}) ...")
             t0 = time.time()
@@ -1198,6 +1268,10 @@ def main():
                 lib_b_values=lib_b_values, n_b=lib_n_b,
                 vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 fit_s0=args.fit_s0, raw_signal=raw_signal,
+                use_gpu=use_gpu,
+                gpu_chunk_voxels=args.gpu_chunk_voxels,
+                gpu_n_iters=args.amico_gpu_iters,
+                gpu_tol=args.amico_gpu_tol,
             )
             print(f"  Done in {time.time()-t0:.1f}s")
 
@@ -1209,9 +1283,7 @@ def main():
         print(f"  kio_std:  median={np.median(res['kio_std']):.2f}")
         print(f"  rho_std:  median={np.median(res['rho_std'])/1e3:.1f}k")
         print(f"  V_std:    median={np.median(res['V_std']):.3f}")
-        if "n_eff" in res:
-            print(f"  n_eff:    median={np.median(res['n_eff']):.2f} "
-                  f"(effective # of library atoms per voxel)")
+        print(f"  n_eff:    median={np.median(res['n_eff']):.2f} "f"(effective # of library atoms per voxel)")
 
         # ---- Save maps ----
         print("\nSaving maps ...")
@@ -1229,24 +1301,26 @@ def main():
                  os.path.join(args.out, "V_std.nii.gz"))
         save_map(res['residual'], mask_idx, shape, affine,
                  os.path.join(args.out, "residual.nii.gz"))
-        if "n_eff" in res:
-            save_map(res['n_eff'], mask_idx, shape, affine,
-                     os.path.join(args.out, "n_eff.nii.gz"))
+        save_map(res['n_eff'], mask_idx, shape, affine, os.path.join(args.out, "n_eff.nii.gz"))
         if "s0_fit" in res:
             save_map(res['s0_fit'], mask_idx, shape, affine,
                      os.path.join(args.out, "s0_fit_map.nii.gz"))
 
         # ---- JSON run metadata ----
         import json
+        print("Saving metadata ...")
+
+        sigma = args.noise_sigma if args.noise_sigma is not None else sigma_used
         meta_out = dict(
             method=args.method,
+            device=resolved_device,
             library=args.library,
             inputs=[list(s) for s in input_specs],
             fit_deltas=fit_deltas,
             fit_pairs=[[float(d), float(b)] for d, b in fit_pairs],
             n_features=n_features,
             rician_correct=bool(args.rician_correct),
-            noise_sigma=args.noise_sigma,
+            noise_sigma=sigma,
             avg_s0=bool(args.avg_s0),
             fit_s0=bool(args.fit_s0),
             log_space=bool(args.log_space),

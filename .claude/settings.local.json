@@ -4,7 +4,13 @@
       "Bash(pkill -f \"_sanity_fitters\")",
       "Bash(pkill -f \"pgrep -f _sanity\")",
       "Bash(cd /home/jaden/.claude/projects/-mnt-c-miscellaneous-coding-projects-python-mri-processing-processing-madi-gpu-custom-madi/memory/)",
-      "Bash(cat MEMORY.md)"
+      "Bash(cat MEMORY.md)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv)",
+      "Bash(python3 -c \"import cupy\")",
+      "Bash(pip show *)",
+      "Skill(update-config)",
+      "Bash(nvidia-smi)",
+      "Bash(python3 *)"
     ]
   }
 }
