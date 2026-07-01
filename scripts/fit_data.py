@@ -63,6 +63,8 @@ from madi.library  import (build_library, build_library_from_triplets,
                             load_library, load_library_meta,
                             match_voxels_batch, match_voxels_batch_fits0,
                             library_summary)
+from madi.fitters  import (bayes_fit, amico_fit, estimate_sigma_m,
+                           DEFAULT_SIGMA_M, DEFAULT_LAMBDA1, DEFAULT_LAMBDA2)
 from madi.signal   import signals_to_flat
 
 
@@ -630,7 +632,12 @@ def load_dwi_and_average(input_specs, mask_path,
 
     if return_raw:
         s0_ref = np.mean(np.stack(s0_used, axis=0), axis=0)
-        extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used)
+        # Mean number of averaged directions per kept (Δ,b) shell — used to
+        # propagate Rician σ through shell averaging when auto-estimating σ_m.
+        n_dir = [len(idx) for kept in all_shells_kept for _, idx in kept]
+        mean_n_dir = float(np.mean(n_dir)) if n_dir else 1.0
+        extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used,
+                      mean_n_dir=mean_n_dir, s0_median=float(np.median(s0_ref)))
         return measured, fit_pairs, affine, mask_idx, shape, extras
 
     return measured, fit_pairs, affine, mask_idx, shape
@@ -727,6 +734,30 @@ def main():
                          "library entry).  Diagnostic for S0 reliability.")
     ap.add_argument("--log_space", action="store_true",
                     help="Whether to preform fitting within log space or to use no transformations.")
+
+    # -- NEW: fitting method selection --
+    method_grp = ap.add_argument_group(
+        "fitting method",
+        "Choose how each voxel is fit against the library.  'map' is the "
+        "original point-estimate matcher and is byte-for-byte unchanged; "
+        "'bayes' and 'amico' additionally emit posterior mean/std maps.")
+    method_grp.add_argument(
+        "--method", choices=["map", "bayes", "amico"], default="map",
+        help="map: nearest-library-entry MAP estimate (default, "
+             "backwards-compatible).  bayes: Gaussian posterior mean/std "
+             "over the whole library.  amico: elastic-net NNLS mixture.")
+    method_grp.add_argument(
+        "--sigma-m", type=float, default=None,
+        help="[bayes only] Residual-noise std on the normalized S/S0 "
+             "signal.  If omitted, auto-estimated from Rician σ when "
+             "--rician-correct is on, else defaults to "
+             f"{DEFAULT_SIGMA_M} (a placeholder — a warning is logged).")
+    method_grp.add_argument(
+        "--lambda1", type=float, default=DEFAULT_LAMBDA1,
+        help=f"[amico only] L1 (sparsity) penalty (default {DEFAULT_LAMBDA1}).")
+    method_grp.add_argument(
+        "--lambda2", type=float, default=DEFAULT_LAMBDA2,
+        help=f"[amico only] L2 (ridge) penalty (default {DEFAULT_LAMBDA2}).")
     # -- NEW: acquisition metadata (must match library) --
     ap.add_argument("--small-delta", type=float, default=None,
                     help="δ (PFG duration) [ms] of the data being fit.  "
@@ -916,9 +947,25 @@ def main():
         input_specs.sort(key=lambda x: x[0])
         fit_deltas = [d for d, _, _, _ in input_specs]
 
+        # ---- Warn about method-specific flags that are ignored ----
+        if args.method != "bayes" and args.sigma_m is not None:
+            print(f"  ⚠ --sigma-m is only used by --method bayes; "
+                  f"ignored for --method {args.method}.")
+        if args.method != "amico":
+            if args.lambda1 != DEFAULT_LAMBDA1:
+                print(f"  ⚠ --lambda1 is only used by --method amico; "
+                      f"ignored for --method {args.method}.")
+            if args.lambda2 != DEFAULT_LAMBDA2:
+                print(f"  ⚠ --lambda2 is only used by --method amico; "
+                      f"ignored for --method {args.method}.")
+        if args.method == "amico" and args.log_space:
+            print(f"  ⚠ --log_space has no effect for --method amico "
+                  f"(the regression is linear in signal); ignored.")
+
         print("=" * 60)
         print("MADI Fitting")
         print("=" * 60)
+        print(f"  Method:                 {args.method}")
         print(f"  Δ values to fit:        {fit_deltas} ms")
         print(f"  Rician correction:      {args.rician_correct}")
         print(f"  S0 averaging across Δ:  {args.avg_s0}")
@@ -972,6 +1019,10 @@ def main():
                 print(f"ERROR: Δ = {d} ms not in library {list(lib_deltas)}"); return
 
         # Load data; produces fit_pairs ----
+        # bayes/amico always need the extras dict (raw signal for --fit-s0,
+        # plus σ / S0 / n_dir for σ_m auto-estimation), so request it for any
+        # non-map method regardless of --fit-s0.
+        need_extras = args.fit_s0 or (args.method != "map")
         print("\nLoading DWI data ...")
         z_slice_obj = parse_z_slice(args.z_slice)
         load_out = load_dwi_and_average(
@@ -980,14 +1031,15 @@ def main():
             rician_correct=args.rician_correct,
             noise_sigma=args.noise_sigma,
             avg_s0=args.avg_s0,
-            return_raw=args.fit_s0,
+            return_raw=need_extras,
             z_slice=z_slice_obj,
         )
 
-        if args.fit_s0:
+        if need_extras:
             measured, fit_pairs, affine, mask_idx, shape, extras = load_out
         else:
             measured, fit_pairs, affine, mask_idx, shape = load_out
+            extras = None
 
         n_features = len(fit_pairs)
         print(f"\n  Feature vector ({n_features} cols):")
@@ -1005,81 +1057,208 @@ def main():
             print(f"\n  ⓘ {n_features} measurements per voxel for 3 free "
                   f"parameters — a workable but tight fit.")
 
-        # ---- Match ----
-        if args.fit_s0:
-            raw_signal = extras['raw']
-            print(f"\nMatching {raw_signal.shape[0]} voxels with S0 FITTED ...")
+        # ================================================================
+        #  METHOD DISPATCH
+        # ================================================================
+        if args.method == "map":
+            # ---- MAP: point-estimate matcher (UNCHANGED behaviour) ----
+            if args.fit_s0:
+                raw_signal = extras['raw']
+                print(f"\nMatching {raw_signal.shape[0]} voxels with S0 FITTED ...")
+                t0 = time.time()
+                kio_map, rho_map, V_map, res_map, s0_fit_map = match_voxels_batch_fits0(
+                    raw_signal, lib,
+                    fit_pairs=fit_pairs,
+                    lib_deltas=lib_deltas,
+                    lib_b_values=lib_b_values,
+                    n_b=lib_n_b,
+                    vi_min=args.vi_min,
+                    vi_max=args.vi_max,
+                    rho_max=args.rho_max,
+                )
+                print(f"  Done in {time.time()-t0:.1f}s")
+                save_map(s0_fit_map, mask_idx, shape, affine,
+                         os.path.join(args.out, "s0_fit_map.nii.gz"))
+                s0_ratio = s0_fit_map / (extras['s0'] + 1e-10)
+                save_map(s0_ratio, mask_idx, shape, affine,
+                         os.path.join(args.out, "s0_fit_over_measured.nii.gz"))
+                print(f"\n  Fitted-S0 / Measured-S0 ratio:")
+                print(f"    median = {np.median(s0_ratio):.3f}")
+                print(f"    5-95%  = [{np.percentile(s0_ratio, 5):.3f}, "
+                      f"{np.percentile(s0_ratio, 95):.3f}]")
+            else:
+                print(f"\nMatching {measured.shape[0]} voxels ...")
+                t0 = time.time()
+                kio_map, rho_map, V_map, res_map = match_voxels_batch(
+                    measured, lib,
+                    fit_pairs=fit_pairs,
+                    lib_deltas=lib_deltas,
+                    lib_b_values=lib_b_values,
+                    n_b=lib_n_b,
+                    vi_min=args.vi_min,
+                    vi_max=args.vi_max,
+                    rho_max=args.rho_max,
+                    log_space=args.log_space,
+                )
+                print(f"  Done in {time.time()-t0:.1f}s")
+
+            # Stats
+            print(f"\n  kio:  median={np.median(kio_map):.1f}, "
+                  f"range=[{kio_map.min():.1f}, {kio_map.max():.1f}] s-1")
+            print(f"  rho:  median={np.median(rho_map)/1e3:.0f}k, "
+                  f"range=[{rho_map.min()/1e3:.0f}k, "
+                  f"{rho_map.max()/1e3:.0f}k] cells/uL")
+            print(f"  V:    median={np.median(V_map):.2f}, "
+                  f"range=[{V_map.min():.2f}, {V_map.max():.2f}] pL")
+
+            # Boundary warnings
+            for name, vals, grid in [
+                ("rho", rho_map, sorted(set(e.rho for e in lib))),
+                ("V",   V_map,   sorted(set(e.V for e in lib))),
+                ("kio", kio_map, sorted(set(e.kio for e in lib))),
+            ]:
+                n = len(vals)
+                at_max = np.sum(vals >= grid[-1] - 1e-10)
+                at_min = np.sum(vals <= grid[0] + 1e-10)
+                if at_max / n > 0.10:
+                    print(f"  ⚠ {at_max/n*100:.0f}% of voxels hit {name} "
+                          f"UPPER bound ({grid[-1]}). Extend the grid.")
+                if at_min / n > 0.10:
+                    print(f"  ⚠ {at_min/n*100:.0f}% of voxels hit {name} "
+                          f"LOWER bound ({grid[0]}). Extend the grid.")
+
+            print("\nSaving maps ...")
+            save_map(kio_map, mask_idx, shape, affine,
+                     os.path.join(args.out, "kio_map.nii.gz"))
+            save_map(rho_map, mask_idx, shape, affine,
+                     os.path.join(args.out, "rho_map.nii.gz"))
+            save_map(V_map, mask_idx, shape, affine,
+                     os.path.join(args.out, "V_map.nii.gz"))
+            save_map(res_map, mask_idx, shape, affine,
+                     os.path.join(args.out, "residual_map.nii.gz"))
+
+            print("\nDone!")
+            return
+
+        # ---- bayes / amico: distributional fitters ----
+        raw_signal = extras['raw'] if args.fit_s0 else None
+        method_meta = {}   # method-specific params recorded in JSON
+
+        if args.method == "bayes":
+            # Resolve σ_m: user > auto-from-Rician > placeholder default.
+            if args.sigma_m is not None:
+                sigma_m = float(args.sigma_m)
+                sigma_src = "user"
+                print(f"\n  σ_m = {sigma_m:.4g}  (user-specified)")
+            else:
+                est = estimate_sigma_m(extras.get('sigma'),
+                                       extras.get('s0_median'),
+                                       extras.get('mean_n_dir'))
+                if args.rician_correct and est is not None and est > 0:
+                    sigma_m = est
+                    sigma_src = "auto-rician"
+                    print(f"\n  σ_m = {sigma_m:.4g}  (auto from Rician σ="
+                          f"{extras['sigma']:.2f}, S0_med="
+                          f"{extras['s0_median']:.1f}, "
+                          f"mean n_dir={extras['mean_n_dir']:.1f})")
+                else:
+                    sigma_m = DEFAULT_SIGMA_M
+                    sigma_src = "default-placeholder"
+                    print(f"\n  ⚠ σ_m = {sigma_m:.4g}  (PLACEHOLDER default — "
+                          f"pass --sigma-m or --rician-correct for a "
+                          f"data-driven value).")
+            method_meta = dict(sigma_m=sigma_m, sigma_m_source=sigma_src)
+
+            print(f"\nBayes posterior over {measured.shape[0]} voxels "
+                  f"({'S0 FITTED' if args.fit_s0 else 'S0 fixed'}) ...")
             t0 = time.time()
-            kio_map, rho_map, V_map, res_map, s0_fit_map = match_voxels_batch_fits0(
-                raw_signal, lib,
-                fit_pairs=fit_pairs,
-                lib_deltas=lib_deltas,
-                lib_b_values=lib_b_values,
-                n_b=lib_n_b,
-                vi_min=args.vi_min,
-                vi_max=args.vi_max,
-                rho_max=args.rho_max,
-            )
-            print(f"  Done in {time.time()-t0:.1f}s")
-            save_map(s0_fit_map, mask_idx, shape, affine,
-                     os.path.join(args.out, "s0_fit_map.nii.gz"))
-            s0_ratio = s0_fit_map / (extras['s0'] + 1e-10)
-            save_map(s0_ratio, mask_idx, shape, affine,
-                     os.path.join(args.out, "s0_fit_over_measured.nii.gz"))
-            print(f"\n  Fitted-S0 / Measured-S0 ratio:")
-            print(f"    median = {np.median(s0_ratio):.3f}")
-            print(f"    5-95%  = [{np.percentile(s0_ratio, 5):.3f}, "
-                  f"{np.percentile(s0_ratio, 95):.3f}]")
-        else:
-            print(f"\nMatching {measured.shape[0]} voxels ...")
-            t0 = time.time()
-            kio_map, rho_map, V_map, res_map = match_voxels_batch(
+            res = bayes_fit(
                 measured, lib,
-                fit_pairs=fit_pairs,
-                lib_deltas=lib_deltas,
-                lib_b_values=lib_b_values,
-                n_b=lib_n_b,
-                vi_min=args.vi_min,
-                vi_max=args.vi_max,
-                rho_max=args.rho_max,
+                sigma_m=sigma_m,
+                fit_pairs=fit_pairs, lib_deltas=lib_deltas,
+                lib_b_values=lib_b_values, n_b=lib_n_b,
+                vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 log_space=args.log_space,
+                fit_s0=args.fit_s0, raw_signal=raw_signal,
             )
             print(f"  Done in {time.time()-t0:.1f}s")
 
-        # Stats
-        print(f"\n  kio:  median={np.median(kio_map):.1f}, "
-              f"range=[{kio_map.min():.1f}, {kio_map.max():.1f}] s-1")
-        print(f"  rho:  median={np.median(rho_map)/1e3:.0f}k, "
-              f"range=[{rho_map.min()/1e3:.0f}k, "
-              f"{rho_map.max()/1e3:.0f}k] cells/uL")
-        print(f"  V:    median={np.median(V_map):.2f}, "
-              f"range=[{V_map.min():.2f}, {V_map.max():.2f}] pL")
+        else:  # amico
+            print(f"\n  AMICO elastic-net: λ1={args.lambda1:g} (L1), "
+                  f"λ2={args.lambda2:g} (L2)")
+            method_meta = dict(lambda1=float(args.lambda1),
+                               lambda2=float(args.lambda2))
+            print(f"\nAMICO NNLS over {measured.shape[0]} voxels "
+                  f"({'S0 FITTED' if args.fit_s0 else 'S0 fixed'}) ...")
+            t0 = time.time()
+            res = amico_fit(
+                measured, lib,
+                lambda1=args.lambda1, lambda2=args.lambda2,
+                fit_pairs=fit_pairs, lib_deltas=lib_deltas,
+                lib_b_values=lib_b_values, n_b=lib_n_b,
+                vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
+                fit_s0=args.fit_s0, raw_signal=raw_signal,
+            )
+            print(f"  Done in {time.time()-t0:.1f}s")
 
-        # Boundary warnings
-        for name, vals, grid in [
-            ("rho", rho_map, sorted(set(e.rho for e in lib))),
-            ("V",   V_map,   sorted(set(e.V for e in lib))),
-            ("kio", kio_map, sorted(set(e.kio for e in lib))),
-        ]:
-            n = len(vals)
-            at_max = np.sum(vals >= grid[-1] - 1e-10)
-            at_min = np.sum(vals <= grid[0] + 1e-10)
-            if at_max / n > 0.10:
-                print(f"  ⚠ {at_max/n*100:.0f}% of voxels hit {name} "
-                      f"UPPER bound ({grid[-1]}). Extend the grid.")
-            if at_min / n > 0.10:
-                print(f"  ⚠ {at_min/n*100:.0f}% of voxels hit {name} "
-                      f"LOWER bound ({grid[0]}). Extend the grid.")
+        # ---- Stats (weighted means + posterior std) ----
+        print(f"\n  kio_mean: median={np.median(res['kio_mean']):.1f}, "
+              f"range=[{res['kio_mean'].min():.1f}, {res['kio_mean'].max():.1f}] s-1")
+        print(f"  rho_mean: median={np.median(res['rho_mean'])/1e3:.0f}k cells/uL")
+        print(f"  V_mean:   median={np.median(res['V_mean']):.2f} pL")
+        print(f"  kio_std:  median={np.median(res['kio_std']):.2f}")
+        print(f"  rho_std:  median={np.median(res['rho_std'])/1e3:.1f}k")
+        print(f"  V_std:    median={np.median(res['V_std']):.3f}")
+        if "n_eff" in res:
+            print(f"  n_eff:    median={np.median(res['n_eff']):.2f} "
+                  f"(effective # of library atoms per voxel)")
 
+        # ---- Save maps ----
         print("\nSaving maps ...")
-        save_map(kio_map, mask_idx, shape, affine,
-                 os.path.join(args.out, "kio_map.nii.gz"))
-        save_map(rho_map, mask_idx, shape, affine,
-                 os.path.join(args.out, "rho_map.nii.gz"))
-        save_map(V_map, mask_idx, shape, affine,
-                 os.path.join(args.out, "V_map.nii.gz"))
-        save_map(res_map, mask_idx, shape, affine,
-                 os.path.join(args.out, "residual_map.nii.gz"))
+        save_map(res['kio_mean'], mask_idx, shape, affine,
+                 os.path.join(args.out, "kio_mean.nii.gz"))
+        save_map(res['rho_mean'], mask_idx, shape, affine,
+                 os.path.join(args.out, "rho_mean.nii.gz"))
+        save_map(res['V_mean'], mask_idx, shape, affine,
+                 os.path.join(args.out, "V_mean.nii.gz"))
+        save_map(res['kio_std'], mask_idx, shape, affine,
+                 os.path.join(args.out, "kio_std.nii.gz"))
+        save_map(res['rho_std'], mask_idx, shape, affine,
+                 os.path.join(args.out, "rho_std.nii.gz"))
+        save_map(res['V_std'], mask_idx, shape, affine,
+                 os.path.join(args.out, "V_std.nii.gz"))
+        save_map(res['residual'], mask_idx, shape, affine,
+                 os.path.join(args.out, "residual.nii.gz"))
+        if "n_eff" in res:
+            save_map(res['n_eff'], mask_idx, shape, affine,
+                     os.path.join(args.out, "n_eff.nii.gz"))
+        if "s0_fit" in res:
+            save_map(res['s0_fit'], mask_idx, shape, affine,
+                     os.path.join(args.out, "s0_fit_map.nii.gz"))
+
+        # ---- JSON run metadata ----
+        import json
+        meta_out = dict(
+            method=args.method,
+            library=args.library,
+            inputs=[list(s) for s in input_specs],
+            fit_deltas=fit_deltas,
+            fit_pairs=[[float(d), float(b)] for d, b in fit_pairs],
+            n_features=n_features,
+            rician_correct=bool(args.rician_correct),
+            noise_sigma=args.noise_sigma,
+            avg_s0=bool(args.avg_s0),
+            fit_s0=bool(args.fit_s0),
+            log_space=bool(args.log_space),
+            vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
+            n_voxels=int(measured.shape[0]),
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            **method_meta,
+        )
+        meta_path = os.path.join(args.out, "fit_metadata.json")
+        with open(meta_path, "w") as fh:
+            json.dump(meta_out, fh, indent=2)
+        print(f"  Saved {meta_path}")
 
         print("\nDone!")
 

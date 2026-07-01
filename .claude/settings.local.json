@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"_sanity_fitters\")",
+      "Bash(pkill -f \"pgrep -f _sanity\")",
+      "Bash(cd /home/jaden/.claude/projects/-mnt-c-miscellaneous-coding-projects-python-mri-processing-processing-madi-gpu-custom-madi/memory/)",
+      "Bash(cat MEMORY.md)"
+    ]
+  }
+}
