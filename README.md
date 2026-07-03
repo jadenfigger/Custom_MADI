@@ -131,11 +131,6 @@ python fit_data.py --fit \
     --mask mask.nii.gz --out results_1delta/
 ```
 
-**Legacy syntax still works** (but --input is preferred):
-```bash
-python fit_data.py --fit --dwi15 dwi15.nii.gz --dwi25 dwi25.nii.gz --mask mask.nii.gz
-```
-
 
 ## Project structure
 
@@ -148,9 +143,26 @@ madi_gpu/
 │   ├── walker_gpu.py      # Numba CUDA random walk kernel + CPU fallback
 │   ├── signal.py          # Multi-delta SDE signal computation
 │   ├── library.py         # Library builder (append, triplets, sub-grids)
+│   ├── fitters.py         # CPU fitting (map/bayes/amico/...)
+│   ├── fitters_gpu.py     # GPU-accelerated mirror of fitters.py
 │   └── plotting.py        # Visualisation
-├── run_simulation.py      # Reproduce Figure 4 (parameter sensitivity)
-├── fit_data.py            # Build library + fit NIfTI data → maps
+├── scripts/
+│   ├── fit_data.py            # Build library + fit NIfTI data → maps
+│   ├── run_simulation.py      # Reproduce Figure 4 (parameter sensitivity)
+│   ├── build_lib.sbatch       # Sol supercomputer library-build job
+│   ├── build_cohort_manifest.py / run_cohort_manifest.py
+│   │                           # Discover + batch-fit a cohort of subjects
+│   ├── filter_for_madi.py, merge_shards.py, migrate_library.py
+│   ├── plot_b_space_map.py
+│   ├── edema_figures/         # Figures for the edema cohort write-up
+│   └── _make_synth_dwi.py, _sanity_fitters.py   # dev-time test helpers
+├── analysis/                  # Diagnostic / verification tooling
+│   ├── verify_gpu_fitters.py, test_drms_curves.py
+│   │                           # Correctness checks against madi_checklist.txt
+│   ├── analyze_library.py, delta_b_analysis.py, extract_lib_and_voxel.py
+│   ├── plot_error_landscape.py, view_error_landscape_3d.py
+│   └── setup_and_run.md
+├── docs/                   # fitting_methods.md, madi_checklist.txt, sol_package_guide.md
 ├── requirements.txt
 └── README.md
 ```

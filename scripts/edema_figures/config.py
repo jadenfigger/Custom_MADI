@@ -94,8 +94,7 @@ FIG3_SUBJECTS = ["001", "003", "187"]
 FIG3_METHOD = "BAYES"
 FIG3_MARKERS = {"001": "o", "003": "s", "187": "^"}
 # Distinct per-subject hues (reused wherever a figure needs subject color
-# coding, e.g. Fig 3's voxel cloud) -- matches madi_viewer_app/constants.py's
-# PROFILE_COLORS palette for visual consistency with the interactive viewer.
+# coding, e.g. Fig 3's voxel cloud).
 SUBJECT_COLORS = {"001": "#1d4ed8", "003": "#be123c", "187": "#047857"}
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,7 @@
 data/
+figures/
+error_landscape_3d_out/
+out_singleshell/
 __pycache__/
 *.nii
 *.nii.gz

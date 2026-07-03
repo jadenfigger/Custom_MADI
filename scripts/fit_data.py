@@ -765,8 +765,6 @@ def main():
     # -- Fitting inputs --
     ap.add_argument("--input", type=str, nargs="+",
                     help="'delta:path' pairs (e.g. 15:dwi15.nii.gz)")
-    ap.add_argument("--dwi15"); ap.add_argument("--dwi25")
-    ap.add_argument("--dwi30"); ap.add_argument("--dwi40")
     ap.add_argument("--mask", default=None,
                     help="Optional brain mask NIfTI.  If omitted, the "
                          "fit is run over every voxel of the volume.  "
@@ -1043,12 +1041,6 @@ def main():
         if args.input:
             for s in args.input:
                 input_specs.append(parse_input(s))
-        else:
-            legacy_map = [(15.0, args.dwi15), (25.0, args.dwi25),
-                          (30.0, args.dwi30), (40.0, args.dwi40)]
-            for delta, path in legacy_map:
-                if path is not None:
-                    input_specs.append((delta, path, None, None))
         if not input_specs:
             print("ERROR: No DWI inputs specified."); return
         input_specs.sort(key=lambda x: x[0])
@@ -1120,14 +1112,6 @@ def main():
         if args.input:
             for s in args.input:
                 input_specs.append(parse_input(s))
-        else:
-            legacy_map = [(15.0, args.dwi15), (25.0, args.dwi25),
-                          (30.0, args.dwi30), (40.0, args.dwi40)]
-            for delta, path in legacy_map:
-                if path is not None:
-                    # Legacy CLI args have no bvals/bvecs — fall back to
-                    # LEGACY_SHELLS by passing None.
-                    input_specs.append((delta, path, None, None))
 
         if not input_specs:
             print("ERROR: No DWI inputs specified."); return
