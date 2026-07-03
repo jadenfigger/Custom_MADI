@@ -85,11 +85,14 @@ LEGACY_B0_INDEX = 0
 LEGACY_N_VOLS   = 97
 
 
-# Tolerance for clustering bvals into shells (s/mm²).  Anything below
-# B0_THRESHOLD is treated as b=0; non-zero bvals within B_TOL of each
-# other are grouped into the same shell.
+# Anything below B0_THRESHOLD is treated as b=0 [s/mm²].
 B0_THRESHOLD = 50.0
-B_TOL        = 50.0
+
+# Each non-b0 DWI volume's raw b-value is matched individually (not
+# clustered with its neighbors first) against the library's b-value grid:
+# if the nearest library b-value is within B_LIB_MATCH_TOL, that volume is
+# snapped to it; otherwise the volume is discarded from the fit entirely.
+B_LIB_MATCH_TOL = 30.0
 
 
 # ===================================================================
@@ -199,26 +202,47 @@ def parse_z_slice(s):
 # bvals / bvecs parsing
 # ===================================================================
 
-def parse_bvals(path: str, b0_thresh: float = B0_THRESHOLD,
-                b_tol: float = B_TOL):
-    """Read an FSL-format bvals file and group into b=0 + shells.
+def parse_bvals(path: str, lib_b_values, b0_thresh: float = B0_THRESHOLD,
+                tol: float = B_LIB_MATCH_TOL):
+    """Read an FSL-format bvals file and match each volume directly against
+    the library's b-value grid.
+
+    Each non-b0 volume's raw b-value is checked individually (not
+    clustered with its neighbors first): if the nearest library b-value is
+    within ``tol``, the volume is snapped to that library b-value;
+    otherwise it is dropped from the fit entirely. This is deliberately
+    library-driven rather than scanner-driven -- a chain-clustering
+    approach that groups nearby raw b-values together first and then
+    checks whether the cluster's mean happens to land near a library value
+    can silently misclassify volumes near the boundary between shells, and
+    can't express "this whole run of intermediate b-values (e.g. an
+    IVIM/perfusion-range shell) isn't in the library at all, throw it
+    away" as precisely as a per-volume check does.
 
     Parameters
     ----------
     path : str
         Path to a whitespace-delimited bvals file (typically one row).
+    lib_b_values : list of float
+        b-values present in the library [s/mm²].
     b0_thresh : float
         Anything with b < this is treated as b=0 [s/mm²].
-    b_tol : float
-        Non-zero bvals within ±b_tol of each other are grouped into the
-        same shell [s/mm²].
+    tol : float
+        Max |raw b-value - nearest library b-value| to accept a volume
+        (default 30 s/mm²). Volumes farther than this from every library
+        b-value are discarded.
 
     Returns
     -------
     bvals : (n_vols,) float ndarray  — raw values from the file
     b0_idx : (n_b0,) int ndarray
     shells : list of (b_value, idx_array) sorted by ascending b
-        b_value is the rounded representative for that shell [s/mm²].
+        b_value is the library's own canonical value (not a rounded
+        scanner-side representative); only library b-values with at least
+        one matching volume appear.
+    n_dropped : int
+        Number of non-b0 volumes discarded (too far from every library
+        b-value).
     """
     raw = np.loadtxt(path).ravel().astype(float)
     if raw.size == 0:
@@ -232,31 +256,25 @@ def parse_bvals(path: str, b0_thresh: float = B0_THRESHOLD,
         raise ValueError(f"No non-zero b-values in {path}")
 
     nz_vals = raw[nz_idx]
+    lib_arr = np.asarray(sorted(set(lib_b_values)), dtype=float)
 
-    # Cluster by sorting and walking with b_tol gap.  Robust to scanner
-    # rounding (e.g. 998, 1001 → one cluster at 1000).
-    order = np.argsort(nz_vals)
-    sorted_vals = nz_vals[order]
-    sorted_idx  = nz_idx[order]
+    # Nearest library b-value (and its distance) for every volume.
+    dists = np.abs(nz_vals[:, None] - lib_arr[None, :])
+    nearest_j = np.argmin(dists, axis=1)
+    nearest_dist = dists[np.arange(nz_vals.size), nearest_j]
+    nearest_b = lib_arr[nearest_j]
+
+    keep = nearest_dist <= tol
+    n_dropped = int((~keep).sum())
 
     shells = []
-    cur_lo = sorted_vals[0]
-    cur_idx = [sorted_idx[0]]
-    cur_vals = [sorted_vals[0]]
-    for v, i in zip(sorted_vals[1:], sorted_idx[1:]):
-        if v - cur_lo <= b_tol:
-            cur_idx.append(i)
-            cur_vals.append(v)
-        else:
-            b_rep = round(float(np.mean(cur_vals)) / 50.0) * 50.0
-            shells.append((b_rep, np.array(sorted(cur_idx), dtype=int)))
-            cur_lo = v
-            cur_idx = [i]
-            cur_vals = [v]
-    b_rep = round(float(np.mean(cur_vals)) / 50.0) * 50.0
-    shells.append((b_rep, np.array(sorted(cur_idx), dtype=int)))
+    for lb in lib_arr:
+        idx = nz_idx[keep & (nearest_b == lb)]
+        if idx.size > 0:
+            shells.append((float(lb), np.sort(idx)))
+    shells.sort(key=lambda x: x[0])
 
-    return raw, b0_idx, shells
+    return raw, b0_idx, shells, n_dropped
 
 
 def parse_bvecs(path: str, n_vols_expected: int):
@@ -317,40 +335,47 @@ def check_direction_uniformity(bvecs, idx, label=""):
 # Noise estimation & Rician correction
 # ===================================================================
 
-def estimate_noise_sigma(data_4d, mask_brain, method="background"):
-    """Estimate Rician noise sigma from a magnitude DWI volume.
+def estimate_noise_sigma(b0_image, mask_brain, dilate_iters=16):
+    """Estimate Rician noise sigma from a b=0 magnitude image's background.
+
+    Background is voxels OUTSIDE a DILATED copy of the brain mask, not
+    simply outside the raw mask. Skull/scalp tissue sits immediately
+    outside a typical brain mask and its magnitude values are not pure
+    Rayleigh-distributed noise (bone/marrow signal, motion, EPI ghosting
+    near the skull) -- sampling background right up against the mask
+    boundary biases the estimate high. Dilating the mask first pushes the
+    sampled background out past the skull into cleaner air.
 
     Parameters
     ----------
-    data_4d : ndarray (X,Y,Z,N_vols)  full DWI volume series
-    mask_brain : bool ndarray (X,Y,Z) brain mask (used to find air region)
-    method : 'background' uses voxels outside the brain mask in the b=0
-             image.  In a true-zero-signal region, magnitude follows a
-             Rayleigh distribution with sigma = sqrt(mean(M^2) / 2).
+    b0_image : ndarray (X,Y,Z)  a single b=0 magnitude volume
+    mask_brain : bool ndarray (X,Y,Z)  brain mask
+    dilate_iters : int  binary-dilation iterations applied to mask_brain
+        before excluding it from the background region (default 8;
+        0 reproduces the old "just outside the raw mask" behavior).
 
     Returns
     -------
-    sigma : float (single noise std; assumes spatially uniform noise)
+    sigma : float or None (None if too few background voxels)
+    n_bg  : int  number of background voxels actually used
     """
-    # Use b=0 volume (volume 0) for noise estimation
-    b0 = data_4d[..., 0]
-
-    # Background = outside brain, with a small erosion margin to avoid
-    # partial-volume edge effects.  Simple version: just outside mask.
-    bg = ~mask_brain
+    if dilate_iters > 0:
+        from scipy.ndimage import binary_dilation
+        bg_mask = ~binary_dilation(mask_brain, iterations=dilate_iters)
+    else:
+        bg_mask = ~mask_brain
 
     # Drop zero voxels (often the FOV padding) - they're not noise samples
-    bg_vals = b0[bg]
+    bg_vals = b0_image[bg_mask]
     bg_vals = bg_vals[bg_vals > 0]
 
-    if len(bg_vals) < 100:
-        print("    WARNING: very few background voxels; sigma estimate "
-              "may be unreliable")
-        return None
+    n_bg = len(bg_vals)
+    if n_bg < 100:
+        return None, n_bg
 
     # Rayleigh: sigma = sqrt(<M^2>/2)
     sigma = float(np.sqrt(np.mean(bg_vals.astype(np.float64)**2) / 2.0))
-    return sigma
+    return sigma, n_bg
 
 
 def rician_correct_secondmoment(M, sigma):
@@ -381,10 +406,11 @@ def load_dwi_and_average(input_specs, mask_path,
                          lib_b_values,
                          rician_correct=False,
                          noise_sigma=None,
+                         noise_bg_dilate_iters=16,
                          avg_s0=False,
                          return_raw=False,
                          z_slice=None,
-                         b_tol=B_TOL):
+                         b_tol=B_LIB_MATCH_TOL):
     """Load DWI NIfTIs, derive (Δ, b) layout from each input's bvals,
     and assemble the measured matrix in a column order matching
     ``fit_pairs``.
@@ -413,6 +439,10 @@ def load_dwi_and_average(input_specs, mask_path,
         (within b_tol) are retained.
     rician_correct : bool
     noise_sigma : float or None
+    noise_bg_dilate_iters : int
+        [auto sigma only, ignored if noise_sigma is given] binary-dilation
+        iterations applied to the mask before its background (~mask) is
+        sampled for noise estimation -- see estimate_noise_sigma().
     avg_s0 : bool
         If True, replace each Δ's S0 with the grand mean across Δs.
     return_raw : bool
@@ -501,18 +531,53 @@ def load_dwi_and_average(input_specs, mask_path,
                       f"got {n_vols}.  Pass a bvals file for non-default "
                       f"protocols.")
             b0_idx = np.array([LEGACY_B0_INDEX], dtype=int)
-            shells = [(float(b), np.arange(sl.start, sl.stop, dtype=int))
-                      for b, sl in LEGACY_SHELLS]
-            print(f"    LEGACY mode: 1 b=0 vol, {len(shells)} shells")
+            raw_shells = [(float(b), np.arange(sl.start, sl.stop, dtype=int))
+                          for b, sl in LEGACY_SHELLS]
+            # LEGACY_SHELLS's hardcoded b-values aren't necessarily on the
+            # library's grid either -- match them the same way (nearest
+            # library b-value within b_tol, else drop the whole shell;
+            # there's no raw per-volume bvals array in legacy mode to
+            # round individually, only these fixed nominal shell values).
+            kept = []
+            dropped = []
+            for b, idx in raw_shells:
+                nearest = min(lib_b_values, key=lambda lb: abs(lb - b))
+                if abs(nearest - b) <= b_tol:
+                    kept.append((float(nearest), idx))
+                else:
+                    dropped.append(b)
+            if dropped:
+                print(f"    ⚠ dropping legacy shells not in library: "
+                      f"{[f'{b:g}' for b in dropped]} "
+                      f"(library has {sorted(lib_b_values)})")
+            if not kept:
+                raise ValueError(
+                    f"No LEGACY_SHELLS b-value matched any library "
+                    f"b-value within {b_tol:g} s/mm² "
+                    f"(library: {sorted(lib_b_values)}).")
+            print(f"    LEGACY mode: 1 b=0 vol, {len(kept)} shells "
+                  f"matched to library")
         else:
-            bvals, b0_idx, shells = parse_bvals(bvals_path)
+            bvals, b0_idx, shells, n_dropped = parse_bvals(
+                bvals_path, lib_b_values, tol=b_tol)
             if bvals.size != n_vols:
                 raise ValueError(
                     f"bvals length ({bvals.size}) ≠ DWI volumes ({n_vols}) "
                     f"for {dwi_path}")
             print(f"    bvals: {len(b0_idx)} b=0 vols, "
-                  f"{len(shells)} non-zero shells "
+                  f"{len(shells)} shells matched to library "
+                  f"(±{b_tol:g} s/mm²) "
                   f"({[f'b={int(b)}×{len(idx)}' for b, idx in shells]})")
+            if n_dropped:
+                print(f"    ⚠ discarded {n_dropped} volume(s) whose "
+                      f"b-value is more than {b_tol:g} s/mm² from every "
+                      f"library b-value {sorted(lib_b_values)} "
+                      f"(not used in the fit)")
+            if not shells:
+                raise ValueError(
+                    f"No volumes in {dwi_path} matched any library "
+                    f"b-value within {b_tol:g} s/mm² "
+                    f"(library: {sorted(lib_b_values)}).")
 
             # Optional bvecs uniformity check
             bvecs = parse_bvecs(bvecs_path, n_vols_expected=n_vols)
@@ -521,25 +586,7 @@ def load_dwi_and_average(input_specs, mask_path,
                     check_direction_uniformity(bvecs, idx,
                                                label=f"Δ={delta_ms:g}, b={int(b)}")
 
-        # Filter shells against library
-        kept = []
-        dropped = []
-        for b, idx in shells:
-            match = next((lb for lb in lib_b_values if abs(b - lb) <= b_tol),
-                         None)
-            if match is not None:
-                kept.append((float(match), idx))   # use library's canonical b
-            else:
-                dropped.append(b)
-        if dropped:
-            print(f"    ⚠ dropping shells not in library: "
-                  f"{[f'{b:g}' for b in dropped]}  "
-                  f"(library has {[f'{b:g}' for b in lib_b_values]})")
-        if not kept:
-            raise ValueError(
-                f"No shells in {dwi_path} match any library b-value "
-                f"(library: {lib_b_values}).")
-        kept.sort(key=lambda x: x[0])
+            kept = shells
 
         all_data.append(data)
         all_b0_idx.append(b0_idx)
@@ -565,17 +612,21 @@ def load_dwi_and_average(input_specs, mask_path,
             print(f"  Rician correction ENABLED, user-provided sigma={sigma_used:.2f}")
         else:
             b0_for_sigma = all_data[0][..., all_b0_idx[0][0]]
-            bg = ~mask_for_noise
-            bg_vals = b0_for_sigma[bg]
-            bg_vals = bg_vals[bg_vals > 0]
-            if len(bg_vals) < 100:
-                print("    ⚠ very few background voxels — disabling Rician correction.")
+            sigma_used, n_bg = estimate_noise_sigma(
+                b0_for_sigma, mask_for_noise,
+                dilate_iters=noise_bg_dilate_iters)
+            if sigma_used is None:
+                print(f"    ⚠ very few background voxels ({n_bg}) outside "
+                      f"the {noise_bg_dilate_iters}x-dilated mask — "
+                      f"disabling Rician correction. Try a smaller "
+                      f"--noise-bg-dilate-iters.")
                 rician_correct = False
             else:
-                sigma_used = float(np.sqrt(np.mean(bg_vals.astype(np.float64) ** 2) / 2.0))
                 b0_brain_med = float(np.median(b0_for_sigma[mask_for_noise]))
                 print(f"  Rician correction ENABLED")
-                print(f"    sigma (auto, background)  = {sigma_used:.2f}")
+                print(f"    sigma (auto, background, "
+                      f"{noise_bg_dilate_iters}x-dilated-mask excluded, "
+                      f"n={n_bg}) = {sigma_used:.2f}")
                 print(f"    median brain b=0 signal   = {b0_brain_med:.1f}")
                 print(f"    median brain b=0 SNR      = {b0_brain_med/sigma_used:.1f}")
 
@@ -672,6 +723,19 @@ def main():
     ap.add_argument("--build-library", action="store_true")
     ap.add_argument("--fit", action="store_true")
     ap.add_argument("--info", action="store_true")
+    ap.add_argument("--export-voxel", type=int, nargs=3, default=None,
+                    metavar=("I", "J", "K"),
+                    help="Export ONE voxel's measured decay (normalized + "
+                         "raw, in fit_pairs column order) to an .npz for "
+                         "analysis/view_error_landscape_3d.py, instead of "
+                         "fitting the whole volume. Uses the same "
+                         "--input/--mask/--rician-correct/--noise-sigma/"
+                         "--avg-s0/--library/--small-delta flags as --fit, "
+                         "so the exported curve is built by the exact same "
+                         "code path (load_dwi_and_average) as a real fit -- "
+                         "no separate shell-averaging logic to drift out of "
+                         "sync. Voxel indices (I,J,K) are in the --mask/DWI "
+                         "native voxel grid.")
 
     # -- Library file --
     ap.add_argument("--library", default="madi_library.npz")
@@ -725,7 +789,21 @@ def main():
     ap.add_argument("--noise-sigma", type=float, default=None,
                     help="Rician noise std.  If omitted and --rician-correct "
                          "is set, sigma is estimated from background voxels "
-                         "of the first scan's b=0 image.")
+                         "of the first scan's b=0 image, drawn from outside "
+                         "a dilated copy of --mask (see "
+                         "--noise-bg-dilate-iters) so skull/scalp tissue "
+                         "immediately outside the brain mask doesn't bias "
+                         "the estimate.")
+    ap.add_argument("--noise-bg-dilate-iters", type=int, default=48,
+                    help="[auto sigma only] Number of binary-dilation "
+                         "iterations applied to --mask before excluding it "
+                         "from the background region used to estimate "
+                         "noise sigma (default 64). Larger values push the "
+                         "background sample further from the brain, past "
+                         "the skull/scalp, at the cost of fewer background "
+                         "voxels; tune upward if the auto sigma still looks "
+                         "too high, downward if too few background voxels "
+                         "remain for a small FOV.")
     ap.add_argument("--avg-s0", action="store_true",
                     help="Average the b=0 volumes across all Δ scans into a "
                          "single S0 image for normalization.  TE is constant "
@@ -801,9 +879,9 @@ def main():
                          "If omitted, the library's stored small δ is used "
                          "and a warning is printed.")
     # -- Matcher tuning (already exposed in library.py but worth making CLI) --
-    ap.add_argument("--vi-min", type=float, default=0.5,
+    ap.add_argument("--vi-min", type=float, default=0.0,
                     help="Lower bound on intracellular volume fraction "
-                         "for library candidates (paper uses 0.5).")
+                         "for library candidates.")
     ap.add_argument("--vi-max", type=float, default=0.95)
     ap.add_argument("--rho-max", type=float, default=None,
                     help="Optional upper bound on library rho [cells/uL] "
@@ -827,7 +905,8 @@ def main():
     # args.rician_correct = False
     # args.avg_s0 = False
 
-    if not any([args.build_library, args.fit, args.info]):
+    if not any([args.build_library, args.fit, args.info,
+                args.export_voxel is not None]):
         ap.print_help(); return
 
     # ================================================================
@@ -952,6 +1031,84 @@ def main():
         build_library(
             kios=kios, rhos=rhos, Vs=Vs, cfg=cfg,
             save_path=args.library, existing_library=existing)
+        return
+
+    # ================================================================
+    #  EXPORT ONE VOXEL'S DECAY CURVE (for view_error_landscape_3d.py)
+    # ================================================================
+    if args.export_voxel is not None:
+        i_vox, j_vox, k_vox = args.export_voxel
+
+        input_specs = []
+        if args.input:
+            for s in args.input:
+                input_specs.append(parse_input(s))
+        else:
+            legacy_map = [(15.0, args.dwi15), (25.0, args.dwi25),
+                          (30.0, args.dwi30), (40.0, args.dwi40)]
+            for delta, path in legacy_map:
+                if path is not None:
+                    input_specs.append((delta, path, None, None))
+        if not input_specs:
+            print("ERROR: No DWI inputs specified."); return
+        input_specs.sort(key=lambda x: x[0])
+
+        if not os.path.exists(args.library):
+            print(f"ERROR: Library not found: {args.library}"); return
+        meta = load_library_meta(args.library)
+        lib_b_values = meta['b_values']
+        if lib_b_values is None:
+            print("ERROR: library has no stored b-values metadata."); return
+
+        print("=" * 60)
+        print(f"Exporting voxel ({i_vox}, {j_vox}, {k_vox})")
+        print("=" * 60)
+        measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used = \
+            load_dwi_and_average(
+                input_specs, args.mask,
+                lib_b_values=lib_b_values,
+                rician_correct=args.rician_correct,
+                noise_sigma=args.noise_sigma,
+                noise_bg_dilate_iters=args.noise_bg_dilate_iters,
+                avg_s0=args.avg_s0,
+                return_raw=True,
+            )
+
+        hit = ((mask_idx[0] == i_vox) & (mask_idx[1] == j_vox) &
+               (mask_idx[2] == k_vox))
+        pos = np.where(hit)[0]
+        if pos.size == 0:
+            print(f"ERROR: voxel ({i_vox},{j_vox},{k_vox}) is not in "
+                  f"--mask (or falls outside the volume, shape {shape}). "
+                  f"Nothing exported.")
+            return
+        pos = int(pos[0])
+
+        measured_vec = measured[pos]
+        raw_vec = extras['raw'][pos]
+        s0 = float(extras['s0'][pos])
+        deltas = np.array([d for d, _ in fit_pairs], dtype=float)
+        bvals = np.array([b for _, b in fit_pairs], dtype=float)
+
+        os.makedirs(args.out, exist_ok=True)
+        out_path = os.path.join(
+            args.out, f"voxel_{i_vox}_{j_vox}_{k_vox}.npz")
+        np.savez(
+            out_path,
+            measured=measured_vec, raw=raw_vec,
+            fit_deltas=deltas, fit_bvals=bvals,
+            s0=s0, sigma=(sigma_used if sigma_used is not None else np.nan),
+            mean_n_dir=extras['mean_n_dir'], s0_median=extras['s0_median'],
+            ijk=np.array([i_vox, j_vox, k_vox], dtype=int),
+            affine=affine, library=args.library,
+            rician_correct=bool(args.rician_correct),
+        )
+        print(f"\n  S0 = {s0:.1f}   sigma = {sigma_used}")
+        print(f"  measured (S/S0): {np.array2string(measured_vec, precision=4)}")
+        print(f"  fit_pairs: {list(zip(deltas.tolist(), bvals.tolist()))}")
+        print(f"\n  Saved {out_path}")
+        print("  Open with: python analysis/view_error_landscape_3d.py "
+              f"--library {args.library} --voxel-data {out_path}")
         return
 
     # ================================================================
@@ -1091,6 +1248,7 @@ def main():
             lib_b_values=lib_b_values,
             rician_correct=args.rician_correct,
             noise_sigma=args.noise_sigma,
+            noise_bg_dilate_iters=args.noise_bg_dilate_iters,
             avg_s0=args.avg_s0,
             return_raw=need_extras,
             z_slice=z_slice_obj,
@@ -1321,6 +1479,9 @@ def main():
             n_features=n_features,
             rician_correct=bool(args.rician_correct),
             noise_sigma=sigma,
+            noise_bg_dilate_iters=(args.noise_bg_dilate_iters
+                                    if args.rician_correct and
+                                    args.noise_sigma is None else None),
             avg_s0=bool(args.avg_s0),
             fit_s0=bool(args.fit_s0),
             log_space=bool(args.log_space),

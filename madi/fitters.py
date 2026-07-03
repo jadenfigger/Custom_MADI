@@ -158,6 +158,22 @@ def bayes_fit(
         resid = mm[:, None] - (MR ** 2) / rr[None, :]
         # Forbid negative S0 (flipped signal): give it zero posterior mass.
         resid = np.where(S0_cand > 0, resid, np.inf)
+
+        # `resid` is on raw (un-normalized) signal units -- it scales like
+        # S0_cand^2 -- but sigma_m is specified on the normalized S/S0
+        # scale (same convention as the fixed-S0 branch). Feeding the raw
+        # residual straight into `resid / (2 sigma_m^2)` below made the
+        # exponent astronomically large relative to sigma_m (S0 ~
+        # thousands => resid ~ S0^2 ~ millions), so exp() underflowed to
+        # exactly 0 for every candidate except the single best one --
+        # collapsing the posterior to a one-hot MAP-equivalent pick
+        # (n_eff=1, std=0) regardless of sigma_m. Dividing by S0_cand^2
+        # converts it back to the same normalized-signal residual the
+        # fixed-S0 branch uses: resid/S0_cand^2 = ||M/S0_cand - s_i||^2.
+        # `resid` (raw units) is kept as-is for the reported `residual`
+        # output, matching the MAP free-S0 matcher's convention.
+        S0_safe = np.where(S0_cand > 0, S0_cand, 1.0)
+        weight_resid = resid / (S0_safe ** 2)
     else:
         if log_space:
             measured = np.log(np.clip(measured_batch, s_floor, 1.0))
@@ -174,6 +190,7 @@ def bayes_fit(
         m2 = np.sum(measured ** 2, axis=1, keepdims=True)
         l2 = np.sum(lib_m ** 2, axis=1, keepdims=True).T
         resid = np.maximum(m2 + l2 - 2.0 * measured @ lib_m.T, 0.0)
+        weight_resid = resid  # already on the normalized S/S0 scale
 
     # Posterior weights in log-space, stabilized by per-voxel max subtraction.
     #
@@ -187,7 +204,7 @@ def bayes_fit(
     # "nan" even though only those specific voxels were actually invalid.
     # Route those rows to an explicit zero-weight result instead (same
     # "no support" convention amico_fit already uses for degenerate voxels).
-    log_w = -resid / (2.0 * sigma_m ** 2)
+    log_w = -weight_resid / (2.0 * sigma_m ** 2)
     row_max = np.max(log_w, axis=1, keepdims=True)
     invalid = ~np.isfinite(row_max)
     log_w = log_w - np.where(invalid, 0.0, row_max)

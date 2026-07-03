@@ -27,7 +27,7 @@ python scripts/fit_data.py --fit --input 15:/mnt/c/Miscellaneous/Coding_Projects
 INPUT="50:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.bvec"
 MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-brain_mask.nii.gz"
 LIB="data/libraries/madi_dense_human.npz"
-BASE="data/outputs/madi_output_glioma_v1.4"
+BASE="data/outputs/madi_output_glioma_v1.5"
 
 INPUT="15:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td15_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td15_desc-preproc_dwi.eddy_rotated_bvecs \
        25:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td25_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td25_desc-preproc_dwi.eddy_rotated_bvecs
@@ -41,35 +41,35 @@ BASE="data/outputs/madi_output_psilocybin_v1.0"
 # ── MAP ──────────────────────────────────────────────────────────────
 python scripts/fit_data.py --fit \
   --method map \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 10.0 \
+  --input $INPUT --mask $MASK --library $LIB --rician-correct \
   --out $BASE/map
 
 python scripts/fit_data.py --fit \
   --method map --fit-s0 \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 10.0 \
+  --input $INPUT --mask $MASK --library $LIB --rician-correct \
   --out $BASE/map_fits0
 
 # ── BAYES ─────────────────────────────────────────────────────────────
 # (--rician-correct lets it auto-estimate sigma_m; logged in fit_metadata.json)
 python scripts/fit_data.py --fit \
   --method bayes \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 20.0 \
+  --input $INPUT --mask $MASK --library $LIB --rician-correct \
   --out $BASE/bayes_s-auto
 
 python scripts/fit_data.py --fit \
   --method bayes --fit-s0 \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 20.0 \
-  --out $BASE/bayes_fits0_s-0.02 --sigma-m 0.02
+  --input $INPUT --mask $MASK --library $LIB --rician-correct \
+  --out $BASE/bayes_fits0_s-auto
 
 # ── AMICO ─────────────────────────────────────────────────────────────
 python scripts/fit_data.py --fit \
   --method amico --device gpu \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 20.0 \
+  --input $INPUT --mask $MASK --library $LIB --rician-correct  \
   --out $BASE/amico_l1-0.0_l2-0.01 --lambda1 0.0 --lambda2 0.01
 
 python scripts/fit_data.py --fit \
   --method amico --fit-s0 \
-  --input $INPUT --mask $MASK --library $LIB --rician-correct --noise-sigma 20.0 \
+  --input $INPUT --mask $MASK --library $LIB --rician-correct  \
   --out $BASE/amico_fits0_l1-0.0_l2-0.01 --lambda1 0.0 --lambda2 0.01
 
 =====================================================================================================================

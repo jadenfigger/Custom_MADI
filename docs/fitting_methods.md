@@ -66,10 +66,17 @@ then report, for each parameter θ ∈ {k_io, ρ, V},
 
 Weights are computed in log-space with a per-voxel `max(log w)` subtraction
 before exponentiating, for numerical stability. With `--fit-s0` the residual
-in the exponent is the free-S₀ residual and negative-S₀ candidates get zero
-weight.
+in the exponent is the free-S₀ residual **divided by that candidate's own
+fitted S₀²** before being compared against `σ_m`, and negative-S₀ candidates
+get zero weight. This keeps `σ_m` on the same normalized S/S₀ scale in both
+modes — the raw free-S₀ residual scales like `S₀²` (thousands, for typical
+DWI intensities), so applying `σ_m` to it directly (without this
+normalization) made the posterior collapse to a one-hot MAP-equivalent pick
+regardless of `σ_m` (`n_eff=1`, `std=0` everywhere) — a bug fixed in both
+the CPU and GPU paths.
 
-**σ_m** (residual noise std on the *normalized* signal) is chosen as:
+**σ_m** (residual noise std on the *normalized* signal, **regardless of
+whether `--fit-s0` is set**) is chosen as:
 
 1. `--sigma-m FLOAT` if given (source logged as `user`);
 2. else, if `--rician-correct` is on, auto-estimated by propagating the Rician

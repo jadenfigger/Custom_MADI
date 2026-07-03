@@ -10,7 +10,17 @@
       "Bash(pip show *)",
       "Skill(update-config)",
       "Bash(nvidia-smi)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Read(//mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema/**)",
+      "Bash(find /mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema -iname *.json)",
+      "Bash(cd *)",
+      "Bash(timeout 590 conda run -n mri python3 scripts/run_cohort_manifest.py --manifest data/manifests/edema_cohort_manifest.tsv --run-id sub-001_MAP)",
+      "Bash(echo \"EXIT: $?\")",
+      "Read(//mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema_original/001/**)",
+      "Read(//mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema_original/002/**)",
+      "Read(//mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/**)",
+      "Read(//mnt/c/miscellaneous/coding_projects/python/mri_processing/**)",
+      "Bash(flirt -version)"
     ]
   }
 }

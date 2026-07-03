@@ -223,6 +223,19 @@ if HAS_CUDA:
         for f in range(n_feat):
             mm += raw[tid, f] * raw[tid, f]
 
+        # `resid` (below) is on raw signal units -- it scales like s0^2 --
+        # but inv_two_sigma2 = 1/(2 sigma_m^2) is calibrated for the
+        # normalized S/S0 scale (same convention as the fixed-S0 kernel).
+        # Weighting directly by `resid` made the exponent astronomically
+        # large relative to sigma_m whenever S0 ~ thousands (resid ~ S0^2
+        # ~ millions), underflowing exp() to exactly 0 for every candidate
+        # but the single best one -- collapsing the posterior to a one-hot
+        # MAP-equivalent pick (n_eff=1, std=0) regardless of sigma_m.
+        # `resid_w = resid / s0^2` converts it back to the same
+        # normalized-signal residual the fixed-S0 kernel uses
+        # (resid/s0^2 = ||raw/s0 - lib_j||^2); `resid` itself (raw units)
+        # is kept for the reported residual output, matching the MAP
+        # free-S0 matcher's convention.
         min_resid = math.inf
         for j in range(n_lib):
             mr = 0.0
@@ -232,9 +245,11 @@ if HAS_CUDA:
             s0 = mr / rr
             resid = mm - (mr * mr) / rr
             if s0 <= 0.0:
-                resid = math.inf
-            if resid < min_resid:
-                min_resid = resid
+                resid_w = math.inf
+            else:
+                resid_w = resid / (s0 * s0)
+            if resid_w < min_resid:
+                min_resid = resid_w
 
         sw = 0.0; swk = 0.0; swk2 = 0.0
         swr = 0.0; swr2 = 0.0
@@ -243,7 +258,7 @@ if HAS_CUDA:
         # Degenerate-voxel guard: if every candidate got masked to +inf above
         # (no library entry gives a positive fitted S0 for this voxel — e.g.
         # background/low-SNR after Rician correction), min_resid is +inf too,
-        # and `resid - min_resid` below would be `inf - inf = nan`, which
+        # and `resid_w - min_resid` below would be `inf - inf = nan`, which
         # would poison every weighted sum for this voxel. Skip the loop
         # entirely in that case and leave all sums at their initialized 0
         # (same "no support" convention amico_fit already uses).
@@ -256,9 +271,11 @@ if HAS_CUDA:
                 s0 = mr / rr
                 resid = mm - (mr * mr) / rr
                 if s0 <= 0.0:
-                    resid = math.inf
+                    resid_w = math.inf
+                else:
+                    resid_w = resid / (s0 * s0)
                 # exp(-inf) == 0.0: masked candidates naturally get zero weight.
-                w = math.exp(-(resid - min_resid) * inv_two_sigma2)
+                w = math.exp(-(resid_w - min_resid) * inv_two_sigma2)
                 sw += w
                 swk += w * kios[j]; swk2 += w * kios[j] * kios[j]
                 swr += w * rhos[j]; swr2 += w * rhos[j] * rhos[j]
