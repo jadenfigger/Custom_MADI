@@ -21,6 +21,12 @@ MADI_ROOT = os.path.join(DATA_ROOT, "derivatives", "madi")
 ROIS_ROOT = os.path.join(DATA_ROOT, "derivatives", "rois")
 PREPROC_ROOT = os.path.join(DATA_ROOT, "derivatives", "preproc")
 FLAIR_ROOT = os.path.join(DATA_ROOT, "derivatives", "flair")
+TUMORSYNTH_ROOT = os.path.join(DATA_ROOT, "derivatives", "tumorsynth")
+
+# SRI-24 template TumorSynth output is registered to (see
+# docs/tumorsynth_install.md §1c) -- needed to bring its labels back into each
+# subject's native space.
+SRI24_TEMPLATE = "/home/jaden/sri24/T1.nii.gz"
 FIGURES_OUT = os.path.join(MADI_ROOT, "figures")
 PAPER_FIGURES_DIR = os.path.join(ORIGINAL_ROOT, "figures")
 

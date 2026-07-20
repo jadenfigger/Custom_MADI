@@ -21,6 +21,20 @@ All three share the same candidate filtering (`--vi-min`, `--vi-max`,
 `--rho-max`), the same `(Δ, b)` subsetting, the same optional `--log_space`
 transform (except AMICO, see below), and the same free-S₀ option (`--fit-s0`).
 
+**`--log_space` applies only to fixed-S₀ MAP and Bayes.** It transforms both
+the measured signal and the library curves to `log(clip(S/S₀, 1e-3, 1.0))`
+before the residual is computed, rebalancing the least-squares metric so the
+low-signal high-b tail (where the tissue-discriminating information lives) is
+not drowned out by the high-signal low-b points. It is silently inapplicable
+to three cases: (1) **AMICO** — the regression `||Dx − m||²` is linear in the
+signal, so a log transform is meaningless (`log` of a mixture ≠ mixture of
+`log`s); this is warned and ignored. (2) **MAP with `--fit-s0`** — the free-S₀
+matcher (`match_voxels_batch_fits0`) has no `log_space` parameter, because its
+analytic `S₀* = (m·sᵢ)/(sᵢ·sᵢ)` projection assumes a linear signal model that
+the log transform breaks. (3) **Bayes with `--fit-s0`** — `bayes_fit` applies
+the log transform only in its fixed-S₀ branch; the free-S₀ branch operates on
+raw signal and ignores `--log_space`.
+
 ---
 
 ## Method 1 — MAP (`--method map`, default)

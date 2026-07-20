@@ -9,121 +9,179 @@ Wiki: https://surfer.nmr.mgh.harvard.edu/fswiki/TumorSynth
 
 > **Architecture note.** This machine is `x86_64` with an NVIDIA RTX 2060 — both
 > requirements are met (`mri_TumorSynth` is x86-only; GPU gives ~10 s/scan vs.
-> ~3 min on CPU).
+> ~3 min on CPU). Verified end-to-end on 2026-07-06 (`--wholetumor` on the
+> SRI-24 template itself, ~85 s for the 5-fold ensemble on GPU).
 
 ---
 
 ## 0. What you end up with
 
-Two things must be on `PATH` / installed before the segmentation script runs:
-
-1. **A conda env `nnUNet_v1.7`** holding the exact python + pytorch + nnU-Net v1
-   the models were trained with, plus the two downloaded model weight sets
-   (`Task002_Tumor`, `Task003_InnerTumor`) placed in nnU-Net's results folder.
-2. **FreeSurfer ≥ 7.4.1** for the required preprocessing (skull-strip +
-   registration to the SRI-24 template) and for the `mri_tumorsynth` wrapper
-   script itself.
+1. **A conda env `nnUNet_v1.7`** with python 3.8.13 + pytorch 2.1.2 (CUDA 11.8)
+   + the `nnunet` pip package, plus the two model weight sets (`Task002_Tumor`,
+   `Task003_InnerTumor`) placed in nnU-Net's results folder.
+2. **FreeSurfer 8.2.0** — already ships `mri_synthstrip`, `mri_robust_register`,
+   `mri_binarize`, **and `mri_tumorsynth` itself** at
+   `/usr/local/freesurfer/8.2.0/bin/`. No separate launcher download needed.
+3. **A patched copy of `mri_tumorsynth`** on `PATH` ahead of FreeSurfer's own
+   (see §2d — the vendor script has two real bugs that break every run on
+   Linux).
+4. **The SRI-24 template**, downloaded separately (§1c) — it does **not** ship
+   with FreeSurfer, despite what the wiki implies.
 
 ---
 
 ## 1. Prerequisites
 
 ### 1a. conda
-Already installed here at `/home/jaden/miniconda3`. Its activation script is:
-
+Already installed here at `/home/jaden/miniconda3`:
 ```bash
 CONDA_SH=/home/jaden/miniconda3/etc/profile.d/conda.sh
 source "$CONDA_SH"
 ```
 
-(The wiki tells you to find this with `cat ~/.bashrc | grep conda.sh`.)
-
-### 1b. FreeSurfer ≥ 7.4.1
-Needed for `mri_synthstrip` (skull-strip), `mri_robust_register` /
-`mri_easyreg` (SRI-24 registration), the SRI-24 template itself, and the
-`mri_tumorsynth` launcher. Install from
-https://surfer.nmr.mgh.harvard.edu/fswiki/DownloadAndInstall, then:
-
+### 1b. FreeSurfer
+Already installed at `/usr/local/freesurfer/8.2.0` (satisfies the ≥7.4.1
+requirement) and confirmed to include `mri_synthstrip`, `mri_robust_register`,
+`mri_binarize`, `mri_tumorsynth`:
 ```bash
-export FREESURFER_HOME=/usr/local/freesurfer/7.4.1     # adjust to your install
+export FREESURFER_HOME=/usr/local/freesurfer/8.2.0
 source "$FREESURFER_HOME/SetUpFreeSurfer.sh"
 ```
 
-Verify: `mri_synthstrip --help` and `mri_robust_register --help` both print usage.
+### 1c. The SRI-24 template (not bundled with FreeSurfer)
+Confirmed by searching the entire FreeSurfer 8.2.0 tree — there is no SRI24
+file anywhere in it. The real source is NITRC's SRI24 project
+(https://www.nitrc.org/projects/sri24/, CC BY-SA 3.0), specifically the
+"anatomy" NIfTI package:
 
-### 1c. Download the two model weight sets
+```bash
+mkdir -p ~/Downloads/sri24 && cd ~/Downloads/sri24
+curl -L -o sri24_anatomy_nifti.zip \
+  "https://www.nitrc.org/frs/download.php/4499/sri24_anatomy_nifti.zip"
+unzip -o sri24_anatomy_nifti.zip
+```
+
+This unpacks `spgr.nii` (T1-weighted), `erly.nii`, `late.nii`, and a `LICENSE`.
+`spgr.nii` is the T1 registration target `--wholetumor` expects
+(confirmed 240×240×155 @ 1mm isotropic — matches the published SRI24 spec):
+```bash
+mkdir -p ~/sri24
+gzip -c ~/Downloads/sri24/sri24/spgr.nii > ~/sri24/T1.nii.gz
+cp ~/Downloads/sri24/sri24/LICENSE ~/sri24/LICENSE
+```
+
+### 1d. Download the two model weight sets
 Links are on the wiki ("Key links"):
 
 - **Whole tumor + healthy tissue:** `TumourSynth_v1.0.zip`
 - **Inner tumor substructures:** `Task003_InnerTumor.zip`
 
-```bash
-cd ~/Downloads
-unzip TumourSynth_v1.0.zip     &&  mv TumourSynth_v1.0 Task002_Tumor
-unzip Task003_InnerTumor.zip   # already named Task003_InnerTumor
-```
-
-Note both directory paths — the install script needs `Task002_Tumor`, and
-`Task003_InnerTumor` gets copied into the results folder afterwards.
+Unzip both. Note: NITRC/OneDrive zips sometimes extract flat (without the
+wrapping `TaskXXX_Name` folder) — check for a `nnUNetTrainerV2__*` folder with
+real `fold_0..4/model_final_checkpoint.model` files and training logs inside;
+that's the genuine model content regardless of what directory it lands in.
 
 ---
 
 ## 2. Build the conda env with `create_nnUNet_v1.7_env.sh`
 
-Download `create_nnUNet_v1.7_env.sh` (wiki "Key links"), then:
+> **Naming gotcha (found 2026-07-06):** `mri_tumorsynth` computes its
+> `RESULTS_FOLDER` by string-splitting the model file path at the **first**
+> literal `nnUNet/` substring it finds. If your install root itself is named
+> `nnUNet` (as the wiki's own example suggests, e.g. `~/nnUNet`), the path
+> `~/nnUNet/nnUNet_v1.7/.../nnUNet/3d_fullres/...` contains `nnUNet/` twice,
+> and the script splits at the wrong (outer) one — `nnUNet_predict` then looks
+> for the model in the wrong place and fails with
+> `AssertionError: model output folder not found`.
+>
+> **Fix: never name the install root `nnUNet`.** Use something like
+> `~/madi_tumorsynth_models` instead.
 
 ```bash
-NNUNET_ROOT=$HOME/nnUNet                 # where nnU-Net + data live
+NNUNET_ROOT=$HOME/madi_tumorsynth_models   # NOT "nnUNet" — see gotcha above
 
 ./create_nnUNet_v1.7_env.sh \
-    -e /home/jaden/miniconda3/etc/profile.d/conda.sh \  # conda.sh
-    -m ~/Downloads/Task002_Tumor \                      # unpacked whole-tumor model
-    -n nnUNet_v1.7 \                                    # conda env name
-    -d "$NNUNET_ROOT" \                                 # nnU-Net install root
-    -c                                                 # install CUDA (we have a GPU)
+    -e /home/jaden/miniconda3/etc/profile.d/conda.sh \
+    -m ~/Downloads/Task002_Tumor \
+    -n nnUNet_v1.7 \
+    -d "$NNUNET_ROOT" \
+    -c
 ```
 
-The script: creates the `nnUNet_v1.7` conda env (tested python/pytorch), clones &
-installs nnU-Net v1, builds the data/results dir structure, drops
-`Task002_Tumor` into the results folder, and writes `nnUNet_v1.7_path.sh` (the
-env vars nnU-Net needs) into `$PWD`.
+If `conda create` fails with "unrecognized arguments" on conda ≥25 — package
+specs must be contiguous, before any `-c channel` flags. (This repo's local
+copy of the vendor script already has this fixed.)
+
+The `pip install .` step for the `nnunet` package itself is memory-hungry
+(pulls in scikit-image, SimpleITK, batchgenerators alongside torch already
+loaded). **On a memory-constrained WSL2 VM this can OOM and crash the entire
+WSL instance**, not just the pip process. If that happens: raise the WSL
+memory ceiling in `%UserProfile%\.wslconfig` on the Windows side, e.g.
+```ini
+[wsl2]
+memory=12GB
+processors=8
+swap=8GB
+```
+then `wsl --shutdown` from Windows and reopen — this fixed it here (default
+cap was ~7.9GB on a 16GB host).
 
 ### 2a. Add the second model (inner tumor)
-Copy `Task003_InnerTumor` next to `Task002_Tumor` in the results tree:
-
 ```bash
-cp -r ~/Downloads/Task003_InnerTumor \
-      "$NNUNET_ROOT"/nnUNet_v1.7/nnUNet_trained_models/nnUNet/3d_fullres/
+mkdir -p "$NNUNET_ROOT"/nnUNet_v1.7/nnUNet_trained_models/nnUNet/3d_fullres/Task003_InnerTumor
+cp -r ~/Downloads/<wherever the nnUNetTrainerV2__* folder actually landed> \
+      "$NNUNET_ROOT"/nnUNet_v1.7/nnUNet_trained_models/nnUNet/3d_fullres/Task003_InnerTumor/
 ```
-
-(Equivalently, re-run the install script with `-m ~/Downloads/Task003_InnerTumor`.)
+Verify both models: each should have
+`nnUNetTrainerV2__nnUNetPlansv2.1/fold_{0..4}/model_final_checkpoint.model`
+directly under `Task002_Tumor/` and `Task003_InnerTumor/`.
 
 ### 2b. Make the nnU-Net env vars auto-load on activate
 ```bash
 source /home/jaden/miniconda3/etc/profile.d/conda.sh
 conda activate nnUNet_v1.7
+cat > nnUNet_v1.7_path.sh <<EOF
+#!/usr/bin/env bash
+export nnUNet_raw_data_base=$NNUNET_ROOT/nnUNet_v1.7/nnUNet_raw_data_base
+export nnUNet_preprocessed=$NNUNET_ROOT/nnUNet_v1.7/nnUNet_preprocessed
+export RESULTS_FOLDER=$NNUNET_ROOT/nnUNet_v1.7/nnUNet_trained_models
+EOF
 mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
 cp nnUNet_v1.7_path.sh "$CONDA_PREFIX/etc/conda/activate.d/"
 ```
+(Note: `mri_tumorsynth` actually recomputes these three vars itself from
+whatever you pass to `--nnUnet`, so this step mostly matters if you ever call
+`nnUNet_predict` directly rather than through the wrapper.)
 
-Now activating `nnUNet_v1.7` sets `NNUNET_ENV_DIR`, `nnUNet_raw_data_base`,
-`nnUNet_preprocessed`, and `RESULTS_FOLDER` for you.
+### 2c. `mri_tumorsynth` already ships with FreeSurfer — but is buggy on Linux
+No separate launcher download needed (`/usr/local/freesurfer/8.2.0/bin/mri_tumorsynth`
+exists already). However it has two bugs that make every invocation fail on
+this machine, both found via `bash -x` tracing an actual run:
 
-### 2c. Install the `mri_tumorsynth` launcher
-Download the main script from the GitHub repo linked on the wiki
-("mri_TumorSynth main script"), make it executable, and put it on `PATH`
-(e.g. into `$FREESURFER_HOME/bin` or `~/.local/bin`):
+1. `mktemp -d -t TumorSynth_` — GNU `mktemp` (Linux) requires explicit `X`s in
+   a `-t` template; BSD/macOS `mktemp` doesn't. Fails immediately with
+   `mktemp: too few X's in template`.
+2. `((i++))` at the end of the per-input loop — when `i` is `0` (first/only
+   input), bash's `((...))` arithmetic evaluates to the *pre*-increment value,
+   which is `0` (falsy), so with `set -e` at the top of the script this
+   silently aborts right after inference finishes — no error message, just no
+   output file and no "Fusing the results" line.
 
+Fix: copy the script, patch both lines, and put it on `PATH` ahead of
+FreeSurfer's copy (don't edit FreeSurfer's own file — it's root-owned):
 ```bash
-chmod +x mri_tumorsynth
-install -m 755 mri_tumorsynth ~/.local/bin/     # ensure ~/.local/bin is on PATH
+mkdir -p ~/.local/bin
+cp /usr/local/freesurfer/8.2.0/bin/mri_tumorsynth ~/.local/bin/mri_tumorsynth
+sed -i 's/mktemp -d -t TumorSynth_/mktemp -d -t TumorSynth_XXXXXX/' ~/.local/bin/mri_tumorsynth
+sed -i 's/((i++))/i=$((i+1))/' ~/.local/bin/mri_tumorsynth
+chmod +x ~/.local/bin/mri_tumorsynth
+export PATH="$HOME/.local/bin:$PATH"   # put this ahead of $FREESURFER_HOME/bin
 ```
+`scripts/segment_tumorsynth.sh` does this `PATH` prepend automatically.
 
 ---
 
 ## 3. Known-issue fixes (apply if you hit them)
-
-All are from the wiki FAQ, run inside the activated env:
 
 ```bash
 source /home/jaden/miniconda3/etc/profile.d/conda.sh
@@ -142,33 +200,35 @@ conda clean -a -y
 
 ## 4. Preprocessing each subject (required before `--wholetumor`)
 
-The wiki is explicit: `--wholetumor` inputs must be **skull-stripped** *and*
-**registered to the SRI-24 template**. Our raw anatomicals in
-`data/edema/sub-XXX/anat/` are neither. Per subject we therefore:
+`--wholetumor` inputs must be **skull-stripped** *and* **registered to the
+SRI-24 template** (`~/sri24/T1.nii.gz`, §1c). Per subject:
 
 1. **skull-strip** the primary sequence with `mri_synthstrip`;
 2. **register** the stripped volume to SRI-24 with `mri_robust_register`
    (`--resample` writes the moved volume so non-FreeSurfer viewers stay aligned).
 
-The recommended primary sequence is **T1CE** (`sub-XXX_ce-Gd_T1w.nii.gz`). T2 and
-FLAIR are added as extra comma-separated inputs for accuracy, so they are
-stripped + registered the same way.
-
-The SRI-24 template ships with FreeSurfer; the script points at
-`$FREESURFER_HOME/average` / your local SRI-24 file — set `SRI24_TEMPLATE` to it.
+Primary sequence is **T1CE** (`sub-XXX_ce-Gd_T1w.nii.gz`); T2 and FLAIR are
+added as extra comma-separated inputs for accuracy.
 
 `scripts/segment_tumorsynth.sh` does all of steps 4–5 for the whole cohort.
 
 ---
 
-## 5. Running the segmentation (what the script does per subject)
+## 5. Running the segmentation
+
+**Critical flag:** the wiki's help text says `--nnUNet`, but the actual script
+only matches `--nnUnet` (lowercase "net") — bash `case` is case-sensitive, and
+there's no environment-variable fallback, so the documented flag silently
+fails with "directory to save the nnUNet model files is not set." Always pass
+`--nnUnet <root>` in exactly that case, pointing at `$NNUNET_ROOT` (the parent
+of `nnUNet_v1.7/`, **not** the `nnUNet_v1.7` subdirectory itself).
 
 ```bash
 # whole tumor + healthy tissue (multi-sequence, GPU):
 mri_tumorsynth \
   --i sub-XXX_ce-Gd_T1w_sri24.nii.gz,sub-XXX_T2w_sri24.nii.gz,sub-XXX_FLAIR_sri24.nii.gz \
   --o sub-XXX_desc-wholetumor_dseg.nii.gz \
-  --wholetumor
+  --wholetumor --nnUnet "$NNUNET_ROOT"
 
 # isolate the tumor ROI from the whole-tumor label (label 18) and multiply by T1CE:
 mri_binarize --i sub-XXX_desc-wholetumor_dseg.nii.gz --match 18 \
@@ -180,7 +240,7 @@ fslmaths sub-XXX_ce-Gd_T1w_sri24.nii.gz -mul sub-XXX_desc-tumormask.nii.gz \
 mri_tumorsynth \
   --i sub-XXX_desc-tumorroi.nii.gz \
   --o sub-XXX_desc-innertumor_dseg.nii.gz \
-  --innertumor
+  --innertumor --nnUnet "$NNUNET_ROOT"
 ```
 
 ### Output label maps
@@ -199,7 +259,16 @@ mri_tumorsynth \
 | 8 | Caudate | 17 | Ventral-DC |
 | 9 | Putamen | **18** | **Whole tumor** |
 
-`--innertumor` (BraTS): `1` Non-enhancing, `2` Enhancing, `3` Necrosis.
+`--innertumor` (BraTS-compliant, per `mri_tumorsynth --help` verbatim —
+"Outputs BraTS-compliant subclasses: Tumor Core (TC), Non-Enhancing Tumor
+(NET), and Edema" — in that order): `1` Tumor Core (TC), `2` Non-Enhancing
+Tumor (NET), `3` Edema. (An earlier draft of this doc had this table wrong,
+transcribed from memory instead of the actual help text — corrected
+2026-07-06 after `scripts/edema_figures/tumorsynth_roi_space.py` produced an
+implausible near-zero "edema" region under the wrong mapping.)
+
+Verified 2026-07-06 by running `--wholetumor` directly on the SRI-24 template
+itself (a healthy brain): produced all 17 tissue labels, correctly no label 18.
 
 ---
 

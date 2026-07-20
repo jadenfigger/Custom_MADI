@@ -97,7 +97,7 @@ def collect(param, rois, methods):
     return stats
 
 
-def make_figure(param, rois, methods, stats):
+def make_figure(param, rois, methods, stats, out_stem="fig_roi_method_bars", title="{param} by ROI and fitting method"):
     n_roi, n_method = len(rois), len(methods)
     x = np.arange(n_roi)
     width = 0.8 / n_method
@@ -124,10 +124,9 @@ def make_figure(param, rois, methods, stats):
                             rotation=90)
 
     ax.set_xticks(x)
-    ax.set_xticklabels([r.capitalize() for r in rois], fontsize=10)
+    ax.set_xticklabels([r.replace("-", " ").title() for r in rois], fontsize=10)
     ax.set_ylabel(config.PARAM_LABELS[param], fontsize=11)
-    ax.set_title(f"{config.PARAM_LABELS[param]} by ROI and fitting method",
-                 fontsize=12)
+    ax.set_title(title.format(param=config.PARAM_LABELS[param]), fontsize=12)
     ax.margins(x=0.02)
 
     ax.spines["top"].set_visible(False)
@@ -142,7 +141,7 @@ def make_figure(param, rois, methods, stats):
               title_fontsize=9, ncol=2, loc="upper right")
 
     os.makedirs(config.FIGURES_OUT, exist_ok=True)
-    out = os.path.join(config.FIGURES_OUT, f"fig_roi_method_bars_{param}.png")
+    out = os.path.join(config.FIGURES_OUT, f"{out_stem}_{param}.png")
     fig.savefig(out, dpi=config.FIGURE_DPI)
     plt.close(fig)
     print(f"saved {out}")
