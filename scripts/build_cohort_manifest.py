@@ -26,10 +26,13 @@ import csv
 import glob
 import os
 
+import numpy as np
+
 # Acquisition metadata for this cohort's single-shot clinical protocol.
 # Matches the human-clinical library (data/libraries/madi_dense_human.npz):
 # Delta = 50 ms, small delta = 20 ms.
 DEFAULT_DELTA_MS = 50.0
+DEFAULT_SMALL_DELTA_MS = 20.0
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_LIBRARY = os.path.join(REPO_ROOT, "data/libraries/madi_dense_human.npz")
 
@@ -41,22 +44,60 @@ SENTINEL = "default"
 # both .nii.gz and .nii extensions.
 DEFAULT_MASK_PRIORITY = ["desc-nodif-brain-clean_mask", "desc-nodif-brain_mask"]
 
+# vi_min/vi_max/rho_max columns below are left at SENTINEL, so fit_data.py
+# applies its OWN --vi-min/--vi-max/--rho-max defaults at fit time. These
+# constants mirror those defaults (scripts/fit_data.py's argparse) purely so
+# --target-n-eff-pct can be resolved to an n_lib-sized n_eff count that
+# matches the candidate pool the real fit will actually use. If fit_data.py's
+# own defaults change, update these to match.
+FIT_DATA_VI_MIN_DEFAULT = 0.0
+FIT_DATA_VI_MAX_DEFAULT = 0.95
+FIT_DATA_RHO_MAX_DEFAULT = None
+
+# Target n_eff for bayes/bayes-fits0 rows, as a percentage of the vi-filtered
+# candidate library size (n_lib) -- see docs/fitting_methods.md "n_eff
+# interpretation" / "sigma_m calibration": n_eff -> 1 means MAP-collapsed,
+# n_eff -> n_lib means uninformative, and ~0.1-1% of n_lib is a reasonable
+# middle ground. Same percentage is used for BAYES and BAYES-fits0 so both
+# land at comparable posterior sharpness despite needing very different
+# sigma_m to get there (see calibrate_sigma_m in madi/fitters.py).
+DEFAULT_TARGET_N_EFF_PCT = 0.2
+
 # (method, fit_s0, run_label, sigma_m)
+# sigma_m is only used for bayes rows without --target-n-eff overriding it;
+# left SENTINEL for bayes rows here since target_n_eff (computed below) is
+# what actually drives sigma_m at fit time.
 FIT_MODES = [
     ("map",   False, "MAP", "0.02"),
     ("map",   True,  "MAP-fits0", "0.01"),
-    ("bayes", False, "BAYES", "0.02"),
-    ("bayes", True,  "BAYES-fits0", "0.01")
+    ("bayes", False, "BAYES", SENTINEL),
+    ("bayes", True,  "BAYES-fits0", SENTINEL),
 ]
 
 MANIFEST_COLUMNS = [
     "run_id", "subject_id", "method", "fit_s0",
     "dwi_path", "bval_path", "bvec_path", "delta_ms",
     "mask_path", "library", "out_dir", "device",
-    "small_delta", "sigma_m", "vi_min", "vi_max", "rho_max",
+    "small_delta", "sigma_m", "target_n_eff", "vi_min", "vi_max", "rho_max",
     "noise_sigma", "noise_bg_dilate_iters",
     "rician_correct", "avg_s0", "log_space",
 ]
+
+
+def compute_n_lib(library_path: str, vi_min: float, vi_max: float,
+                   rho_max=None) -> int:
+    """Candidate-library size after the vi/rho_max filter, without touching
+    the (potentially many-GB) 'vectors' array -- mirrors the mask
+    madi.library._build_candidate_lib_matrix applies, using only the small
+    'rhos'/'Vs' arrays."""
+    with np.load(library_path) as d:
+        rhos = d["rhos"]
+        Vs = d["Vs"]
+    vis = (rhos / 1e9) * (Vs * 1e3)
+    mask = (vis >= vi_min) & (vis <= vi_max)
+    if rho_max is not None:
+        mask &= (rhos <= rho_max)
+    return int(mask.sum())
 
 
 def find_mask(dwi_dir: str, subject_id: str, priority):
@@ -102,11 +143,35 @@ def main():
     ap.add_argument("--delta-ms", type=float, default=DEFAULT_DELTA_MS,
                      help=f"Diffusion time Delta [ms] of the acquisition "
                           f"(default {DEFAULT_DELTA_MS}).")
+    ap.add_argument("--small-delta", type=float, default=DEFAULT_SMALL_DELTA_MS,
+                     help=f"Gradient pulse duration delta [ms] of the "
+                          f"acquisition (default {DEFAULT_SMALL_DELTA_MS}). "
+                          f"Required by the (delta,Delta,b)-universal "
+                          f"library -- written into every row's small_delta "
+                          f"column so fit_data.py doesn't need it re-typed.")
+    ap.add_argument("--target-n-eff-pct", type=float,
+                     default=DEFAULT_TARGET_N_EFF_PCT,
+                     help="[bayes rows only] target n_eff as a percentage of "
+                          f"the vi-filtered candidate library size (default "
+                          f"{DEFAULT_TARGET_N_EFF_PCT}%%). Resolved to an "
+                          "absolute n_eff count once here (not recomputed by "
+                          "fit_data.py), using the vi_min/vi_max/rho_max this "
+                          "manifest actually leaves fit_data.py to default to "
+                          "-- see FIT_DATA_VI_MIN_DEFAULT/FIT_DATA_VI_MAX_DEFAULT.")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
     ap.add_argument("--mask-priority", nargs="+", default=DEFAULT_MASK_PRIORITY,
                      help="Mask filename 'desc-*' stems to try in priority "
                           f"order (default {DEFAULT_MASK_PRIORITY}).")
     args = ap.parse_args()
+
+    n_lib = compute_n_lib(args.library, FIT_DATA_VI_MIN_DEFAULT,
+                           FIT_DATA_VI_MAX_DEFAULT, FIT_DATA_RHO_MAX_DEFAULT)
+    target_n_eff = round(args.target_n_eff_pct / 100.0 * n_lib, 1)
+    print(f"Library {args.library}: n_lib={n_lib} "
+          f"(vi in [{FIT_DATA_VI_MIN_DEFAULT}, {FIT_DATA_VI_MAX_DEFAULT}], "
+          f"rho_max={FIT_DATA_RHO_MAX_DEFAULT})  ->  target_n_eff="
+          f"{target_n_eff:g} ({args.target_n_eff_pct:g}% of n_lib) for "
+          f"bayes rows")
 
     rows = []
     print(f"Scanning {args.preproc_root} ...")
@@ -135,15 +200,15 @@ def main():
                 "out_dir": out_dir,
                 "device": args.device,
                 # --- tunable parameters, left at fit_data.py's own defaults ---
-                "small_delta": SENTINEL,
+                "small_delta": args.small_delta,
                 "sigma_m": sigma_m,
+                "target_n_eff": target_n_eff if method == "bayes" else SENTINEL,
                 "vi_min": SENTINEL,
                 "vi_max": SENTINEL,
                 "rho_max": SENTINEL,
                 "noise_sigma": SENTINEL,
                 "noise_bg_dilate_iters": SENTINEL,
                 "rician_correct": "true",
-                "sigma_m": "0.01" if fit_s0 else "0.02",
                 "avg_s0": "false",
                 "log_space": "false",
             })

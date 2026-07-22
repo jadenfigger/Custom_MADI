@@ -64,6 +64,7 @@ from madi.library  import (build_library, build_library_from_triplets,
                             match_voxels_batch, match_voxels_batch_fits0,
                             library_summary)
 from madi.fitters  import (bayes_fit, amico_fit, estimate_sigma_m,
+                           calibrate_sigma_m,
                            DEFAULT_SIGMA_M, DEFAULT_LAMBDA1, DEFAULT_LAMBDA2)
 from madi.signal   import signals_to_flat
 from madi import fitters_gpu
@@ -99,19 +100,24 @@ B_LIB_MATCH_TOL = 30.0
 # Presets  (unchanged - omitted for brevity, keep yours)
 # ===================================================================
 
+# NOTE: `n_steps` is no longer a settable SimConfig field -- it is derived
+# from `T_max_ms / ts` so that every walk covers the full (δ,Δ,b) grid (see
+# madi/config.py). Presets below only tune walker/ensemble counts and
+# geometry; leave T_max_ms at the SimConfig default unless a preset
+# deliberately restricts the (δ,Δ) grid too (via small_deltas/big_deltas).
 PRESETS = {
     "calibration": {
         "kios": [10, 35],
         "rhos": [200_000, 800_000],
         "Vs":   [1.0, 3.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=50_000,
+        "cfg":  dict(n_walkers=100_000, n_ensembles=120,
                      L=250.0, buffer=60.0, grid_spacing=1.0),
     },
     "small": {
         "kios": [5, 12, 25, 50],
         "rhos": [100_000, 200_000, 400_000, 800_000, 1_200_000],
         "Vs":   [0.5, 1.0, 2.0, 3.5],
-        "cfg":  dict(n_walkers=5_000, n_ensembles=2, n_steps=50_000,
+        "cfg":  dict(n_walkers=5_000, n_ensembles=2,
                      L=180.0, buffer=45.0, grid_spacing=1.2),
     },
     "default": {
@@ -119,18 +125,15 @@ PRESETS = {
         "rhos": [100_000, 200_000, 300_000, 400_000, 600_000,
                  800_000, 1_000_000, 1_200_000, 1_500_000],
         "Vs":   [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120, n_steps=50_000,
+        "cfg":  dict(n_walkers=100_000, n_ensembles=120,
                      L=250.0, buffer=60.0, grid_spacing=1.0),
     },
     "dense": {
-        "kios": [2, 4, 6, 8, 10, 12, 15, 18, 22, 25, 30, 35, 45, 60, 80, 100],
-        "rhos": [100_000, 150_000, 200_000, 300_000, 400_000, 500_000,
-                600_000, 800_000, 1_000_000, 1_200_000, 1_500_000,
-                2_000_000, 3_000_000],
-        "Vs":   [0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5,
-                3.0, 4.0, 5.0, 7.0, 9.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=40, n_steps=75_000,
-                     L=250.0, buffer=60.0, grid_spacing=1.0),
+        "kios": np.linspace(1, 50, 50).tolist() + [60, 70, 80, 90, 100],
+        "rhos": np.linspace(100_000, 3_000_000, 100).tolist(),
+        "Vs":   np.linspace(0.1, 9.0, 100).tolist(),
+        "cfg":  dict(n_walkers=100_000, n_ensembles=40,
+                     L=300.0, buffer=80.0, grid_spacing=1.0),
     },
 }
 
@@ -149,29 +152,51 @@ def parse_triplet(s: str):
 def parse_input(s: str):
     """Parse a single --input spec.
 
+    The first ':'-separated field is the diffusion time Δ (ms). It may be
+    prefixed with a per-scan gradient duration δ as 'δ,Δ' to override the
+    global --small-delta for THIS scan (the (δ,Δ,b)-universal library
+    supports a different δ per acquisition).
+
     Supported forms:
-        Δ:dwi.nii.gz                          — legacy, uses LEGACY_SHELLS
+        Δ:dwi.nii.gz                          — legacy, uses LEGACY_SHELLS; δ from --small-delta
         Δ:dwi.nii.gz:bvals.bval               — bvals-driven, no bvecs
         Δ:dwi.nii.gz:bvals.bval:bvecs.bvec    — bvals + bvecs
+        δ,Δ:dwi.nii.gz:bvals.bval[:bvecs]     — explicit per-scan δ
 
     Returns
     -------
-    (delta_ms, dwi_path, bvals_path_or_None, bvecs_path_or_None)
+    (delta_small_or_None, Delta_ms, dwi_path, bvals_path_or_None,
+     bvecs_path_or_None)
+        delta_small_or_None is the per-scan δ if given as 'δ,Δ', else None
+        (meaning "use the global --small-delta").
     """
     parts = s.split(":")
     if len(parts) < 2:
         raise ValueError(
-            f"Input must be 'Δ:dwi.nii.gz[:bvals[:bvecs]]', got '{s}'")
-    try:
-        delta = float(parts[0])
-    except ValueError:
-        raise ValueError(f"First field of --input must be Δ in ms; got '{parts[0]}'")
+            f"Input must be '[δ,]Δ:dwi.nii.gz[:bvals[:bvecs]]', got '{s}'")
+    timing = parts[0]
+    if "," in timing:
+        ds, dD = timing.split(",", 1)
+        try:
+            delta_small = float(ds)
+            Delta = float(dD)
+        except ValueError:
+            raise ValueError(
+                f"First field 'δ,Δ' must be two numbers in ms; got '{timing}'")
+    else:
+        delta_small = None
+        try:
+            Delta = float(timing)
+        except ValueError:
+            raise ValueError(
+                f"First field of --input must be Δ in ms (or 'δ,Δ'); "
+                f"got '{timing}'")
     dwi   = parts[1]
     bvals = parts[2] if len(parts) >= 3 and parts[2] else None
     bvecs = parts[3] if len(parts) >= 4 and parts[3] else None
     if len(parts) > 4:
         raise ValueError(f"Too many ':'-separated fields in --input '{s}'")
-    return (delta, dwi, bvals, bvecs)
+    return (delta_small, Delta, dwi, bvals, bvecs)
 
 
 def parse_z_slice(s):
@@ -404,6 +429,7 @@ def rician_correct_secondmoment(M, sigma):
 
 def load_dwi_and_average(input_specs, mask_path,
                          lib_b_values,
+                         default_small_delta=None,
                          rician_correct=False,
                          noise_sigma=None,
                          noise_bg_dilate_iters=16,
@@ -411,16 +437,22 @@ def load_dwi_and_average(input_specs, mask_path,
                          return_raw=False,
                          z_slice=None,
                          b_tol=B_LIB_MATCH_TOL):
-    """Load DWI NIfTIs, derive (Δ, b) layout from each input's bvals,
+    """Load DWI NIfTIs, derive (δ, Δ, b) layout from each input's bvals,
     and assemble the measured matrix in a column order matching
-    ``fit_pairs``.
+    ``fit_triples``.
 
     Parameters
     ----------
-    input_specs : list of (delta_ms, dwi_path, bvals_path_or_None,
-                          bvecs_path_or_None)
+    input_specs : list of (delta_small_or_None, Delta_ms, dwi_path,
+                          bvals_path_or_None, bvecs_path_or_None)
         For each input either bvals_path is given (preferred) or it is
-        None (legacy path: assumes LEGACY_SHELLS protocol).
+        None (legacy path: assumes LEGACY_SHELLS protocol).  ``delta_small``
+        is the per-scan gradient duration δ [ms]; when None the global
+        ``default_small_delta`` is used for that scan.
+    default_small_delta : float or None
+        Global δ [ms] applied to any input whose per-scan δ is None.
+        Required (non-None) unless every input carries its own δ — the
+        (δ,Δ,b) library cannot be indexed without a δ for every scan.
     mask_path : str or None
         Path to a brain mask NIfTI.  If None, fit every voxel of the
         full DWI volume — affine and shape are taken from the first
@@ -452,7 +484,7 @@ def load_dwi_and_average(input_specs, mask_path,
     Returns
     -------
     measured : (n_voxels, n_features) ndarray  — S/S0 ratios
-    fit_pairs : list of (Δ, b) tuples in the column order of ``measured``
+    fit_triples : list of (δ, Δ, b) tuples in the column order of ``measured``
     affine, mask_indices, shape
     extras (if return_raw) : dict with 'raw', 's0', 'sigma'
     sigma_used : float
@@ -460,8 +492,18 @@ def load_dwi_and_average(input_specs, mask_path,
     """
     import nibabel as nib
 
-    input_specs = sorted(input_specs, key=lambda x: x[0])
+    # Sort by diffusion time Δ (2nd field); δ (1st field) may be None.
+    input_specs = sorted(input_specs, key=lambda x: x[1])
     n_deltas = len(input_specs)
+
+    def _resolve_delta_small(per_scan_delta, Delta):
+        d = per_scan_delta if per_scan_delta is not None else default_small_delta
+        if d is None:
+            raise ValueError(
+                f"No δ (small-delta) for the Δ={Delta:g} ms scan: pass "
+                f"--small-delta, or give the input as 'δ,Δ:...'. The "
+                f"(δ,Δ,b) library needs a δ for every acquisition.")
+        return float(d)
 
     # ----------------------------------------------------------------
     # Mask (optional).  If absent, fit every voxel of the volume —
@@ -474,7 +516,7 @@ def load_dwi_and_average(input_specs, mask_path,
         shape = mask.shape
         print(f"  Mask: {mask.sum()} voxels (from --mask)")
     else:
-        first_img = nib.load(input_specs[0][1])
+        first_img = nib.load(input_specs[0][2])
         affine = first_img.affine
         shape  = tuple(first_img.shape[:3])
         mask   = np.ones(shape, dtype=bool)
@@ -516,9 +558,14 @@ def load_dwi_and_average(input_specs, mask_path,
     all_data         = []         # list of (X, Y, Z, N_vols) arrays
     all_b0_idx       = []         # list of int arrays
     all_shells_kept  = []         # list of [(b, idx)] retained against library
+    all_small_delta  = []         # list of resolved per-scan δ [ms]
 
-    for di, (delta_ms, dwi_path, bvals_path, bvecs_path) in enumerate(input_specs):
-        print(f"  Δ={delta_ms:.1f}ms  ({os.path.basename(dwi_path)})", flush=True)
+    for di, (delta_small_in, delta_ms, dwi_path, bvals_path, bvecs_path) \
+            in enumerate(input_specs):
+        delta_small = _resolve_delta_small(delta_small_in, delta_ms)
+        all_small_delta.append(delta_small)
+        print(f"  δ={delta_small:.1f}ms  Δ={delta_ms:.1f}ms  "
+              f"({os.path.basename(dwi_path)})", flush=True)
         img = nib.load(dwi_path)
         data = img.get_fdata().astype(np.float64)
         n_vols = data.shape[-1]
@@ -595,12 +642,15 @@ def load_dwi_and_average(input_specs, mask_path,
     # ----------------------------------------------------------------
     # Build the column ordering: (Δ, b) pairs sorted by Δ then by b
     # ----------------------------------------------------------------
-    fit_pairs = []
-    for (delta_ms, *_), kept in zip(input_specs, all_shells_kept):
+    fit_triples = []
+    for spec, delta_small, kept in zip(input_specs, all_small_delta,
+                                       all_shells_kept):
+        delta_big = spec[1]
         for b, _ in kept:
-            fit_pairs.append((float(delta_ms), float(b)))
-    n_features = len(fit_pairs)
-    print(f"  → {n_features} (Δ,b) features per voxel")
+            fit_triples.append((float(delta_small), float(delta_big),
+                                float(b)))
+    n_features = len(fit_triples)
+    print(f"  → {n_features} (δ,Δ,b) features per voxel")
 
     # ----------------------------------------------------------------
     # Noise sigma estimation (optional) — uses first scan's first b=0
@@ -645,7 +695,7 @@ def load_dwi_and_average(input_specs, mask_path,
         b0_mean_vol = np.mean(b0_block, axis=-1)
         s0_vox = b0_mean_vol[mask]
         s0_per_delta.append(s0_vox)
-        print(f"  Δ={input_specs[di][0]:g}: S0 from {len(b0_idx)} b=0 vols, "
+        print(f"  Δ={input_specs[di][1]:g}: S0 from {len(b0_idx)} b=0 vols, "
               f"median brain S0 = {np.median(s0_vox):.1f}")
 
     if avg_s0 and n_deltas > 1:
@@ -667,7 +717,7 @@ def load_dwi_and_average(input_specs, mask_path,
         s0_used = s0_per_delta
 
     # ----------------------------------------------------------------
-    # Build measured matrix in fit_pairs order
+    # Build measured matrix in fit_triples order
     # ----------------------------------------------------------------
     measured   = np.zeros((n_vox, n_features), dtype=np.float64)
     raw_signal = np.zeros((n_vox, n_features), dtype=np.float64)
@@ -692,9 +742,9 @@ def load_dwi_and_average(input_specs, mask_path,
         mean_n_dir = float(np.mean(n_dir)) if n_dir else 1.0
         extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used,
                       mean_n_dir=mean_n_dir, s0_median=float(np.median(s0_ref)))
-        return measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used
+        return measured, fit_triples, affine, mask_idx, shape, extras, sigma_used
 
-    return measured, fit_pairs, affine, mask_idx, shape, sigma_used
+    return measured, fit_triples, affine, mask_idx, shape, sigma_used
 
 
 # ===================================================================
@@ -726,7 +776,7 @@ def main():
     ap.add_argument("--export-voxel", type=int, nargs=3, default=None,
                     metavar=("I", "J", "K"),
                     help="Export ONE voxel's measured decay (normalized + "
-                         "raw, in fit_pairs column order) to an .npz for "
+                         "raw, in fit_triples column order) to an .npz for "
                          "analysis/view_error_landscape_3d.py, instead of "
                          "fitting the whole volume. Uses the same "
                          "--input/--mask/--rician-correct/--noise-sigma/"
@@ -761,6 +811,18 @@ def main():
     # -- Sharding --
     ap.add_argument("--shard-id", type=int, default=None)
     ap.add_argument("--n-shards", type=int, default=None)
+
+    # -- Build-level RNG seed --
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Build-level RNG seed. MUST be the same across "
+                         "every SLURM shard of a given library build: "
+                         "ensemble/walker seeds are derived from "
+                         "(seed, ensemble_index[, kio]) only -- never from "
+                         "(rho, V) -- so every (rho,V) grid point shares "
+                         "correlated random-number streams (common random "
+                         "numbers), which the Fisher/CRLB phase needs. "
+                         "Changing --seed between shards of the same "
+                         "library silently breaks that correlation.")
 
     # -- Fitting inputs --
     ap.add_argument("--input", type=str, nargs="+",
@@ -830,7 +892,19 @@ def main():
         help="[bayes only] Residual-noise std on the normalized S/S0 "
              "signal.  If omitted, auto-estimated from Rician σ when "
              "--rician-correct is on, else defaults to "
-             f"{DEFAULT_SIGMA_M} (a placeholder — a warning is logged).")
+             f"{DEFAULT_SIGMA_M} (a placeholder — a warning is logged). "
+             "Ignored if --target-n-eff is given.")
+    method_grp.add_argument(
+        "--target-n-eff", type=float, default=None,
+        help="[bayes only] Instead of a fixed --sigma-m, pick σ_m so that "
+             "the posterior's effective number of contributing library "
+             "entries (n_eff = 1/Σw_i², median over a random voxel "
+             "subsample) hits this value. Useful with --fit-s0, whose "
+             "residual scale (S0 fitted per candidate) is not directly "
+             "comparable to the fixed-S0 residual, so the same σ_m does "
+             "not give comparable posterior sharpness across the two — "
+             "run without --fit-s0 first, note its n_eff, then pass that "
+             "value here for the --fit-s0 run to match its discrimination.")
     method_grp.add_argument(
         "--lambda1", type=float, default=DEFAULT_LAMBDA1,
         help=f"[amico only] L1 (sparsity) penalty (default {DEFAULT_LAMBDA1}).")
@@ -872,15 +946,23 @@ def main():
              "--device cpu for an exact answer.")
     # -- NEW: acquisition metadata (must match library) --
     ap.add_argument("--small-delta", type=float, default=None,
-                    help="δ (PFG duration) [ms] of the data being fit.  "
-                         "Must match the library's small δ (within 0.05 ms).  "
-                         "If omitted, the library's stored small δ is used "
-                         "and a warning is printed.")
-    # -- Matcher tuning (already exposed in library.py but worth making CLI) --
+                    help="Global δ (PFG gradient duration) [ms] of the data "
+                         "being fit, used as the default for every --input "
+                         "that doesn't carry its own δ. The (δ,Δ,b)-universal "
+                         "library is indexed by (δ,Δ,b), so a δ is required "
+                         "for every scan: either pass --small-delta or give "
+                         "each input as 'δ,Δ:dwi...'. Each (δ,Δ) is matched to "
+                         "the nearest stored library pair (no interpolation).")
+    # -- vi bounds (used BOTH for --build-library and for matching) --
     ap.add_argument("--vi-min", type=float, default=0.0,
                     help="Lower bound on intracellular volume fraction "
-                         "for library candidates.")
-    ap.add_argument("--vi-max", type=float, default=0.95)
+                         "vi = (rho/1e9)*(V*1e3). With --build-library, only "
+                         "(kio,rho,V) triplets with vi in [--vi-min, --vi-max] "
+                         "are simulated (e.g. --vi-min 0.4 skips sparse/low-vi "
+                         "tissue). With --fit, bounds the library candidates.")
+    ap.add_argument("--vi-max", type=float, default=0.95,
+                    help="Upper bound on vi (hard physical ceiling is 0.95; "
+                         "values above are clamped to it at build time).")
     ap.add_argument("--rho-max", type=float, default=None,
                     help="Optional upper bound on library rho [cells/uL] "
                          "for matching (e.g. 1500000 for brain).")
@@ -948,7 +1030,8 @@ def main():
 
             build_library_from_triplets(
                 triplets, cfg=cfg, save_path=args.library,
-                existing_library=existing)
+                existing_library=existing, seed=args.seed,
+                vi_min=args.vi_min, vi_max=args.vi_max)
             return
 
         # ---- Mode: explicit sub-grid ----
@@ -963,7 +1046,8 @@ def main():
 
             build_library(
                 kios=gk, rhos=gr, Vs=gv, cfg=cfg,
-                save_path=args.library, existing_library=existing)
+                save_path=args.library, existing_library=existing,
+                seed=args.seed, vi_min=args.vi_min, vi_max=args.vi_max)
             return
 
         # ---- Mode: preset grid + optional custom additions ----
@@ -993,9 +1077,13 @@ def main():
                 return
 
             # Build full triplet list, filter by vi, slice by (ρ,V) pair.
+            # Use the SAME vi bounds the builder will apply so shard
+            # assignment matches what actually gets computed (otherwise a
+            # shard could be handed entries that are then all skipped).
+            vi_hi = min(args.vi_max, 0.95)
             all_triplets = [(k, r, v) for k in kios for r in rhos for v in Vs]
             valid = [(k, r, v) for k, r, v in all_triplets
-                     if (r / 1e9) * (v * 1e3) <= 0.95]
+                     if args.vi_min <= (r / 1e9) * (v * 1e3) <= vi_hi]
 
             # Unique (ρ,V) pairs, sorted by cost proxy (ρ·V), round-robin
             # across shards so each shard gets a mix of cheap + expensive.
@@ -1023,12 +1111,14 @@ def main():
 
             build_library_from_triplets(
                 shard_triplets, cfg=cfg, save_path=save_path,
-                existing_library=existing)
+                existing_library=existing, seed=args.seed,
+                vi_min=args.vi_min, vi_max=args.vi_max)
             return
 
         build_library(
             kios=kios, rhos=rhos, Vs=Vs, cfg=cfg,
-            save_path=args.library, existing_library=existing)
+            save_path=args.library, existing_library=existing,
+            seed=args.seed, vi_min=args.vi_min, vi_max=args.vi_max)
         return
 
     # ================================================================
@@ -1043,7 +1133,7 @@ def main():
                 input_specs.append(parse_input(s))
         if not input_specs:
             print("ERROR: No DWI inputs specified."); return
-        input_specs.sort(key=lambda x: x[0])
+        input_specs.sort(key=lambda x: x[1])
 
         if not os.path.exists(args.library):
             print(f"ERROR: Library not found: {args.library}"); return
@@ -1055,10 +1145,11 @@ def main():
         print("=" * 60)
         print(f"Exporting voxel ({i_vox}, {j_vox}, {k_vox})")
         print("=" * 60)
-        measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used = \
+        measured, fit_triples, affine, mask_idx, shape, extras, sigma_used = \
             load_dwi_and_average(
                 input_specs, args.mask,
                 lib_b_values=lib_b_values,
+                default_small_delta=args.small_delta,
                 rician_correct=args.rician_correct,
                 noise_sigma=args.noise_sigma,
                 noise_bg_dilate_iters=args.noise_bg_dilate_iters,
@@ -1079,8 +1170,9 @@ def main():
         measured_vec = measured[pos]
         raw_vec = extras['raw'][pos]
         s0 = float(extras['s0'][pos])
-        deltas = np.array([d for d, _ in fit_pairs], dtype=float)
-        bvals = np.array([b for _, b in fit_pairs], dtype=float)
+        small_deltas = np.array([d for d, _, _ in fit_triples], dtype=float)
+        deltas = np.array([D for _, D, _ in fit_triples], dtype=float)
+        bvals = np.array([b for _, _, b in fit_triples], dtype=float)
 
         os.makedirs(args.out, exist_ok=True)
         out_path = os.path.join(
@@ -1088,7 +1180,7 @@ def main():
         np.savez(
             out_path,
             measured=measured_vec, raw=raw_vec,
-            fit_deltas=deltas, fit_bvals=bvals,
+            fit_small_deltas=small_deltas, fit_deltas=deltas, fit_bvals=bvals,
             s0=s0, sigma=(sigma_used if sigma_used is not None else np.nan),
             mean_n_dir=extras['mean_n_dir'], s0_median=extras['s0_median'],
             ijk=np.array([i_vox, j_vox, k_vox], dtype=int),
@@ -1097,7 +1189,8 @@ def main():
         )
         print(f"\n  S0 = {s0:.1f}   sigma = {sigma_used}")
         print(f"  measured (S/S0): {np.array2string(measured_vec, precision=4)}")
-        print(f"  fit_pairs: {list(zip(deltas.tolist(), bvals.tolist()))}")
+        print(f"  fit_triples (δ,Δ,b): "
+              f"{list(zip(small_deltas.tolist(), deltas.tolist(), bvals.tolist()))}")
         print(f"\n  Saved {out_path}")
         print("  Open with: python analysis/view_error_landscape_3d.py "
               f"--library {args.library} --voxel-data {out_path}")
@@ -1121,12 +1214,15 @@ def main():
                   "background (air) voxels, which requires a brain mask "
                   "to identify."); return
 
-        input_specs.sort(key=lambda x: x[0])
-        fit_deltas = [d for d, _, _, _ in input_specs]
+        input_specs.sort(key=lambda x: x[1])
+        fit_deltas = [D for _, D, _, _, _ in input_specs]
 
         # ---- Warn about method-specific flags that are ignored ----
         if args.method != "bayes" and args.sigma_m is not None:
             print(f"  ⚠ --sigma-m is only used by --method bayes; "
+                  f"ignored for --method {args.method}.")
+        if args.method != "bayes" and args.target_n_eff is not None:
+            print(f"  ⚠ --target-n-eff is only used by --method bayes; "
                   f"ignored for --method {args.method}.")
         if args.method != "amico":
             if args.lambda1 != DEFAULT_LAMBDA1:
@@ -1182,10 +1278,9 @@ def main():
             print(f"ERROR: Library not found: {args.library}"); return
         lib = load_library(args.library)
         meta = load_library_meta(args.library)
-        lib_deltas    = meta['deltas']
-        lib_n_b       = meta['n_b']
-        lib_small_d   = meta['small_delta']
-        lib_b_values  = meta['b_values']
+        lib_delta_pairs = meta['delta_pairs']
+        lib_n_b         = meta['n_b']
+        lib_b_values    = meta['b_values']
 
         if lib_b_values is None:
             print(f"ERROR: library has no stored b-values metadata and no "
@@ -1196,31 +1291,24 @@ def main():
         print(f"  {len(lib)} entries")
         library_summary(lib, meta=meta)
 
-        # ---- Acquisition consistency checks ----
-        # 1. small δ
-        if args.small_delta is not None:
-            if lib_small_d is None:
-                print(f"  ⚠ library was built before small δ was saved; "
-                      f"trusting --small-delta={args.small_delta} ms.")
-            elif abs(args.small_delta - lib_small_d) > 0.05:
-                print(f"ERROR: --small-delta ({args.small_delta} ms) does not "
-                      f"match library small δ ({lib_small_d} ms)."); return
-            else:
-                print(f"  ✓ small δ matches library: {args.small_delta} ms")
-        else:
-            if lib_small_d is None:
-                print(f"  ⚠ no --small-delta supplied and library has none "
-                      f"stored.  Assuming default {SimConfig().delta} ms.")
-            else:
-                print(f"  ⓘ no --small-delta supplied; assuming library value "
-                      f"{lib_small_d} ms.")
+        # Unique library δ and Δ, derived from the stored (δ,Δ) pairs.
+        lib_pairs_arr    = np.asarray(lib_delta_pairs, dtype=float)
+        lib_small_deltas = sorted(set(round(float(d), 4)
+                                      for d, _ in lib_delta_pairs))
+        lib_deltas       = sorted(set(round(float(D), 4)
+                                      for _, D in lib_delta_pairs))
+        if meta.get('format') == 'legacy':
+            print(f"  ⓘ legacy fixed-δ library (δ = {lib_small_deltas} ms); "
+                  f"matched as a single-δ grid.")
 
-        # 2. Δ values
+        # ---- Acquisition consistency check: every fit Δ must sit on the
+        # library's Δ grid (δ is validated per-pair after data load, once
+        # each scan's δ is resolved). ----
         for d in fit_deltas:
             if not any(abs(d - ld) < 0.01 for ld in lib_deltas):
                 print(f"ERROR: Δ = {d} ms not in library {list(lib_deltas)}"); return
 
-        # Load data; produces fit_pairs ----
+        # Load data; produces fit_triples ----
         # bayes/amico always need the extras dict (raw signal for --fit-s0,
         # plus σ / S0 / n_dir for σ_m auto-estimation), so request it for any
         # non-map method regardless of --fit-s0.
@@ -1230,6 +1318,7 @@ def main():
         load_out = load_dwi_and_average(
             input_specs, args.mask,
             lib_b_values=lib_b_values,
+            default_small_delta=args.small_delta,
             rician_correct=args.rician_correct,
             noise_sigma=args.noise_sigma,
             noise_bg_dilate_iters=args.noise_bg_dilate_iters,
@@ -1240,15 +1329,31 @@ def main():
 
 
         if need_extras:
-            measured, fit_pairs, affine, mask_idx, shape, extras, sigma_used = load_out
+            measured, fit_triples, affine, mask_idx, shape, extras, sigma_used = load_out
         else:
-            measured, fit_pairs, affine, mask_idx, shape, sigma_used = load_out
+            measured, fit_triples, affine, mask_idx, shape, sigma_used = load_out
             extras = None
 
-        n_features = len(fit_pairs)
+        n_features = len(fit_triples)
         print(f"\n  Feature vector ({n_features} cols):")
-        for d, b in fit_pairs:
-            print(f"    Δ={d:g} ms,  b={b:g} s/mm²")
+        for dd, D, b in fit_triples:
+            print(f"    δ={dd:g} ms,  Δ={D:g} ms,  b={b:g} s/mm²")
+
+        # ---- Consistency check: every distinct (δ,Δ) the data asks for must
+        # land near a stored library pair. NEAREST-column matching accepts a
+        # small mismatch as error (per design), but a pair far off the grid
+        # almost always means a protocol/library mismatch -- fail loudly. ----
+        unique_dD = sorted(set((dd, D) for dd, D, _ in fit_triples))
+        for dd, D in unique_dD:
+            d2 = ((lib_pairs_arr[:, 0] - dd) ** 2
+                  + (lib_pairs_arr[:, 1] - D) ** 2)
+            j = int(np.argmin(d2))
+            nd, nD = lib_pairs_arr[j]
+            if abs(nd - dd) > 1.5 or abs(nD - D) > 1.5:
+                print(f"ERROR: (δ={dd:g}, Δ={D:g}) ms is not on the library "
+                      f"grid; nearest stored pair is (δ={nd:g}, Δ={nD:g}) ms. "
+                      f"Rebuild the library to cover this protocol, or fix "
+                      f"--small-delta / the input Δ."); return
 
         # Underdetermination warning (3 free params: kio, ρ, V)
         if n_features < 3:
@@ -1272,10 +1377,10 @@ def main():
                 t0 = time.time()
                 kio_map, rho_map, V_map, res_map, s0_fit_map = match_voxels_batch_fits0(
                     raw_signal, lib,
-                    fit_pairs=fit_pairs,
-                    lib_deltas=lib_deltas,
+                    lib_delta_pairs=lib_delta_pairs,
                     lib_b_values=lib_b_values,
                     n_b=lib_n_b,
+                    fit_triples=fit_triples,
                     vi_min=args.vi_min,
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
@@ -1296,10 +1401,10 @@ def main():
                 t0 = time.time()
                 kio_map, rho_map, V_map, res_map = match_voxels_batch(
                     measured, lib,
-                    fit_pairs=fit_pairs,
-                    lib_deltas=lib_deltas,
+                    lib_delta_pairs=lib_delta_pairs,
                     lib_b_values=lib_b_values,
                     n_b=lib_n_b,
+                    fit_triples=fit_triples,
                     vi_min=args.vi_min,
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
@@ -1350,9 +1455,40 @@ def main():
         raw_signal = extras['raw'] if args.fit_s0 else None
         method_meta = {}   # method-specific params recorded in JSON
 
+        # Candidate-library size after the vi/rho_max filter (same mask
+        # _build_candidate_lib_matrix applies) -- recorded so n_eff (bayes)
+        # / n_eff (amico) can be judged as a fraction of n_lib rather than
+        # a bare number.
+        vis_all  = np.array([(e.rho / 1e9) * (e.V * 1e3) for e in lib])
+        rhos_all = np.array([e.rho for e in lib])
+        lib_mask = (vis_all >= args.vi_min) & (vis_all <= args.vi_max)
+        if args.rho_max is not None:
+            lib_mask &= (rhos_all <= args.rho_max)
+        n_lib = int(lib_mask.sum())
+
         if args.method == "bayes":
-            # Resolve σ_m: user > auto-from-Rician > placeholder default.
-            if args.sigma_m is not None:
+            # Resolve σ_m: target-n_eff calibration > user > auto-from-Rician
+            # > placeholder default.
+            if args.target_n_eff is not None:
+                if args.sigma_m is not None:
+                    print(f"  ⚠ --target-n-eff given; ignoring --sigma-m "
+                          f"{args.sigma_m:.4g}.")
+                print(f"\n  Calibrating σ_m for target n_eff="
+                      f"{args.target_n_eff:g} "
+                      f"({'S0 FITTED' if args.fit_s0 else 'S0 fixed'}) ...")
+                sigma_m = calibrate_sigma_m(
+                    measured, lib,
+                    lib_delta_pairs=lib_delta_pairs, lib_b_values=lib_b_values,
+                    n_b=lib_n_b, fit_triples=fit_triples,
+                    target_n_eff=args.target_n_eff,
+                    fit_s0=args.fit_s0, raw_signal=raw_signal,
+                    vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
+                    use_gpu=use_gpu,
+                )
+                sigma_src = "target-n-eff"
+                print(f"  σ_m = {sigma_m:.4g}  (calibrated for target "
+                      f"n_eff={args.target_n_eff:g})")
+            elif args.sigma_m is not None:
                 sigma_m = float(args.sigma_m)
                 sigma_src = "user"
                 print(f"\n  σ_m = {sigma_m:.4g}  (user-specified)")
@@ -1373,7 +1509,8 @@ def main():
                     print(f"\n  ⚠ σ_m = {sigma_m:.4g}  (PLACEHOLDER default — "
                           f"pass --sigma-m or --rician-correct for a "
                           f"data-driven value).")
-            method_meta = dict(sigma_m=sigma_m, sigma_m_source=sigma_src)
+            method_meta = dict(sigma_m=sigma_m, sigma_m_source=sigma_src,
+                               n_lib=n_lib)
 
             print(f"\nBayes posterior over {measured.shape[0]} voxels "
                   f"({'S0 FITTED' if args.fit_s0 else 'S0 fixed'}) ...")
@@ -1381,8 +1518,8 @@ def main():
             res = bayes_fit(
                 measured, lib,
                 sigma_m=sigma_m,
-                fit_pairs=fit_pairs, lib_deltas=lib_deltas,
-                lib_b_values=lib_b_values, n_b=lib_n_b,
+                lib_delta_pairs=lib_delta_pairs, lib_b_values=lib_b_values,
+                n_b=lib_n_b, fit_triples=fit_triples,
                 vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 log_space=args.log_space,
                 fit_s0=args.fit_s0, raw_signal=raw_signal,
@@ -1394,7 +1531,8 @@ def main():
             print(f"\n  AMICO elastic-net: λ1={args.lambda1:g} (L1), "
                   f"λ2={args.lambda2:g} (L2)")
             method_meta = dict(lambda1=float(args.lambda1),
-                               lambda2=float(args.lambda2))
+                               lambda2=float(args.lambda2),
+                               n_lib=n_lib)
             if resolved_device == "gpu":
                 method_meta.update(
                     gpu_chunk_voxels=args.gpu_chunk_voxels,
@@ -1406,8 +1544,8 @@ def main():
             res = amico_fit(
                 measured, lib,
                 lambda1=args.lambda1, lambda2=args.lambda2,
-                fit_pairs=fit_pairs, lib_deltas=lib_deltas,
-                lib_b_values=lib_b_values, n_b=lib_n_b,
+                lib_delta_pairs=lib_delta_pairs, lib_b_values=lib_b_values,
+                n_b=lib_n_b, fit_triples=fit_triples,
                 vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 fit_s0=args.fit_s0, raw_signal=raw_signal,
                 use_gpu=use_gpu,
@@ -1459,7 +1597,8 @@ def main():
             library=args.library,
             inputs=[list(s) for s in input_specs],
             fit_deltas=fit_deltas,
-            fit_pairs=[[float(d), float(b)] for d, b in fit_pairs],
+            fit_triples=[[float(dd), float(D), float(b)]
+                         for dd, D, b in fit_triples],
             n_features=n_features,
             rician_correct=bool(args.rician_correct),
             noise_sigma=sigma,

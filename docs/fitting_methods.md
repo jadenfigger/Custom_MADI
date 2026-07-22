@@ -92,12 +92,15 @@ the CPU and GPU paths.
 **σ_m** (residual noise std on the *normalized* signal, **regardless of
 whether `--fit-s0` is set**) is chosen as:
 
-1. `--sigma-m FLOAT` if given (source logged as `user`);
-2. else, if `--rician-correct` is on, auto-estimated by propagating the Rician
+1. `--target-n-eff FLOAT` if given — see **σ_m calibration** below (source
+   logged as `target-n-eff`; overrides `--sigma-m` with a warning if both are
+   given);
+2. else `--sigma-m FLOAT` if given (source logged as `user`);
+3. else, if `--rician-correct` is on, auto-estimated by propagating the Rician
    σ through shell averaging and S₀ normalization,
    `σ_m ≈ σ_rician / (S0_median · sqrt(mean_n_dir_per_shell))` (logged as
    `auto-rician`);
-3. else a placeholder `0.02` (2 % of the normalized signal) with a warning.
+4. else a placeholder `0.02` (2 % of the normalized signal) with a warning.
 
 **Intuition.** σ_m sets how sharply the posterior concentrates. As σ_m → 0 the
 weight collapses onto the single best entry and the posterior mean reproduces
@@ -106,6 +109,53 @@ becomes a smooth, noise-averaged blend that can fall *between* grid points.
 The posterior **std** is a genuine uncertainty map: it is small where one
 tissue clearly explains the data (e.g. white matter) and large where many
 tissues fit comparably well (e.g. CSF / partial-volume voxels).
+
+`n_eff = 1 / Σ wᵢ²` (same "effective number of atoms" definition AMICO uses,
+see Method 3) is the diagnostic for how sharply concentrated a given σ_m made
+the posterior: `n_eff → 1` means one entry dominates (MAP-equivalent,
+possibly overconfident); `n_eff → n_lib` (the vi-filtered candidate count)
+means the weights are nearly uniform and the posterior mean is dominated by
+the *candidate library's* distribution rather than the data. A useful target
+is a small fraction of `n_lib` — enough to smooth over per-entry MC/grid
+noise without washing out the fit; `fit_metadata.json` records `n_lib` so
+this can be judged after the fact.
+
+### σ_m calibration (`--target-n-eff`)
+
+**The same σ_m does not give comparable posterior sharpness in the fixed-S₀
+and free-S₀ (`--fit-s0`) branches**, because their residuals are on
+genuinely different scales, not just different units. With `--fit-s0`, each
+candidate `i` gets its own least-squares-optimal `S0ᵢ*`, which absorbs the
+single largest source of mismatch (overall amplitude) before the shape
+residual is ever compared to σ_m — an extra fitted parameter can only shrink
+a residual, never grow it, the same way adjusted-R² never exceeds R². Because
+many entries in a dense library differ from their neighbors mostly in level
+rather than shape, this systematically fattens the weight given to
+*off-optimal* candidates once S₀ is free, flattening the posterior — for the
+same σ_m, `--fit-s0` runs typically land at a much higher `n_eff` (weaker
+discrimination) than the fixed-S₀ branch. This isn't a bug in either branch's
+math; it just means σ_m's "how much do I trust this candidate" meaning isn't
+portable between them. It also isn't fixable by a closed-form noise
+correction — the gap is dominated by how residuals fall off across *nearby*
+candidates in a specific library, i.e. local library geometry, not by the
+measurement noise level that σ_m formulas above are derived from.
+
+`--target-n-eff FLOAT` sidesteps this by calibrating σ_m directly against
+`n_eff` instead of against noise: `n_eff(σ_m)` is monotonically increasing
+for either S₀ convention (larger σ_m always flattens the posterior further),
+so `calibrate_sigma_m()` (`madi/fitters.py`) bisects σ_m — on a random
+subsample of the voxels being fit (`sample_size`, default 1500), not the
+whole volume — until the sample's *median* `n_eff` matches the target, then
+runs the full fit with that σ_m. This works identically for both S₀
+conventions since it never assumes a noise model, only monotonicity.
+
+Typical workflow: run the fixed-S₀ `bayes` fit first (with `--sigma-m` or
+auto-Rician as usual), note its printed/`fit_metadata.json` `n_eff`, then
+rerun with `--fit-s0 --target-n-eff <that n_eff>` so the free-S₀ run matches
+the same discriminative power instead of guessing at a new `--sigma-m`.
+Calibration progress (`σ_m → median n_eff` per bisection step) is printed;
+the final calibrated σ_m is logged the same way a user-supplied one would be
+(`method_meta['sigma_m']`, `method_meta['sigma_m_source'] = "target-n-eff"`).
 
 **Outputs:** `kio_mean.nii.gz`, `rho_mean.nii.gz`, `V_mean.nii.gz`,
 `kio_std.nii.gz`, `rho_std.nii.gz`, `V_std.nii.gz`, `residual.nii.gz`
@@ -218,12 +268,21 @@ recorded in `fit_metadata.json` as `"device"`.
 - **`map`** — fast default, reproducible, no uncertainty. Use for quick looks
   and when you need the original behaviour exactly.
 - **`bayes`** — when you want uncertainty maps and noise-averaged, off-grid
-  estimates. Tune `σ_m` to your noise level (auto with `--rician-correct`).
+  estimates. Tune `σ_m` to your noise level (auto with `--rician-correct`),
+  or set `--target-n-eff` directly if you want to reason in terms of
+  discrimination strength instead of a noise value — the latter is
+  necessary, not just convenient, when comparing a `--fit-s0` run against a
+  fixed-S₀ one (see **σ_m calibration** above).
 - **`amico`** — when you want a sparse mixture interpretation, regularized /
   smoother maps, and the `n_eff` diagnostic, and can afford the per-voxel
   solve. Start from the ridge default and raise `--lambda2` for more smoothing
-  or `--lambda1` for more sparsity.
+  or `--lambda1` for more sparsity. (No `--target-n-eff` equivalent yet —
+  AMICO's `n_eff` is governed by `--lambda2`, not a `σ_m`-style noise
+  parameter, so it would need its own calibration knob; not implemented.)
 
 Every non-`map` run writes `fit_metadata.json` in the output directory
-recording the method, all parameters used (including the auto-estimated σ_m),
-the inputs, and a timestamp, so experiments are self-documenting.
+recording the method, all parameters used (including the resolved σ_m and its
+source — `user` / `auto-rician` / `target-n-eff` / `default-placeholder` —
+plus `n_lib`, the vi/rho_max-filtered candidate-library size, for judging
+`n_eff` against), the inputs, and a timestamp, so experiments are
+self-documenting.

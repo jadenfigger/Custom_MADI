@@ -24,6 +24,14 @@ All three share the same candidate-filtering / (Δ,b)-subsetting logic
 free-S₀ semantics as the MAP matcher, so their outputs are directly
 comparable.  See ``docs/fitting_methods.md`` for the math and guidance.
 
+``calibrate_sigma_m``
+    Picks σ_m for ``bayes_fit`` by target ``n_eff`` instead of by noise
+    level, bisecting on a voxel subsample. Needed because the fixed-S₀ and
+    free-S₀ (``fit_s0=True``) residuals are on different scales (S₀ fitted
+    per candidate absorbs the dominant mismatch term in the latter), so the
+    same σ_m does not give comparable posterior sharpness in both — see
+    ``docs/fitting_methods.md`` § "σ_m calibration".
+
 The fitters return ``dict``s of flat per-voxel maps so that
 ``scripts/fit_data.py`` can dispatch on ``--method`` and write whichever
 maps a given method produces.
@@ -104,9 +112,9 @@ def bayes_fit(
     library,
     *,
     sigma_m,
-    fit_deltas=None, lib_deltas=None, n_b=4,
+    lib_delta_pairs, lib_b_values, n_b,
+    fit_triples,
     vi_min=0.5, vi_max=0.95, rho_max=None,
-    fit_pairs=None, lib_b_values=None,
     log_space=False, s_floor=1e-3,
     fit_s0=False, raw_signal=None,
     use_gpu=None,
@@ -129,8 +137,8 @@ def bayes_fit(
     s0_fit (posterior-mean fitted S₀).
     """
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
-        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
-        fit_pairs=fit_pairs, lib_b_values=lib_b_values)
+        library, lib_delta_pairs, lib_b_values, n_b,
+        vi_min, vi_max, rho_max, fit_triples)
 
     if sigma_m <= 0:
         raise ValueError(f"sigma_m must be > 0, got {sigma_m}")
@@ -228,6 +236,92 @@ def bayes_fit(
     return out
 
 
+def calibrate_sigma_m(
+    measured_batch,
+    library,
+    *,
+    lib_delta_pairs, lib_b_values, n_b,
+    fit_triples,
+    target_n_eff,
+    fit_s0=False,
+    raw_signal=None,
+    vi_min=0.5, vi_max=0.95, rho_max=None,
+    sigma_lo=1e-5, sigma_hi=1.0,
+    n_iter=25,
+    sample_size=1500,
+    rng_seed=0,
+    use_gpu=None,
+    verbose=True,
+):
+    """Bisect σ_m so ``median(n_eff)`` over a voxel subsample hits ``target_n_eff``.
+
+    ``n_eff = 1/Σw_i²`` grows monotonically with σ_m under either S0
+    convention (larger σ_m flattens the posterior toward uniform weights),
+    so a plain bisection converges regardless of how the fixed- vs free-S0
+    residual scales differ from each other — this sidesteps needing a
+    closed-form noise-propagation correction for ``fit_s0``, whose residual
+    (``S0`` fitted per candidate) is systematically smaller than the
+    fixed-S0 residual by an amount that depends on the library's local
+    geometry, not just measurement noise, so no such closed form exists.
+
+    Runs on a random subsample of ``sample_size`` voxels (not the full
+    volume), since only the aggregate (median) n_eff is needed, not
+    per-voxel outputs.
+
+    Returns the calibrated σ_m (float).
+    """
+    if target_n_eff <= 0:
+        raise ValueError(f"target_n_eff must be > 0, got {target_n_eff}")
+    if fit_s0 and raw_signal is None:
+        raise ValueError("fit_s0=True requires raw_signal.")
+
+    n_vox = measured_batch.shape[0]
+    n_sample = min(sample_size, n_vox)
+    rng = np.random.default_rng(rng_seed)
+    idx = rng.choice(n_vox, size=n_sample, replace=False)
+    measured_sub = measured_batch[idx]
+    raw_sub = raw_signal[idx] if fit_s0 else None
+
+    def median_n_eff(sigma_m):
+        out = bayes_fit(
+            measured_sub, library,
+            sigma_m=sigma_m,
+            lib_delta_pairs=lib_delta_pairs, lib_b_values=lib_b_values,
+            n_b=n_b, fit_triples=fit_triples,
+            vi_min=vi_min, vi_max=vi_max, rho_max=rho_max,
+            fit_s0=fit_s0, raw_signal=raw_sub,
+            use_gpu=use_gpu,
+        )
+        n_eff = out["n_eff"]
+        valid = n_eff[n_eff > 0]
+        return float(np.median(valid)) if valid.size else 0.0
+
+    n_eff_lo = median_n_eff(sigma_lo)
+    n_eff_hi = median_n_eff(sigma_hi)
+    if not (n_eff_lo <= target_n_eff <= n_eff_hi):
+        raise ValueError(
+            f"target_n_eff={target_n_eff:g} is outside the achievable range "
+            f"[{n_eff_lo:g}, {n_eff_hi:g}] for σ_m in "
+            f"[{sigma_lo:g}, {sigma_hi:g}] on this {n_sample}-voxel sample; "
+            f"widen sigma_lo/sigma_hi.")
+
+    log_lo, log_hi = np.log(sigma_lo), np.log(sigma_hi)
+    for i in range(n_iter):
+        log_mid = 0.5 * (log_lo + log_hi)
+        sigma_mid = float(np.exp(log_mid))
+        n_eff_mid = median_n_eff(sigma_mid)
+        if verbose:
+            print(f"    calibrate_sigma_m [{i+1}/{n_iter}]: "
+                  f"σ_m={sigma_mid:.4g} -> median n_eff={n_eff_mid:.1f} "
+                  f"(target {target_n_eff:g})")
+        if n_eff_mid < target_n_eff:
+            log_lo = log_mid
+        else:
+            log_hi = log_mid
+
+    return float(np.exp(0.5 * (log_lo + log_hi)))
+
+
 # ---------------------------------------------------------------------------
 # Method 2: AMICO-style NNLS with elastic-net regularization
 # ---------------------------------------------------------------------------
@@ -300,9 +394,9 @@ def amico_fit(
     library,
     *,
     lambda1=DEFAULT_LAMBDA1, lambda2=DEFAULT_LAMBDA2,
-    fit_deltas=None, lib_deltas=None, n_b=4,
+    lib_delta_pairs, lib_b_values, n_b,
+    fit_triples,
     vi_min=0.5, vi_max=0.95, rho_max=None,
-    fit_pairs=None, lib_b_values=None,
     fit_s0=False, raw_signal=None,
     verbose=True, progress_every=2000,
     use_gpu=None,
@@ -337,8 +431,8 @@ def amico_fit(
     when ``fit_s0`` — s0_fit (``Σx``).
     """
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
-        library, fit_deltas, lib_deltas, n_b, vi_min, vi_max, rho_max,
-        fit_pairs=fit_pairs, lib_b_values=lib_b_values)
+        library, lib_delta_pairs, lib_b_values, n_b,
+        vi_min, vi_max, rho_max, fit_triples)
 
     if fit_s0:
         if raw_signal is None:

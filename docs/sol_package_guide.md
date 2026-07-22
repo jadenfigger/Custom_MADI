@@ -341,12 +341,12 @@ interactive -p public -q public -G a100:1 -c 8 --mem=32G -t 0-02:00
 
 Wait until your prompt switches from `login0X` to a compute node name (e.g., `cg012`). If it doesn't allocate within a minute or two, you can check the queue with `squeue -u $USER` from another shell, or downgrade to `interactive -p htc -c 8 -t 0-01:00` (no GPU — you just won't be able to run the CUDA verification step on the same node).
 
-## Step 3: Build the `madi` environment in a single mamba call
+## Step 3: Build the `madiEnv` environment in a single mamba call
 
 ```bash
 module load mamba/latest
 
-mamba create -y -n madi -c conda-forge \
+mamba create -y -n madiEnv -c conda-forge \
     python=3.11 \
     numpy=1.26 \
     scipy \
@@ -356,7 +356,7 @@ mamba create -y -n madi -c conda-forge \
     cudatoolkit=11.8 \
     tqdm
 
-source activate madi
+source activate madiEnv
 ```
 
 Single-command creation is intentional — it lets Mamba resolve the whole dependency graph in one pass and produces a far more stable env than chained `mamba install` calls.
@@ -396,7 +396,7 @@ You're now back on a login node.
 ## Step 5: Navigate to the repo and prepare directories
 
 ```bash
-cd /scratch/jfigger/madi/custom_madi
+cd /scratch/jfigger/madi/Custom_MADI/
 mkdir -p logs libraries
 ```
 
@@ -416,6 +416,17 @@ You should see:
 ```
 
 If `--export=NONE` is missing, **fix it before submitting**.
+
+> **On the `--seed` flag (matters for the library format).** The build derives
+> every ensemble/walker RNG seed from `(--seed, ensemble_index[, kio])` and
+> **never** from `(ρ, V)`, so that neighbouring `(ρ, V)` grid points share
+> correlated random-number streams (common random numbers). This is what the
+> future Fisher/CRLB phase needs for low-noise finite-difference derivatives.
+> The consequence for Sol: **every shard of one library build must use the same
+> `--seed`.** `build_lib.sbatch` doesn't pass `--seed`, so all shards use the
+> default `0` — which is fine. If you ever add `--seed` to the script, do NOT
+> derive it from `$SLURM_ARRAY_TASK_ID`; that would silently de-correlate the
+> shards and force a rebuild before the Fisher phase can use the library.
 
 ## Step 7: Test submission — one array task only
 
@@ -452,7 +463,20 @@ sbatch build_lib.sbatch
 squeue -u $USER
 ```
 
-This launches all 32 shards (`--array=0-31`). With ensemble reuse and the per-(ρ,V)-group checkpointing, each shard will build its assigned groups and write `libraries/madi_dense.shard000.npz` … `libraries/madi_dense.shard031.npz`.
+This launches all 64 shards (`--array=0-63`, matching `--n-shards 64` in the
+python call — the two **must** stay in sync). With ensemble reuse and the
+per-(ρ,V)-group checkpointing, each shard will build its assigned groups and
+write `libraries/madi_dense.shard000.npz` … `libraries/madi_dense.shard063.npz`.
+
+> **Note on library size / walltime (post `(δ,Δ,b)`-universal refactor).** Each
+> library entry now stores a full `S[δ,Δ,b]` block — the default grid is
+> **1245 `(δ,Δ)` pairs × 25 b-values = 31 125 float32 per entry** (~124 KB),
+> versus a handful of values in the old fixed-δ format. And every walk now runs
+> to a fixed `T_max = 128 ms` (`n_steps = 128 000`) so that one MC run covers the
+> whole `(δ,Δ)` grid, regardless of preset. Both make each entry heavier than the
+> old pipeline; if shards hit the 1-day walltime, re-shard finer (next step)
+> rather than raising `-t` blindly. The output `.npz` files themselves stay
+> modest (tens of MB per shard for the dense grid).
 
 Monitor with:
 ```bash
@@ -466,11 +490,15 @@ ls -lh libraries/                     # watch shards land
 When everything finishes:
 ```bash
 seff <jobID>                          # check CPU/mem efficiency of a representative task
-ls libraries/madi_dense.shard*.npz | wc -l    # should be 32
-python merge_shards.py libraries/madi_dense.shard*.npz -o libraries/madi_dense.npz
+ls libraries/madi_dense.shard*.npz | wc -l    # should be 64
+python scripts/merge_shards.py libraries/madi_dense.shard*.npz -o libraries/madi_dense.npz
 ```
 
-If any shard hit the walltime, re-shard at higher granularity (`--array=0-63`, change `--n-shards 64` in the python call) and resubmit — the per-group checkpoints in `library.py` make this safe and cheap.
+`merge_shards.py` dedupes on `(kio, ρ, V)` and carries the `(δ,Δ,b)` grid
+metadata through from the shards, so the merged library's stored pair/b-value
+axes match the concatenated vectors.
+
+If any shard hit the walltime, re-shard at higher granularity (e.g. `--array=0-127`, change `--n-shards 128` in the python call — keep the array range and `--n-shards` equal) and resubmit with the **same `--seed`** — the per-group checkpoints in `library.py` make this safe and cheap.
 
 ---
 

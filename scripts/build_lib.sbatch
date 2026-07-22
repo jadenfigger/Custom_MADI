@@ -2,7 +2,7 @@
 #SBATCH --job-name=madi_dense
 #SBATCH -p public
 #SBATCH -q public
-#SBATCH --array=0-63
+#SBATCH --array=0-127
 #SBATCH -N 1
 #SBATCH -c 16
 #SBATCH -G 1
@@ -28,4 +28,7 @@ python /scratch/jfigger/madi/Custom_MADI/scripts/fit_data.py \
     --lib-preset dense \
     --library libraries/madi_dense.npz \
     --shard-id "${SLURM_ARRAY_TASK_ID}" \
-    --n-shards 64
+    --n-shards 128 \
+    --vi-min 0.4 \
+    --vi-max 0.95 \ 
+    --verbose true

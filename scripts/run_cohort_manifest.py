@@ -65,6 +65,7 @@ def build_command(row: dict, python_exe: str, fit_data_script: str):
     for col, flag in [
         ("small_delta", "--small-delta"),
         ("sigma_m", "--sigma-m"),
+        ("target_n_eff", "--target-n-eff"),
         ("vi_min", "--vi-min"),
         ("vi_max", "--vi-max"),
         ("rho_max", "--rho-max"),
