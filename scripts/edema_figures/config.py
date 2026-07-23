@@ -14,8 +14,15 @@ from typing import Dict, List
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_ROOT = "/mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema"
-ORIGINAL_ROOT = "/mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema_original"
+# Overridable via env vars so the same tracked config.py works unmodified on
+# both the local machine and Sol (or any other host) -- e.g. on Sol:
+#   export MADI_EDEMA_DATA_ROOT=/scratch/jfigger/edema
+DATA_ROOT = os.environ.get(
+    "MADI_EDEMA_DATA_ROOT",
+    "/mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema")
+ORIGINAL_ROOT = os.environ.get(
+    "MADI_EDEMA_ORIGINAL_ROOT",
+    "/mnt/c/miscellaneous/coding_projects/python/mri_processing/data_storage/data/edema_original")
 
 MADI_ROOT = os.path.join(DATA_ROOT, "derivatives", "madi")
 ROIS_ROOT = os.path.join(DATA_ROOT, "derivatives", "rois")
@@ -25,8 +32,9 @@ TUMORSYNTH_ROOT = os.path.join(DATA_ROOT, "derivatives", "tumorsynth")
 
 # SRI-24 template TumorSynth output is registered to (see
 # docs/tumorsynth_install.md §1c) -- needed to bring its labels back into each
-# subject's native space.
-SRI24_TEMPLATE = "/home/jaden/sri24/T1.nii.gz"
+# subject's native space. Not used by run_all.py's own pipeline (roi_space /
+# flair_space / fig1,3,4,6) -- only by tumorsynth_roi_space.py.
+SRI24_TEMPLATE = os.environ.get("MADI_SRI24_TEMPLATE", "/home/jaden/sri24/T1.nii.gz")
 FIGURES_OUT = os.path.join(MADI_ROOT, "figures")
 PAPER_FIGURES_DIR = os.path.join(ORIGINAL_ROOT, "figures")
 

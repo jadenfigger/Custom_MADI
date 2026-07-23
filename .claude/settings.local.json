@@ -28,7 +28,10 @@
       "Bash(PYTHONPATH=. conda run -n mri python -c ' *)",
       "Bash(PYTHONPATH=. conda run -n mri python analysis/plot_decay_curves.py --library data/libraries/madi_dense.npz --free kio --range 2,8,25,100 --fixed rho=400000,V=2.0 --output /tmp/claude-1000/-mnt-c-miscellaneous-coding-projects-python-mri-processing-processing-madi-gpu-custom-madi/a17f7268-f7b8-46bc-8cda-e22204c4aa11/scratchpad/test_range.png)",
       "Bash(PYTHONPATH=. conda run -n mri python analysis/plot_decay_curves.py --library data/libraries/madi_dense.npz --free kio --range 2,8,25,100 --fixed rho=400000,V=2.0 --log --output /tmp/claude-1000/-mnt-c-miscellaneous-coding-projects-python-mri-processing-processing-madi-gpu-custom-madi/a17f7268-f7b8-46bc-8cda-e22204c4aa11/scratchpad/v2_range_log.png)",
-      "Read(//usr/local/freesurfer/**)"
+      "Read(//usr/local/freesurfer/**)",
+      "Bash(PYTHONPATH=. /home/jaden/miniconda3/envs/mri/bin/python3 -c ' *)",
+      "Bash(PYTHONPATH=. MADI_EDEMA_DATA_ROOT=/scratch/jfigger/edema /home/jaden/miniconda3/envs/mri/bin/python3 -c ' *)",
+      "Bash(bash -n /mnt/c/miscellaneous/coding_projects/python/mri_processing/processing/madi_gpu/custom_madi/scripts/generate_edema_figures.sbatch)"
     ]
   }
 }

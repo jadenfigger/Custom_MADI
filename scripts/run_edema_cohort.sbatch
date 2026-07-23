@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=edema_madi_fit
-#SBATCH -p public
+#SBATCH -p htc
 #SBATCH -q public
-#SBATCH --array=0-39%10
+#SBATCH --array=0-24
 #SBATCH -N 1
 #SBATCH -c 4
 #SBATCH -G 1
@@ -32,7 +32,7 @@ which python
 python -c "import numpy, scipy, numba, nibabel; from numba import cuda; print('imports OK'); print('CUDA:', cuda.is_available()); print('GPU:', cuda.get_current_device().name.decode() if cuda.is_available() else 'NONE')"
 
 # Adjust if the repo lives somewhere else on Sol.
-REPO_ROOT=/scratch/jfigger/madi/Custom_MADI
+REPO_ROOT=/scratch/jfigger/custom_madi/Custom_MADI
 MANIFEST=/scratch/jfigger/edema/derivatives/edema_cohort_manifest.tsv
 
 cd "${REPO_ROOT}"
