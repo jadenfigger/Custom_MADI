@@ -7,7 +7,7 @@ Usage
     python merge_shards.py libraries/madi_dense.shard*.npz \
                            -o libraries/madi_dense_full.npz
 
-    python scripts/merge_shards.py libraries/madi_dense.shard*.npz -o madi_universal_dense.npz
+    python scripts/merge_shards.py libraries/madi_dense.shard*.npz -o data/libraries/madi_dense_universal.npz
 
 Duplicates (same kio/rho/V triplet) are deduped; first occurrence wins.
 """

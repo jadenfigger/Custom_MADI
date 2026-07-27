@@ -68,8 +68,8 @@ DEFAULT_TARGET_N_EFF_PCT = 0.2
 # left SENTINEL for bayes rows here since target_n_eff (computed below) is
 # what actually drives sigma_m at fit time.
 FIT_MODES = [
-    ("map",   False, "MAP", "0.02"),
-    ("map",   True,  "MAP-fits0", "0.01"),
+    # ("map",   False, "MAP", "0.02"),
+    # ("map",   True,  "MAP-fits0", "0.01"),
     ("bayes", False, "BAYES", SENTINEL),
     ("bayes", True,  "BAYES-fits0", SENTINEL),
 ]
@@ -167,6 +167,7 @@ def main():
     n_lib = compute_n_lib(args.library, FIT_DATA_VI_MIN_DEFAULT,
                            FIT_DATA_VI_MAX_DEFAULT, FIT_DATA_RHO_MAX_DEFAULT)
     target_n_eff = round(args.target_n_eff_pct / 100.0 * n_lib, 1)
+
     print(f"Library {args.library}: n_lib={n_lib} "
           f"(vi in [{FIT_DATA_VI_MIN_DEFAULT}, {FIT_DATA_VI_MAX_DEFAULT}], "
           f"rho_max={FIT_DATA_RHO_MAX_DEFAULT})  ->  target_n_eff="

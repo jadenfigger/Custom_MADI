@@ -23,7 +23,7 @@ source activate madiEnv
 # it here:
 #   module spider fsl
 #   module avail 2>&1 | grep -i fsl
-# module load <whatever that reports>
+module load fsl/6.0.7
 which flirt || { echo "ERROR: flirt not on PATH -- load the FSL module first (see comment above)"; exit 1; }
 
 # Sanity check — the first line should be /home/jfigger/.conda/envs/madi/bin/python

@@ -7,6 +7,13 @@ LIB="data/libraries/madi_dense_universal.npz"
 BASE="data/outputs/madi_output_glioma_v3.0"
 SMALL_DELTA="20.0"
 
+INPUT="50:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.eddy_rotated_bvecs"
+MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-nodif-brain_mask.nii.gz"
+LIB="data/libraries/madi_dense_universal.npz"
+BASE="data/outputs/madi_output_glioma_v3.1"
+SMALL_DELTA="20.0"
+
+
 INPUT="15:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td15_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td15_desc-preproc_dwi.eddy_rotated_bvecs \
        25:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td25_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td25_desc-preproc_dwi.eddy_rotated_bvecs
        30:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td30_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td30_desc-preproc_dwi.eddy_rotated_bvecs
@@ -36,7 +43,33 @@ python scripts/fit_data.py --fit \
 python scripts/fit_data.py --fit \
   --method bayes --fit-s0 \
   --input $INPUT --mask $MASK --library $LIB --small-delta $SMALL_DELTA  --rician-correct \
-  --out $BASE/bayes_fits0_s-0.001 --sigma-m 0.001
+  --out $BASE/bayes_fits0_s-auto
+
+  INPUT="50:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.eddy_rotated_bvecs"
+  MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-nodif-brain_mask.nii.gz"
+  LIB="data/libraries/madi_dense_universal.npz"
+  BASE="data/outputs/madi_output_glioma_v3.1"
+  SMALL_DELTA="20.0"
+
+  python scripts/fit_data.py --fit \
+  --method bayes --fit-s0 \
+  --input $INPUT --mask $MASK --library $LIB --small-delta $SMALL_DELTA  --rician-correct \
+  --out $BASE/bayes_fits0_s-corrected-30 --target-n-eff 30
+
+  python scripts/fit_data.py --fit \
+  --method bayes --fit-s0 \
+  --input $INPUT --mask $MASK --library $LIB --small-delta $SMALL_DELTA  --rician-correct \
+  --out $BASE/bayes_fits0_s-corrected-100 --target-n-eff 100
+
+  python scripts/fit_data.py --fit \
+  --method bayes --fit-s0 \
+  --input $INPUT --mask $MASK --library $LIB --small-delta $SMALL_DELTA  --rician-correct \
+  --out $BASE/bayes_fits0_s-corrected-400 --target-n-eff 400
+
+    python scripts/fit_data.py --fit \
+  --method bayes --fit-s0 \
+  --input $INPUT --mask $MASK --library $LIB --small-delta $SMALL_DELTA  --rician-correct \
+  --out $BASE/bayes_fits0_s-corrected-800 --target-n-eff 800
 
 # ── AMICO ─────────────────────────────────────────────────────────────
 python scripts/fit_data.py --fit \
