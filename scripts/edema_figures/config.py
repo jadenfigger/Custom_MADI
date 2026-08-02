@@ -75,7 +75,7 @@ BRAIN_MASK_PRIORITY = ["desc-nodif-brain-clean_mask", "desc-nodif-brain_mask"]
 # Figure 1 — multi-subject kio/rho/V slice montage
 # ---------------------------------------------------------------------------
 FIG1_SUBJECTS = ["001", "002", "003", "011", "187"]
-FIG1_METHOD = "BAYES-fits0"
+FIG1_METHOD = "BAYES"
 # Leftmost reference column, ahead of the kio/rho/V panels. Only rendered
 # for subjects in FLAIR_SUBJECTS (currently all of FIG1_SUBJECTS).
 FIG1_SHOW_FLAIR = True
