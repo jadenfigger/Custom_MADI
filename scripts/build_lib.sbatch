@@ -29,8 +29,13 @@ source activate madiEnv
 which python
 python -c "import numpy, scipy, numba, nibabel; from numba import cuda; print('imports OK'); print('CUDA:', cuda.is_available()); print('GPU:', cuda.get_current_device().name.decode() if cuda.is_available() else 'NONE')"
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-/scratch/jfigger/madi/custom_madi}"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-/scratch/jfigger/madi/Custom_MADI}"
 cd "${REPO_ROOT}"
+# Scripts are invoked by pathname (``python scripts/...``), for which Python
+# places ``scripts/`` rather than the repository root on sys.path.  Make the
+# in-repository ``madi`` package explicit and independent of the cluster's
+# sitecustomize/import configuration.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 mkdir -p logs libraries sol_outputs
 
 MODE="${MADI_JOB_MODE:-unset}"
