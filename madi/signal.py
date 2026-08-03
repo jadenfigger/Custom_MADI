@@ -116,6 +116,33 @@ def _assemble(res: ReducedResult, columns: ColumnGrid) -> dict:
         'S_imag':      S_imag,
         'n_eff':       n_eff,
         'n_escaped':   res.n_escaped,
+        # Production is periodic, so every encoding column contains every
+        # walker.  Store this explicitly rather than making downstream audit
+        # code infer survival from a global counter.
+        'surviving_walkers_by_checkpoint': np.full(
+            len(res.occupancy_counts), res.n_walkers_kept, dtype=np.int64
+        ),
+        # The authoritative exchange label is the direct tagged-starting-cell
+        # first-exit hazard.  The independent all-cell residence rate and the
+        # Eq.-5 proxy remain diagnostics, never label substitutes.
+        'kio_measured': res.measured_kio,
+        'kio_measured_se': res.measured_kio_se,
+        'kio_survival_fit': res.kio_survival_fit,
+        'kio_stationary_residence': res.stationary_kio,
+        'kio_analytic_eq5': res.analytic_kio_eq5,
+        'pp': res.mean_pp,
+        'intra_time_ms': res.intra_time_ms,
+        'efflux_events': res.efflux_events,
+        'influx_events': res.influx_events,
+        'initial_intra': res.initial_intra,
+        'final_intra': res.final_intra,
+        'start_initial_intra': res.start_initial_intra,
+        'start_survival_time_ms': res.start_survival_time_ms,
+        'first_exit_events': res.first_exit_events,
+        'start_survivor_counts': res.start_survivor_counts,
+        'occupancy_fraction': res.occupancy_fraction,
+        'calibration': res.calibration,
+        'geometry_stats': res.geometry_stats,
     }
 
 

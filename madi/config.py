@@ -7,7 +7,8 @@ Internal units:  μm (length), ms (time).
 ----------------------------
 The walk kernel accumulates the running position integral
 
-    Y(t) = ∫₀ᵗ x(s) ds        (trapezoid rule, origin-shifted for fp precision)
+    Y(t) = ∫₀ᵗ x(s) ds        (trapezoid rule at every 1-µs MC step,
+                                origin-shifted for fp precision)
 
 sampled at stride ``h_ms``, instead of two fixed PGSE moment windows. For ANY
 (δ, Δ) whose δ, Δ, and Δ+δ are exact multiples of ``h_ms``:
@@ -161,16 +162,59 @@ class SimConfig:
 
     # --- Ensemble geometry -----------------------------------------------------
     L:           float = 250.0          # Ω_sim cube side             [μm]
-    buffer:      float = 60.0           # walker spawn margin (Ω_src) [μm]
-    pop_margin:  float = 40.0           # Ω_pop seed margin           [μm]
+    # ``buffer`` and ``pop_margin`` are retained for loading old command
+    # lines.  The production boundary mode is periodic, so walkers are
+    # started uniformly in the whole box and no finite source domain is used.
+    # They are used only by the explicit ``absorbing_legacy`` diagnostic mode.
+    buffer:      float = 60.0           # legacy walker spawn margin [μm]
+    pop_margin:  float = 40.0           # legacy source-seed margin  [μm]
     kappa:       float = 0.95           # per-cell annulus cap: α_i ≤ κ·d_nn/2
 
-    # --- Voxelised lookup grid ---------------------------------------------
-    grid_spacing: float = 1.0           # μm per grid voxel
+    # --- Periodic candidate classifier -------------------------------------
+    # The GPU cannot call scipy's KD tree.  Both CPU and GPU therefore use
+    # this same finite candidate cache and re-rank every candidate at the
+    # actual walker location.  The cache resolution / candidate count are
+    # validated against an exact periodic KD-tree in Tier-A tests.
+    grid_spacing: float = 0.75           # μm per cache voxel
+    classifier_candidates: int = 8       # primary seeds retained per voxel
+    boundary_mode: str = "periodic"      # production: periodic; legacy only: absorbing_legacy
+
+    # Geometry calibration is deliberately performed on every realised
+    # Poisson ensemble.  ``geometry_vi_tolerance`` is an absolute tolerance:
+    # 0.005 is >10x the binomial MC SE for 200k probes at all requested v_i,
+    # while remaining far below one practical library grid cell.
+    geometry_calibration_points: int = 200_000
+    geometry_validation_points: int = 200_000
+    geometry_sample_cells: int = 128
+    geometry_vi_tolerance: float = 0.005
+    geometry_alpha_iterations: int = 24
 
     # --- Boundary-escape policy --------------------------------------------
-    # Paper behaviour: abort on escape, with a small slack (see walker_gpu.py).
+    # Only meaningful in the explicit legacy absorbing diagnostic.  A
+    # production build rejects that mode rather than silently discarding
+    # walkers from all columns.
     max_escape_frac: float = 0.01
+
+    # --- Exchange calibration ------------------------------------------------
+    # A direct tagged-starting-cell calibration is run once for each realised
+    # geometry before its k_io sweep.  It measures a *response curve*, not a
+    # single analytic or linear p_p→k_io slope: Gaussian proposals can make
+    # the high-p response sub-linear because rejected walkers remain near a
+    # membrane.  The final entry is always labelled by the independently
+    # measured first-exit rate from its own signal walk.
+    exchange_calibration_walkers: int = 4_096
+    exchange_calibration_ms: float = 32.0
+    exchange_calibration_response_points: int = 9
+    exchange_calibration_min_pp: float = 1e-5
+    exchange_calibration_min_events: int = 32
+    exchange_calibration_max_batches: int = 4
+
+    # --- Phase model ---------------------------------------------------------
+    # ``finite_lobe`` is the only production model: it evaluates
+    # gamma*integral(G(t).r(t))dt for rectangular PGSE lobes.  ``narrow_pulse``
+    # exists solely for diagnostics and is never accepted by a production
+    # library build.
+    phase_model: str = "finite_lobe"
 
     # --- (δ, Δ, b) library grid ---------------------------------------------
     h_ms:         float = H_MS
@@ -243,6 +287,30 @@ class SimConfig:
                 f"T_max_ms={self.T_max_ms} ms."
             )
         _ = self.steps_per_h  # raises if h_ms/ts misaligned
+        if self.phase_model not in {"finite_lobe", "narrow_pulse"}:
+            raise ValueError(
+                "phase_model must be 'finite_lobe' or 'narrow_pulse', got "
+                f"{self.phase_model!r}."
+            )
+        if self.boundary_mode not in {"periodic", "absorbing_legacy"}:
+            raise ValueError(
+                "boundary_mode must be 'periodic' or 'absorbing_legacy', got "
+                f"{self.boundary_mode!r}."
+            )
+        if self.classifier_candidates < 2:
+            raise ValueError("classifier_candidates must be at least two.")
+        if self.exchange_calibration_walkers <= 0:
+            raise ValueError("exchange_calibration_walkers must be positive.")
+        if self.exchange_calibration_ms <= 0.0:
+            raise ValueError("exchange_calibration_ms must be positive.")
+        if self.exchange_calibration_response_points < 3:
+            raise ValueError("exchange_calibration_response_points must be at least three.")
+        if not (0.0 < self.exchange_calibration_min_pp <= 1.0):
+            raise ValueError("exchange_calibration_min_pp must lie in (0, 1].")
+        if self.exchange_calibration_min_events < 1:
+            raise ValueError("exchange_calibration_min_events must be positive.")
+        if self.exchange_calibration_max_batches < 1:
+            raise ValueError("exchange_calibration_max_batches must be positive.")
 
     @property
     def grid_size(self) -> int:

@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -49,6 +51,8 @@ def main():
                     help="Per-shard .npz files (globs allowed)")
     ap.add_argument("-o", "--out", required=True,
                     help="Output merged library .npz")
+    ap.add_argument("--require-shards", type=int, default=None,
+                    help="Require shard ids 0..N-1 exactly once before merging.")
     args = ap.parse_args()
 
     # Expand globs
@@ -63,14 +67,38 @@ def main():
         print("ERROR: no shard files found")
         sys.exit(1)
 
+    if args.require_shards is not None:
+        found = []
+        for path in paths:
+            match = re.search(r"\.shard(\d+)(?:\.|$)", os.path.basename(path))
+            if match is None:
+                print(f"ERROR: cannot infer shard id from {path}")
+                sys.exit(1)
+            found.append(int(match.group(1)))
+        expected = set(range(args.require_shards))
+        if set(found) != expected or len(found) != len(set(found)):
+            print(f"ERROR: shard coverage mismatch; found={sorted(found)}, "
+                  f"expected={sorted(expected)}")
+            sys.exit(1)
+
     print(f"Merging {len(paths)} shard files:")
+    first_meta = load_library_meta(paths[0])
+    first_grid = json.dumps((first_meta.get("build_metadata") or {}).get("grid", {}), sort_keys=True)
     merged = []
     seen = set()
     for p in paths:
+        shard_meta = load_library_meta(p)
+        if (shard_meta["delta_pairs"] != first_meta["delta_pairs"]
+                or shard_meta["b_values"] != first_meta["b_values"]
+                or json.dumps((shard_meta.get("build_metadata") or {}).get("grid", {}), sort_keys=True) != first_grid):
+            print(f"ERROR: shard metadata grid mismatch: {p}")
+            sys.exit(1)
         lib = load_library(p)
         before = len(merged)
         for e in lib:
-            key = (round(e.kio, 4), round(e.rho, 1), round(e.V, 6))
+            key = ("free_water",) if e.is_free_water else (
+                round(e.kio, 4), round(e.rho, 1), round(e.V, 6)
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -79,13 +107,16 @@ def main():
 
     # Preserve the (δ,Δ,b) grid metadata from the first shard so the merged
     # library's stored pair/b-value axes match the concatenated vectors.
-    meta = load_library_meta(paths[0])
+    meta = first_meta
     columns = _columns_from_meta(meta)
     cfg = SimConfig(h_ms=(meta.get("h_ms") or 1.0))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
                 exist_ok=True)
-    _save_library(merged, args.out, cfg=cfg, columns=columns)
+    _save_library(
+        merged, args.out, cfg=cfg, columns=columns,
+        build_metadata=meta.get("build_metadata"),
+    )
 
     print(f"\nMerged library → {args.out}")
     library_summary(merged, meta=load_library_meta(args.out))

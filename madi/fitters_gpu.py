@@ -154,7 +154,7 @@ if HAS_CUDA:
         best_s0_out[tid] = best_s0
 
     @cuda.jit
-    def _bayes_kernel_fixed(measured, lib, lib_l2, kios, rhos, Vs,
+    def _bayes_kernel_fixed(measured, lib, lib_l2, kios, rhos, Vs, quadrature_weights,
                              inv_two_sigma2,
                              out_sumw, out_sumw_kio, out_sumw_kio2,
                              out_sumw_rho, out_sumw_rho2,
@@ -191,7 +191,7 @@ if HAS_CUDA:
             for f in range(n_feat):
                 dot += measured[tid, f] * lib[j, f]
             resid = m2 + lib_l2[j] - 2.0 * dot
-            w = math.exp(-(resid - min_resid) * inv_two_sigma2)
+            w = quadrature_weights[j] * math.exp(-(resid - min_resid) * inv_two_sigma2)
             sw += w
             swk += w * kios[j]; swk2 += w * kios[j] * kios[j]
             swr += w * rhos[j]; swr2 += w * rhos[j] * rhos[j]
@@ -207,7 +207,7 @@ if HAS_CUDA:
         out_sumw2[tid] = sw2
 
     @cuda.jit
-    def _bayes_kernel_free_s0(raw, lib, lib_rr, kios, rhos, Vs,
+    def _bayes_kernel_free_s0(raw, lib, lib_rr, kios, rhos, Vs, quadrature_weights,
                                inv_two_sigma2,
                                out_sumw, out_sumw_kio, out_sumw_kio2,
                                out_sumw_rho, out_sumw_rho2,
@@ -275,7 +275,7 @@ if HAS_CUDA:
                 else:
                     resid_w = resid / (s0 * s0)
                 # exp(-inf) == 0.0: masked candidates naturally get zero weight.
-                w = math.exp(-(resid_w - min_resid) * inv_two_sigma2)
+                w = quadrature_weights[j] * math.exp(-(resid_w - min_resid) * inv_two_sigma2)
                 sw += w
                 swk += w * kios[j]; swk2 += w * kios[j] * kios[j]
                 swr += w * rhos[j]; swr2 += w * rhos[j] * rhos[j]
@@ -464,7 +464,7 @@ def map_match_fits0_gpu(raw_signal, lib_mat, kios_arr, rhos_arr, Vs_arr):
 
 
 def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
-                   sigma_m, fit_s0=False):
+                   sigma_m, fit_s0=False, quadrature_weights=None):
     """GPU counterpart of ``fitters.bayes_fit``.
 
     ``measured_batch`` is the (already log-transformed if requested)
@@ -480,6 +480,12 @@ def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
     d_kios = cuda.to_device(np.ascontiguousarray(kios_arr, dtype=np.float64))
     d_rhos = cuda.to_device(np.ascontiguousarray(rhos_arr, dtype=np.float64))
     d_Vs = cuda.to_device(np.ascontiguousarray(Vs_arr, dtype=np.float64))
+    if quadrature_weights is None:
+        raise ValueError("Bayesian GPU fitting requires positive quadrature weights.")
+    weights = np.ascontiguousarray(quadrature_weights, dtype=np.float64)
+    if weights.shape != kios_arr.shape or not np.all(np.isfinite(weights) & (weights > 0.0)):
+        raise ValueError("invalid Bayesian quadrature weights")
+    d_weights = cuda.to_device(weights)
 
     outs = [cuda.device_array(n_vox, dtype=np.float64) for _ in range(9)]
     grid = _grid(n_vox)
@@ -489,7 +495,7 @@ def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
         d_lib_rr = cuda.to_device(lib_rr)
         d_sumw_s0 = cuda.device_array(n_vox, dtype=np.float64)
         _bayes_kernel_free_s0[grid, _THREADS_PER_BLOCK](
-            d_M, d_lib, d_lib_rr, d_kios, d_rhos, d_Vs, inv_two_sigma2,
+            d_M, d_lib, d_lib_rr, d_kios, d_rhos, d_Vs, d_weights, inv_two_sigma2,
             *outs, d_sumw_s0)
         cuda.synchronize()
         sumw_s0 = d_sumw_s0.copy_to_host()
@@ -497,7 +503,7 @@ def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
         lib_l2 = np.sum(lib * lib, axis=1)
         d_lib_l2 = cuda.to_device(lib_l2)
         _bayes_kernel_fixed[grid, _THREADS_PER_BLOCK](
-            d_M, d_lib, d_lib_l2, d_kios, d_rhos, d_Vs, inv_two_sigma2, *outs)
+            d_M, d_lib, d_lib_l2, d_kios, d_rhos, d_Vs, d_weights, inv_two_sigma2, *outs)
         cuda.synchronize()
         sumw_s0 = None
 

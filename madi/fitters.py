@@ -115,6 +115,7 @@ def bayes_fit(
     lib_delta_pairs, lib_b_values, n_b,
     fit_triples,
     vi_min=0.5, vi_max=0.95, rho_max=None,
+    include_free_water=False,
     log_space=False, s_floor=1e-3,
     fit_s0=False, raw_signal=None,
     use_gpu=None,
@@ -136,9 +137,11 @@ def bayes_fit(
     residual (posterior-weighted mean residual), and — when ``fit_s0`` —
     s0_fit (posterior-mean fitted S₀).
     """
-    lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
+    lib_mat, kios_arr, rhos_arr, Vs_arr, quadrature_weights = _build_candidate_lib_matrix(
         library, lib_delta_pairs, lib_b_values, n_b,
-        vi_min, vi_max, rho_max, fit_triples)
+        vi_min, vi_max, rho_max, fit_triples,
+        include_free_water=include_free_water,
+        return_weights=True, require_weights=True)
 
     if sigma_m <= 0:
         raise ValueError(f"sigma_m must be > 0, got {sigma_m}")
@@ -157,7 +160,8 @@ def bayes_fit(
 
         if use_gpu:
             return fitters_gpu.bayes_fit_gpu(M, R, kios_arr, rhos_arr,
-                                              Vs_arr, sigma_m, fit_s0=True)
+                                              Vs_arr, sigma_m, fit_s0=True,
+                                              quadrature_weights=quadrature_weights)
 
         rr = np.maximum(np.sum(R * R, axis=1), 1e-30)
         mm = np.sum(M * M, axis=1)
@@ -193,7 +197,8 @@ def bayes_fit(
         if use_gpu:
             return fitters_gpu.bayes_fit_gpu(measured, lib_m, kios_arr,
                                               rhos_arr, Vs_arr, sigma_m,
-                                              fit_s0=False)
+                                              fit_s0=False,
+                                              quadrature_weights=quadrature_weights)
 
         m2 = np.sum(measured ** 2, axis=1, keepdims=True)
         l2 = np.sum(lib_m ** 2, axis=1, keepdims=True).T
@@ -212,7 +217,9 @@ def bayes_fit(
     # "nan" even though only those specific voxels were actually invalid.
     # Route those rows to an explicit zero-weight result instead (same
     # "no support" convention amico_fit already uses for degenerate voxels).
-    log_w = -weight_resid / (2.0 * sigma_m ** 2)
+    # Quadrature, not counting measure: without this factor dense regions of
+    # the grid acquire posterior mass merely by containing more atoms.
+    log_w = np.log(quadrature_weights)[None, :] - weight_resid / (2.0 * sigma_m ** 2)
     row_max = np.max(log_w, axis=1, keepdims=True)
     invalid = ~np.isfinite(row_max)
     log_w = log_w - np.where(invalid, 0.0, row_max)

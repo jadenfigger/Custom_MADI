@@ -1,571 +1,631 @@
-"""
-Contracted Voronoi cell ensemble with persistent v_i → (α*, <A/V>) lookup.
+"""Periodic contracted-Poisson-Voronoi ensembles.
 
-KEY FIXES vs. the previous version:
+This module deliberately makes geometry *measured state*, not requested
+state.  A library entry is allowed to carry a ``rho``, ``V`` or ``v_i`` label
+only after the realised Poisson tessellation has been calibrated and measured.
 
-  Bottleneck #1 — per-ensemble exact <A/V> via Qhull:
-      The previous version called HalfspaceIntersection + ConvexHull on
-      every interior cell of every ensemble, costing ~30–60 s per ensemble
-      (12 ensembles per library entry → 6–12 min/entry of pure CPU
-      overhead while the GPU sat idle).
+The production geometry is periodic.  Primary seeds live in ``[0, L)^3`` and
+the Voronoi distance uses the minimum-image convention.  This removes the
+old finite-box escape-selection bias while retaining an exactly stationary,
+uniform-in-volume initial distribution.  Phase accumulation uses unwrapped
+walker coordinates in :mod:`madi.walker_gpu`.
 
-  Bottleneck #2 — per-ensemble α* bisection against Monte-Carlo v_i:
-      Each ensemble ran 6–10 iterations of `_measure_vi`, costing another
-      ~60–180 s per library entry.
-
-  THE FIX (paper's actual approach, SI §S.II):
-      Both α*·ρ^(1/3) and <A/V>·ρ^(-1/3) are dimensionless invariants of
-      the Poisson–contracted-Voronoi process: they depend only on v_i and
-      κ, not on ρ.  We build a single 1-D lookup table
-          v_i  →  (α*·ρ^(1/3), <A/V>·ρ^(-1/3))
-      ONCE at startup (or load from disk cache), then for every actual
-      ensemble we just interpolate and rescale by the actual ρ.
-
-      The table is built by running the same exact polyhedral routine
-      that used to run per-ensemble — but now only ~25 times total,
-      not ~12 × N_library_entries times.  After the one-time build
-      (~10–20 min), `create_ensemble` becomes microseconds of arithmetic
-      plus the (chunked, fast) voxel-grid construction.
-
-      Cached to ~/.cache/madi/, keyed by κ + L + pop_margin so config
-      changes invalidate the cache automatically.
+The CUDA kernel cannot call SciPy's periodic KD-tree.  Both CPU and CUDA
+therefore use the same candidate-cache algorithm: retain ``K`` primary seeds
+at each cache-voxel centre, re-rank all ``K`` at the actual walker position,
+and classify from the closest two.  ``classify_exact_cpu`` exists only for
+Tier-A validation of that algorithm; it is not a second production engine.
 """
 
 from __future__ import annotations
 
-import os
-import sys
+from dataclasses import asdict, dataclass
+from itertools import product
+from typing import Any, Optional, Tuple
+
 import numpy as np
-from scipy.spatial import cKDTree, Voronoi, ConvexHull, HalfspaceIntersection
-from dataclasses import dataclass
-from typing import Tuple, Optional
+from scipy.spatial import ConvexHull, HalfspaceIntersection, cKDTree
 
 from .config import SimConfig
 
 
-# ===========================================================================
-# Ensemble data class  (unchanged)
-# ===========================================================================
+def _rho_um3(rho_per_uL: float) -> float:
+    """cells/µL -> cells/µm³."""
+    return float(rho_per_uL) / 1e9
+
+
+def _V_um3(V_pL: float) -> float:
+    """pL -> µm³."""
+    return float(V_pL) * 1e3
+
+
+def _rho_per_uL(rho_um3: float) -> float:
+    return float(rho_um3) * 1e9
+
+
+def _V_pL(V_um3: float) -> float:
+    return float(V_um3) / 1e3
+
+
+def _minimum_image(delta: np.ndarray, L: float) -> np.ndarray:
+    """Return the nearest periodic image displacement in ``[-L/2, L/2)``."""
+    return delta - L * np.floor(delta / L + 0.5)
+
+
+def _nearest_image(seed: np.ndarray, point: np.ndarray, L: float) -> np.ndarray:
+    """Image of ``seed`` nearest to ``point`` (vectorised in the last axis)."""
+    return seed + L * np.floor((point - seed) / L + 0.5)
+
+
+@dataclass(frozen=True)
+class GeometryStats:
+    """Direct measurements associated with one realised Poisson ensemble."""
+
+    vi: float
+    vi_se: float
+    rho_per_uL: float
+    mean_volume_um3: float
+    mean_volume_pL: float
+    sampled_mean_volume_um3: float
+    sampled_mean_volume_se_um3: float
+    mean_area_um2: float
+    mean_area_se_um2: float
+    mean_A_over_V_um_inv: float
+    mean_A_over_V_se_um_inv: float
+    alpha_star_um: float
+    annulus_mean_um: float
+    annulus_std_um: float
+    annulus_min_um: float
+    annulus_max_um: float
+    annulus_q05_um: float
+    annulus_q50_um: float
+    annulus_q95_um: float
+    n_primary_cells: int
+    n_geometry_cells: int
+    n_vi_validation_points: int
+
+    def to_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
 
 @dataclass
 class Ensemble:
-    seeds:        np.ndarray       # (n_cells, 3) float64  [μm]   ALL seeds in Ω_pop
-    annulus:      np.ndarray       # (n_cells,)   float64  [μm]
-    grid_s1:      np.ndarray       # (G, G, G) int32  — nearest seed index
-    grid_s2:      np.ndarray       # (G, G, G) int32  — 2nd nearest seed
-    rho:          float
-    V:            float
-    vi:           float            # REALISED v_i
-    alpha_star:   float
-    L:            float
-    mean_AV:      float            # ⟨A/V⟩ from lookup table [μm⁻¹]
+    """One periodic contracted-Voronoi realisation.
+
+    ``rho`` and ``V`` are realised labels, not the requested coordinates.
+    ``rho_requested`` and ``V_requested`` remain in provenance so a failed
+    geometry calibration cannot silently masquerade as a valid grid point.
+    """
+
+    seeds: np.ndarray                 # (n_primary, 3), in [0,L), float64
+    annulus: np.ndarray               # (n_primary,), µm
+    grid_candidates: np.ndarray       # (G,G,G,K), primary indices or -1
+    rho: float                        # realised cells/µL
+    V: float                          # realised mean cell volume, pL
+    vi: float                         # direct-MC realised volume fraction
+    alpha_star: float
+    L: float
+    mean_AV: float                    # untrimmed sample mean A_i/V_i, µm^-1
     grid_spacing: float
+    classifier_candidates: int
+    geometry: GeometryStats
+    rho_requested: float
+    V_requested: float
+    periodic_tree: Optional[Any] = None
+    is_free_water: bool = False
+
+    @property
+    def grid_s1(self) -> np.ndarray:
+        """Compatibility view of the first cached candidate."""
+        return self.grid_candidates[..., 0]
+
+    @property
+    def grid_s2(self) -> np.ndarray:
+        """Compatibility view of the second cached candidate."""
+        return self.grid_candidates[..., 1]
 
     def classify_cpu(self, positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """CPU compartment classification (validation only)."""
-        gi = np.floor(positions / self.grid_spacing).astype(np.int32)
-        G = self.grid_s1.shape[0]
-        gi = np.clip(gi, 0, G - 1)
-        s1 = self.grid_s1[gi[:, 0], gi[:, 1], gi[:, 2]]
-        s2 = self.grid_s2[gi[:, 0], gi[:, 1], gi[:, 2]]
+        """Production candidate-cache classifier used by the CPU walk.
 
-        s1_pos = self.seeds[s1]
-        s2_pos = self.seeds[s2]
-        mid = 0.5 * (s1_pos + s2_pos)
-        diff = s2_pos - s1_pos
-        nrm = np.linalg.norm(diff, axis=1, keepdims=True)
-        nrm = np.maximum(nrm, 1e-30)
-        normal = diff / nrm
-        signed = np.einsum("ij,ij->i", positions - mid, normal)
-        dist = np.abs(signed)
-        inside = dist >= self.annulus[s1]
+        It intentionally mirrors the CUDA classifier: candidates are obtained
+        from the voxel containing the *wrapped* position and are re-ranked at
+        the actual position using periodic images of their primary seeds.
+        """
+        pts = np.asarray(positions, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError("positions must have shape (N, 3)")
+        if self.is_free_water:
+            return np.zeros(len(pts), dtype=np.int32), np.zeros(len(pts), dtype=bool)
+
+        wrapped = np.mod(pts, self.L)
+        gi = np.floor(wrapped / self.grid_spacing).astype(np.int64)
+        G = self.grid_candidates.shape[0]
+        gi = np.clip(gi, 0, G - 1)
+        candidates = self.grid_candidates[gi[:, 0], gi[:, 1], gi[:, 2]]
+        return _classify_candidate_rows(
+            wrapped, candidates, self.seeds, self.annulus, self.L
+        )
+
+    def classify_exact_cpu(self, positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Exact periodic KD-tree classification for validation only."""
+        pts = np.asarray(positions, dtype=np.float64)
+        if self.is_free_water:
+            return np.zeros(len(pts), dtype=np.int32), np.zeros(len(pts), dtype=bool)
+        if self.periodic_tree is None:
+            self.periodic_tree = cKDTree(self.seeds, boxsize=self.L)
+        wrapped = np.mod(pts, self.L)
+        _, idx = self.periodic_tree.query(wrapped, k=2)
+        if idx.ndim == 1:
+            idx = idx[:, None]
+        s1 = idx[:, 0].astype(np.int32)
+        s2 = idx[:, 1].astype(np.int32)
+        im1 = _nearest_image(self.seeds[s1], wrapped, self.L)
+        im2 = _nearest_image(self.seeds[s2], wrapped, self.L)
+        diff = im2 - im1
+        norm = np.maximum(np.linalg.norm(diff, axis=1), 1e-30)
+        midpoint = 0.5 * (im1 + im2)
+        signed = np.einsum("ij,ij->i", wrapped - midpoint, diff / norm[:, None])
+        inside = np.abs(signed) >= self.annulus[s1]
         return s1, inside
 
 
-# ===========================================================================
-# Unit helpers
-# ===========================================================================
-
-def _rho_um3(rho_per_uL: float) -> float:
-    return rho_per_uL / 1e9
-
-def _V_um3(V_pL: float) -> float:
-    return V_pL * 1e3
-
-
-# ===========================================================================
-# Monte Carlo v_i measurement  (used only inside the table builder)
-# ===========================================================================
-
-def _measure_vi(seeds, annulus, tree, L, n=200_000, rng=None):
-    """Fraction of uniformly random points in Ω_sim = [0, L]³ that lie
-    inside any cell."""
-    if rng is None:
-        rng = np.random.default_rng(0)
-    pts = rng.uniform(0.0, L, (n, 3))
-    _, idxs = tree.query(pts, k=2)
-    s1, s2 = idxs[:, 0], idxs[:, 1]
-    mid = 0.5 * (seeds[s1] + seeds[s2])
-    diff = seeds[s2] - seeds[s1]
-    nrm = np.maximum(np.linalg.norm(diff, axis=1), 1e-30)
-    normal = diff / nrm[:, None]
-    d_plane = np.einsum("ij,ij->i", pts - mid, normal)
-    inside = np.abs(d_plane) >= annulus[s1]
-    return float(inside.mean())
-
-
-# ===========================================================================
-# Exact ⟨A/V⟩ via polyhedral geometry  (used only by the table builder now)
-# ===========================================================================
-
-def compute_mean_AV_exact(
+def _classify_candidate_rows(
+    points: np.ndarray,
+    candidates: np.ndarray,
     seeds: np.ndarray,
     annulus: np.ndarray,
     L: float,
-    verbose: bool = False,
-) -> Optional[float]:
-    """Compute ⟨A/V⟩ = mean over interior cells of A_i/V_i, exactly.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Numpy reference for the candidate-cache classifier.
 
-    Used to populate the lookup table.  See module docstring for why this
-    is no longer called per-ensemble.
+    This is the source-level algorithm translated line-for-line into the
+    CUDA kernel.  It is deliberately separate from ``classify_exact_cpu`` so
+    Tier-A tests can bound cache error against the exact KD-tree.
     """
-    in_sim = np.all((seeds >= 0.0) & (seeds < L), axis=1)
-    interior_indices = np.where(in_sim)[0]
-    if len(interior_indices) < 10:
-        return None
-
-    try:
-        vor = Voronoi(seeds)
-    except Exception as e:
-        if verbose:
-            print(f"    Voronoi failed: {e}")
-        return None
-
-    neighbours: dict = {}
-    for (i, j) in vor.ridge_points:
-        neighbours.setdefault(int(i), set()).add(int(j))
-        neighbours.setdefault(int(j), set()).add(int(i))
-
-    AV_values = []
-    n_deg = n_hsi_fail = n_hull_fail = 0
-
-    for i in interior_indices:
-        a_i = float(annulus[i])
-        if a_i <= 0:
-            continue
-        nbrs = neighbours.get(int(i), None)
-        if not nbrs or len(nbrs) < 4:
-            continue
-
-        s_i = seeds[i]
-        halfspaces = []
-        degenerate = False
-
-        for j in nbrs:
-            d_vec = seeds[j] - s_i
-            d_mag = float(np.linalg.norm(d_vec))
-            if d_mag < 1e-10:
-                continue
-            n_ij = d_vec / d_mag
-            offset = d_mag / 2.0 - a_i
-            if offset <= 1e-6:
-                degenerate = True
-                break
-            b = -(offset + float(np.dot(n_ij, s_i)))
-            halfspaces.append(np.concatenate([n_ij, [b]]))
-
-        if degenerate:
-            n_deg += 1
-            continue
-        if len(halfspaces) < 4:
-            continue
-
-        halfspaces = np.asarray(halfspaces, dtype=np.float64)
-
-        try:
-            hsi = HalfspaceIntersection(halfspaces, s_i, qhull_options="QJ")
-            verts = hsi.intersections
-        except Exception:
-            n_hsi_fail += 1
-            continue
-
-        if verts.shape[0] < 4 or not np.all(np.isfinite(verts)):
-            n_hsi_fail += 1
-            continue
-
-        try:
-            hull = ConvexHull(verts, qhull_options="QJ")
-        except Exception:
-            n_hull_fail += 1
-            continue
-
-        V_i = float(hull.volume)
-        A_i = float(hull.area)
-        if V_i > 1e-9 and A_i > 1e-9:
-            AV_values.append(A_i / V_i)
-
-    if verbose:
-        n_tried = len(interior_indices)
-        print(f"      [exact A/V] {len(AV_values)}/{n_tried} cells succeeded "
-              f"(deg={n_deg}, hsi_fail={n_hsi_fail}, hull_fail={n_hull_fail})")
-
-    if len(AV_values) < 10:
-        return None
-
-    arr = np.asarray(AV_values)
-    lo, hi = np.percentile(arr, [5, 95])
-    core = arr[(arr >= lo) & (arr <= hi)]
-    return float(core.mean())
+    if candidates.ndim != 2 or candidates.shape[1] < 2:
+        raise ValueError("candidate cache must provide at least two seeds")
+    n, k = candidates.shape
+    valid = candidates >= 0
+    safe = np.where(valid, candidates, 0)
+    seed_rows = seeds[safe]                             # (N,K,3)
+    images = _nearest_image(seed_rows, points[:, None, :], L)
+    d2 = np.sum((points[:, None, :] - images) ** 2, axis=2)
+    d2[~valid] = np.inf
+    order = np.argsort(d2, axis=1, kind="stable")
+    first = order[:, 0]
+    second = order[:, 1]
+    rows = np.arange(n)
+    s1 = safe[rows, first].astype(np.int32)
+    s2 = safe[rows, second].astype(np.int32)
+    im1 = images[rows, first]
+    im2 = images[rows, second]
+    diff = im2 - im1
+    norm = np.maximum(np.linalg.norm(diff, axis=1), 1e-30)
+    midpoint = 0.5 * (im1 + im2)
+    signed = np.einsum("ij,ij->i", points - midpoint, diff / norm[:, None])
+    return s1, np.abs(signed) >= annulus[s1]
 
 
-# ===========================================================================
-#                  v_i  →  (α*, <A/V>)   LOOKUP TABLE
-# ===========================================================================
-
-# Bump this if the table-build procedure changes in a way that invalidates
-# previously cached tables.  Cached tables with mismatched version are
-# silently rebuilt.
-_TABLE_VERSION = 2
-
-# Process-wide in-memory cache
-_LOOKUP_TABLE: Optional[dict] = None
-
-
-def _lookup_table_path(cfg: SimConfig) -> str:
-    """Cache file path keyed by the cfg parameters that affect the table."""
-    cache_dir = os.environ.get(
-        "MADI_CACHE_DIR",
-        os.path.expanduser("~/.cache/madi"),
-    )
-    os.makedirs(cache_dir, exist_ok=True)
-    fname = (f"av_table_v{_TABLE_VERSION}"
-             f"_kappa{cfg.kappa:.3f}"
-             f"_L{int(cfg.L)}"
-             f"_margin{int(cfg.pop_margin)}.npz")
-    return os.path.join(cache_dir, fname)
+def _nearest_face_data(
+    tree: cKDTree, seeds: np.ndarray, points: np.ndarray, L: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return nearest primary label and its distance to the nearest face."""
+    wrapped = np.mod(np.asarray(points, dtype=np.float64), L)
+    _, idx = tree.query(wrapped, k=2)
+    if idx.ndim == 1:
+        idx = idx[:, None]
+    s1 = idx[:, 0].astype(np.int32)
+    s2 = idx[:, 1].astype(np.int32)
+    im1 = _nearest_image(seeds[s1], wrapped, L)
+    im2 = _nearest_image(seeds[s2], wrapped, L)
+    diff = im2 - im1
+    norm = np.maximum(np.linalg.norm(diff, axis=1), 1e-30)
+    midpoint = 0.5 * (im1 + im2)
+    signed = np.einsum("ij,ij->i", wrapped - midpoint, diff / norm[:, None])
+    return s1, np.abs(signed)
 
 
-def build_lookup_table(
+def _measure_vi(
+    seeds: np.ndarray,
+    annulus: np.ndarray,
+    tree: cKDTree,
+    L: float,
+    n: int = 200_000,
+    rng: Optional[np.random.Generator] = None,
+) -> float:
+    """Direct uniform-volume measurement of periodic intracellular fraction."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    pts = rng.uniform(0.0, L, size=(int(n), 3))
+    s1, face_dist = _nearest_face_data(tree, seeds, pts, L)
+    return float(np.mean(face_dist >= annulus[s1]))
+
+
+def _solve_alpha_for_vi(
+    target_vi: float,
+    face_labels: np.ndarray,
+    face_distances: np.ndarray,
+    annulus_caps: np.ndarray,
     cfg: SimConfig,
-    n_points: int = 25,
-    ref_rho: float = 400_000.0,
-    save_path: Optional[str] = None,
-    verbose: bool = True,
-) -> dict:
-    """Build the v_i → (α*, ⟨A/V⟩) lookup table from scratch.
+) -> float:
+    """Calibrate α* on this *specific* Poisson realisation.
 
-    Strategy
-    --------
-    1. Sample one large Poisson seed cloud at `ref_rho` in Ω_pop.
-    2. Scan `n_points` α* values from a small fraction of α_cap to α_cap.
-    3. For each α*, build the per-cell annuli (with the κ cap), measure
-       v_i with `_measure_vi`, and measure ⟨A/V⟩ with the exact polyhedral
-       routine `compute_mean_AV_exact`.
-    4. Convert α* and ⟨A/V⟩ to dimensionless invariants
-            α_norm  = α* · ρ^(1/3)
-            AV_norm = ⟨A/V⟩ / ρ^(1/3)
-       which are functions of v_i alone (paper SI §S.II).
-    5. Sort by v_i ascending and return as a dict.
-
-    Cost: ~10–20 min for n_points=25 at moderate L.  ONE-TIME.
+    The random probe points and their exact nearest faces are fixed before
+    bisection.  Consequently the objective is monotone, reproducible and
+    cheap: each iteration is only a vector comparison, not another KD query.
     """
-    if verbose:
-        print(f"  [MADI lookup table] building from scratch")
-        print(f"    n_points = {n_points}")
-        print(f"    ref ρ    = {ref_rho:.0f} cells/μL")
-        print(f"    L        = {cfg.L:.0f} μm")
-        print(f"    κ        = {cfg.kappa:.3f}")
+    if not (0.0 < target_vi < 1.0):
+        raise ValueError(f"target v_i must lie in (0, 1), got {target_vi}")
+    caps_at_points = annulus_caps[face_labels]
 
-    rho_um3_ref   = _rho_um3(ref_rho)
-    rho_third_ref = rho_um3_ref ** (1.0 / 3.0)
-    L      = cfg.L
-    margin = cfg.pop_margin
-    L_pop  = L + 2.0 * margin
+    def volume_fraction(alpha: float) -> float:
+        return float(np.mean(face_distances >= np.minimum(alpha, caps_at_points)))
 
-    # ---- Single large Poisson realisation ---------------------------------
-    rng = np.random.default_rng(20240101)   # fixed seed for reproducibility
-    n_cells = max(rng.poisson(rho_um3_ref * L_pop**3), 16)
-    seeds = rng.uniform(-margin, L + margin, (n_cells, 3)).astype(np.float64)
-    tree = cKDTree(seeds)
-    nn_dist = tree.query(seeds, k=2)[0][:, 1]
-
-    if verbose:
-        print(f"    seeds in Ω_pop: {n_cells}")
-
-    # ---- α* scan range ----------------------------------------------------
-    alpha_cap_max = float(np.max(cfg.kappa * nn_dist / 2.0))
-    # Skip the degenerate α=0 (v_i≈1) endpoint and run up to the cap.
-    # Geometric spacing concentrates points where the κ cap starts to bite
-    # (i.e. low v_i), where the curve is steepest.
-    alphas = np.geomspace(alpha_cap_max * 0.05, alpha_cap_max, n_points)
-
-    vi_list:        list = []
-    alpha_norm_list: list = []
-    AV_norm_list:    list = []
-
-    import time
-    t_total = time.time()
-    for k, a in enumerate(alphas):
-        t0 = time.time()
-        annulus = np.minimum(a, cfg.kappa * nn_dist / 2.0)
-
-        vi = _measure_vi(seeds, annulus, tree, L, n=200_000, rng=rng)
-        AV = compute_mean_AV_exact(seeds, annulus, L, verbose=False)
-
-        if AV is None or vi <= 0 or vi >= 1:
-            if verbose:
-                print(f"    [{k+1:2d}/{n_points}] α*={a:6.3f}μm  SKIPPED "
-                      f"(vi={vi:.3f}, AV={AV})")
-            continue
-
-        vi_list.append(vi)
-        alpha_norm_list.append(a * rho_third_ref)
-        AV_norm_list.append(AV / rho_third_ref)
-
-        if verbose:
-            print(f"    [{k+1:2d}/{n_points}] α*={a:6.3f}μm  v_i={vi:.3f}  "
-                  f"<A/V>={AV:.4f}μm⁻¹   ({time.time()-t0:.1f}s)")
-
-    if verbose:
-        print(f"  [MADI lookup table] built in {time.time()-t_total:.0f}s")
-
-    if len(vi_list) < 5:
+    lo = 0.0
+    hi = float(np.max(annulus_caps))
+    vi_lo = volume_fraction(lo)
+    vi_hi = volume_fraction(hi)
+    if target_vi > vi_lo + cfg.geometry_vi_tolerance:
         raise RuntimeError(
-            f"Lookup-table build failed: only {len(vi_list)} valid points. "
-            f"Check κ and ensemble geometry.")
+            f"target v_i={target_vi:.5f} exceeds alpha=0 realised value {vi_lo:.5f}"
+        )
+    if target_vi < vi_hi - cfg.geometry_vi_tolerance:
+        raise RuntimeError(
+            "target v_i cannot be realised by this contracted tessellation: "
+            f"minimum sampled v_i={vi_hi:.5f}, requested={target_vi:.5f}."
+        )
 
-    vi_arr = np.array(vi_list, dtype=np.float64)
-    order  = np.argsort(vi_arr)
-
-    table = {
-        "version":    np.int32(_TABLE_VERSION),
-        "kappa":      np.float64(cfg.kappa),
-        "L":          np.float64(L),
-        "pop_margin": np.float64(margin),
-        "ref_rho":    np.float64(ref_rho),
-        "vi":         vi_arr[order],
-        "alpha_norm": np.array(alpha_norm_list, dtype=np.float64)[order],
-        "AV_norm":    np.array(AV_norm_list,    dtype=np.float64)[order],
-    }
-
-    if save_path:
-        np.savez(save_path, **table)
-        if verbose:
-            print(f"  [MADI lookup table] saved → {save_path}")
-
-    return table
+    for _ in range(int(cfg.geometry_alpha_iterations)):
+        mid = 0.5 * (lo + hi)
+        if volume_fraction(mid) > target_vi:
+            lo = mid
+        else:
+            hi = mid
+    return float(0.5 * (lo + hi))
 
 
-def _table_is_compatible(table: dict, cfg: SimConfig) -> bool:
+def _periodic_nearest_neighbour_distances(tree: cKDTree, seeds: np.ndarray) -> np.ndarray:
+    """Nearest different-primary distance for every primary seed."""
+    _, idx = tree.query(seeds, k=2)
+    if idx.ndim == 1:
+        raise RuntimeError("periodic tessellation needs at least two seeds")
+    second = idx[:, 1]
+    return np.linalg.norm(_minimum_image(seeds[second] - seeds, tree.boxsize[0]), axis=1)
+
+
+def _cell_polyhedron(
+    seed_index: int,
+    seeds: np.ndarray,
+    annulus: np.ndarray,
+    tree: cKDTree,
+    L: float,
+    neighbour_count: int = 64,
+) -> Optional[Tuple[float, float]]:
+    """Exact volume and area of one contracted periodic Voronoi cell.
+
+    A bounded local neighbour set plus the 26 periodic images of the cell
+    itself supplies all halfspaces.  The function returns ``None`` on a
+    numerical Qhull failure rather than substituting a trimmed/analytic
+    proxy; callers enforce a high successful-cell fraction.
+    """
+    n_cells = len(seeds)
+    if n_cells < 2:
+        return None
+    si = seeds[seed_index]
+    k = min(max(neighbour_count, 2), n_cells)
+    _, idx = tree.query(si, k=k)
+    idx = np.atleast_1d(idx)
+    halfspaces: list[np.ndarray] = []
+
+    def add_plane(neighbour: np.ndarray) -> bool:
+        dvec = neighbour - si
+        dmag = float(np.linalg.norm(dvec))
+        if dmag < 1e-12:
+            return True
+        offset = dmag / 2.0 - float(annulus[seed_index])
+        if offset <= 1e-9:
+            return False
+        normal = dvec / dmag
+        halfspaces.append(np.r_[normal, -(offset + float(normal @ si))])
+        return True
+
+    for j in idx:
+        j = int(j)
+        if j == seed_index:
+            continue
+        dvec = _minimum_image(seeds[j] - si, L)
+        if not add_plane(si + dvec):
+            return None
+
+    # A primary seed's own periodic images can bound a sparse low-density
+    # realisation.  They are harmless redundant halfspaces in dense cases.
+    for offset in product((-1, 0, 1), repeat=3):
+        if offset == (0, 0, 0):
+            continue
+        if not add_plane(si + L * np.asarray(offset, dtype=np.float64)):
+            return None
+
+    if len(halfspaces) < 4:
+        return None
     try:
-        return (int(table["version"])      == _TABLE_VERSION
-            and float(table["kappa"])      == float(cfg.kappa)
-            and float(table["L"])          == float(cfg.L)
-            and float(table["pop_margin"]) == float(cfg.pop_margin))
-    except (KeyError, TypeError, ValueError):
-        return False
+        hs = np.asarray(halfspaces, dtype=np.float64)
+        hsi = HalfspaceIntersection(hs, si, qhull_options="QJ")
+        vertices = hsi.intersections
+        if vertices.shape[0] < 4 or not np.all(np.isfinite(vertices)):
+            return None
+        hull = ConvexHull(vertices, qhull_options="QJ")
+        if hull.volume <= 0.0 or hull.area <= 0.0:
+            return None
+        return float(hull.volume), float(hull.area)
+    except Exception:
+        return None
 
 
-def _load_or_build_lookup_table(cfg: SimConfig, verbose: bool = True) -> dict:
-    """Get the lookup table, loading from disk cache or building if absent.
+def _sample_geometry_stats(
+    seeds: np.ndarray,
+    annulus: np.ndarray,
+    tree: cKDTree,
+    L: float,
+    vi: float,
+    vi_se: float,
+    alpha_star: float,
+    cfg: SimConfig,
+    rng: np.random.Generator,
+) -> GeometryStats:
+    n_cells = len(seeds)
+    n_sample = min(int(cfg.geometry_sample_cells), n_cells)
+    sample_idx = rng.choice(n_cells, size=n_sample, replace=False)
+    volumes: list[float] = []
+    areas: list[float] = []
+    for i in sample_idx:
+        item = _cell_polyhedron(int(i), seeds, annulus, tree, L)
+        if item is not None:
+            vol, area = item
+            volumes.append(vol)
+            areas.append(area)
 
-    The disk cache is keyed by (κ, L, pop_margin) — config changes that
-    affect the geometry automatically invalidate cached tables.
-    """
-    global _LOOKUP_TABLE
+    # A numerical failure is never silently hidden by a partial/trimmed mean.
+    # A sparse but valid Poisson realisation can legitimately contain fewer
+    # than eight primary cells (for example, a local Tier-A diagnostic).  Do
+    # not make that configuration mathematically impossible by demanding a
+    # fixed absolute sample count greater than ``n_sample``; production
+    # builds use hundreds or more cells and still require at least 90% of the
+    # selected cells to yield an exact polyhedron.
+    required = min(n_sample, max(2, int(np.ceil(0.90 * n_sample))))
+    if len(volumes) < required:
+        raise RuntimeError(
+            "Could not measure enough exact contracted-cell polyhedra: "
+            f"{len(volumes)}/{n_sample} succeeded (need {required})."
+        )
+    vol = np.asarray(volumes, dtype=np.float64)
+    area = np.asarray(areas, dtype=np.float64)
+    av = area / vol
+    n_ok = len(vol)
+    sem = lambda x: float(np.std(x, ddof=1) / np.sqrt(len(x))) if len(x) > 1 else 0.0
 
-    # In-memory cache hit
-    if _LOOKUP_TABLE is not None and _table_is_compatible(_LOOKUP_TABLE, cfg):
-        return _LOOKUP_TABLE
-
-    path = _lookup_table_path(cfg)
-
-    # Disk cache hit
-    if os.path.exists(path):
-        try:
-            data = np.load(path, allow_pickle=False)
-            table = {k: data[k] for k in data.files}
-            if _table_is_compatible(table, cfg):
-                _LOOKUP_TABLE = table
-                if verbose:
-                    print(f"  [MADI lookup table] loaded from cache: {path}")
-                return table
-            else:
-                if verbose:
-                    print(f"  [MADI lookup table] cache at {path} is "
-                          f"incompatible with current cfg, rebuilding")
-        except Exception as e:
-            if verbose:
-                print(f"  [MADI lookup table] cache load failed ({e}), "
-                      f"rebuilding")
-
-    # Cache miss → build
-    if verbose:
-        print(f"  [MADI lookup table] no cached table at {path}")
-        print(f"  [MADI lookup table] building once "
-              f"(this takes ~10–20 min, after which all ensembles are fast)")
-    table = build_lookup_table(cfg, save_path=path, verbose=verbose)
-    _LOOKUP_TABLE = table
-    return table
-
-
-def alpha_and_AV_from_vi(
-    vi_target: float,
-    rho: float,
-    table: dict,
-) -> Tuple[float, float]:
-    """Look up (α*, ⟨A/V⟩) for a target v_i and density ρ.
-
-    Linear interpolation in v_i, then rescale by ρ^(±1/3) using the
-    dimensionless invariance of the Poisson–contracted-Voronoi process
-    (paper SI §S.II).
-    """
-    rho_um3   = _rho_um3(rho)
-    rho_third = rho_um3 ** (1.0 / 3.0)
-
-    vi_grid = np.asarray(table["vi"])
-    if vi_target < vi_grid.min() or vi_target > vi_grid.max():
-        sys.stderr.write(
-            f"    ⚠ v_i target {vi_target:.3f} outside lookup table range "
-            f"[{vi_grid.min():.3f}, {vi_grid.max():.3f}]; clamping.\n")
-    vi_clamped = float(np.clip(vi_target, vi_grid.min(), vi_grid.max()))
-
-    alpha_norm = float(np.interp(vi_clamped, vi_grid, table["alpha_norm"]))
-    AV_norm    = float(np.interp(vi_clamped, vi_grid, table["AV_norm"]))
-
-    alpha_star = alpha_norm / rho_third
-    mean_AV    = AV_norm    * rho_third
-    return alpha_star, mean_AV
+    # The mean volume over *all* primary cells is total intracellular volume
+    # divided by the realised primary count.  The direct v_i measurement is
+    # therefore the authoritative, untrimmed V label; sampled exact cells are
+    # retained independently as a geometric cross-check.
+    rho_real = _rho_per_uL(n_cells / L**3)
+    mean_volume = vi * L**3 / n_cells
+    qs = np.quantile(annulus, [0.05, 0.50, 0.95])
+    return GeometryStats(
+        vi=float(vi),
+        vi_se=float(vi_se),
+        rho_per_uL=float(rho_real),
+        mean_volume_um3=float(mean_volume),
+        mean_volume_pL=_V_pL(mean_volume),
+        sampled_mean_volume_um3=float(np.mean(vol)),
+        sampled_mean_volume_se_um3=sem(vol),
+        mean_area_um2=float(np.mean(area)),
+        mean_area_se_um2=sem(area),
+        mean_A_over_V_um_inv=float(np.mean(av)),
+        mean_A_over_V_se_um_inv=sem(av),
+        alpha_star_um=float(alpha_star),
+        annulus_mean_um=float(np.mean(annulus)),
+        annulus_std_um=float(np.std(annulus, ddof=1)) if len(annulus) > 1 else 0.0,
+        annulus_min_um=float(np.min(annulus)),
+        annulus_max_um=float(np.max(annulus)),
+        annulus_q05_um=float(qs[0]),
+        annulus_q50_um=float(qs[1]),
+        annulus_q95_um=float(qs[2]),
+        n_primary_cells=int(n_cells),
+        n_geometry_cells=int(n_ok),
+        n_vi_validation_points=int(cfg.geometry_validation_points),
+    )
 
 
-# ===========================================================================
-# Ensemble creation  (now uses the lookup table)
-# ===========================================================================
+def _build_candidate_cache(
+    tree: cKDTree,
+    L: float,
+    cfg: SimConfig,
+) -> np.ndarray:
+    """Build periodic K-candidate cache, padded with -1 where necessary."""
+    G = cfg.grid_size
+    K = int(cfg.classifier_candidates)
+    if K < 2:
+        raise ValueError("classifier_candidates must be at least two")
+    out = np.full((G, G, G, K), -1, dtype=np.int32)
+    coords = (np.arange(G, dtype=np.float64) + 0.5) * cfg.grid_spacing
+    coords = np.minimum(coords, np.nextafter(L, 0.0))
+    yy, zz = np.meshgrid(coords, coords, indexing="ij")
+    yz = np.column_stack((yy.ravel(), zz.ravel()))
+    query_k = min(K, tree.n)
+    for ix, x in enumerate(coords):
+        slab = np.column_stack((np.full(G * G, x), yz))
+        _, idx = tree.query(slab, k=query_k)
+        idx = np.asarray(idx)
+        if query_k == 1:
+            idx = idx[:, None]
+        out[ix, :, :, :query_k] = idx.reshape(G, G, query_k).astype(np.int32)
+    return out
+
 
 def create_ensemble(
-    rho: float, V: float,
+    rho: float,
+    V: float,
     cfg: SimConfig | None = None,
     seed: int | None = None,
     verbose: bool = False,
-    verify_vi: bool = False,
+    verify_vi: bool = True,
 ) -> Ensemble:
-    """Build a contracted Voronoi ensemble using the v_i → (α*, ⟨A/V⟩)
-    lookup table.
+    """Create and directly measure a periodic contracted-Poisson ensemble.
 
-    Parameters
-    ----------
-    rho, V : target cell density [cells/μL] and mean cell volume [pL].
-    cfg    : SimConfig (uses defaults if None).
-    seed   : RNG seed for the Poisson realisation.
-    verbose: print per-ensemble diagnostics.
-    verify_vi : if True, run a single Monte-Carlo v_i measurement on the
-        realised ensemble for diagnostics.  Costs ~0.5 s; off by default
-        because the lookup-table value is already accurate to ~0.5%.
-
-    Notes
-    -----
-    On the first call (per process and per cfg geometry), the lookup
-    table is built or loaded.  This is the only slow step; subsequent
-    calls are O(1) plus the voxel-grid construction.
+    ``rho`` and ``V`` are requested grid coordinates.  They set
+    ``v_i,target = rho * V * 1e-6``.  The returned object's public labels
+    are the realised density, directly measured volume fraction and the
+    implied realised mean cell volume.  A geometry that misses the target by
+    more than ``geometry_vi_tolerance`` raises instead of clamping.
     """
     if cfg is None:
         cfg = SimConfig()
+    cfg.assert_grid_alignment()
+    if cfg.boundary_mode != "periodic":
+        raise ValueError(
+            "create_ensemble is a periodic production constructor. "
+            "absorbing_legacy is available only as a walker diagnostic."
+        )
+    rho_um3 = _rho_um3(rho)
+    V_um3 = _V_um3(V)
+    target_vi = rho_um3 * V_um3
+    if not (0.0 < target_vi < 1.0):
+        raise ValueError(f"rho={rho:g}, V={V:g} give invalid v_i={target_vi:g}")
+    if target_vi > 0.99 + 1e-12:
+        raise ValueError(f"v_i={target_vi:.6f} exceeds the supported 0.99 ceiling")
+    if rho_um3 <= 0.0:
+        raise ValueError("rho must be positive for a cellular ensemble")
+
     rng = np.random.default_rng(seed)
+    L = float(cfg.L)
+    n_expected = rho_um3 * L**3
+    n_cells = int(rng.poisson(n_expected))
+    if n_cells < 2:
+        raise RuntimeError(
+            f"Poisson realisation has {n_cells} cells (expected {n_expected:.3g}); "
+            "increase L or rho rather than altering the requested density."
+        )
+    seeds = rng.uniform(0.0, L, size=(n_cells, 3)).astype(np.float64)
+    tree = cKDTree(seeds, boxsize=L)
+    nn_dist = _periodic_nearest_neighbour_distances(tree, seeds)
+    annulus_caps = cfg.kappa * nn_dist / 2.0
 
-    rho_um3   = _rho_um3(rho)
-    V_um3     = _V_um3(V)
-    vi_target = rho_um3 * V_um3
-    if vi_target > 0.95:
-        raise ValueError(f"vi = {vi_target:.3f} > 0.95")
+    # Calibrate α* using exact KD-tree labels on fixed probe points.
+    cal_points = rng.uniform(0.0, L, size=(int(cfg.geometry_calibration_points), 3))
+    cal_label, cal_face = _nearest_face_data(tree, seeds, cal_points, L)
+    alpha_star = _solve_alpha_for_vi(target_vi, cal_label, cal_face, annulus_caps, cfg)
+    annulus = np.minimum(alpha_star, annulus_caps).astype(np.float64)
 
-    L      = cfg.L
-    margin = cfg.pop_margin
-    L_pop  = L + 2.0 * margin
+    # Independent direct-volume validation avoids declaring success merely
+    # because the same probe sample was used by the bisection.
+    val_points = rng.uniform(0.0, L, size=(int(cfg.geometry_validation_points), 3))
+    val_label, val_face = _nearest_face_data(tree, seeds, val_points, L)
+    realised_vi = float(np.mean(val_face >= annulus[val_label]))
+    vi_se = float(np.sqrt(max(realised_vi * (1.0 - realised_vi), 0.0) /
+                          max(len(val_points), 1)))
+    allowed = max(float(cfg.geometry_vi_tolerance), 4.0 * vi_se)
+    if abs(realised_vi - target_vi) > allowed:
+        raise RuntimeError(
+            "Realised v_i failed geometry acceptance: "
+            f"target={target_vi:.6f}, measured={realised_vi:.6f}, "
+            f"allowed={allowed:.6f}."
+        )
 
-    # ---- 1.  Get α* and ⟨A/V⟩ from the lookup table  --------------------
-    table = _load_or_build_lookup_table(cfg, verbose=verbose)
-    alpha_star, mean_AV_val = alpha_and_AV_from_vi(vi_target, rho, table)
-
-    if verbose:
-        print(f"    [lookup] vi_target={vi_target:.3f}  "
-              f"α*={alpha_star:.3f}μm  <A/V>={mean_AV_val:.4f}μm⁻¹")
-
-    # ---- 2.  Sample Poisson seeds in Ω_pop  -----------------------------
-    n_cells = max(rng.poisson(rho_um3 * L_pop**3), 16)
-    seeds = rng.uniform(-margin, L + margin, (n_cells, 3)).astype(np.float64)
-    tree  = cKDTree(seeds)
-    nn_dist = tree.query(seeds, k=2)[0][:, 1]
-
-    # ---- 3.  Per-cell annulus widths (κ cap still applies per realisation)
-    annulus = np.minimum(alpha_star, cfg.kappa * nn_dist / 2.0).astype(np.float64)
-
-    # Optional realised-v_i diagnostic
-    if verify_vi:
-        realised_vi = _measure_vi(seeds, annulus, tree, L, n=80_000, rng=rng)
-        if verbose:
-            drift = realised_vi - vi_target
-            print(f"    realised v_i = {realised_vi:.3f}  "
-                  f"(target {vi_target:.3f}, drift {drift:+.3f})")
-    else:
-        realised_vi = vi_target
-
-    # ---- 4.  Voxel lookup grid (chunked over the slowest axis) ----------
-    G  = cfg.grid_size
-    gs = cfg.grid_spacing
-    if verbose:
-        print(f"    Building {G}³ voxel grid ({G**3/1e6:.1f}M voxels) ... ",
-              end="", flush=True)
-
-    coords = np.arange(G) * gs + gs / 2.0
-    grid_s1 = np.empty((G, G, G), dtype=np.int32)
-    grid_s2 = np.empty((G, G, G), dtype=np.int32)
-
-    yy, zz = np.meshgrid(coords, coords, indexing="ij")
-    yz_flat = np.column_stack([yy.ravel(), zz.ravel()])
-    for i in range(G):
-        x_col = np.full((G * G, 1), coords[i], dtype=np.float64)
-        slab = np.hstack([x_col, yz_flat])
-        _, idxs = tree.query(slab, k=2)
-        grid_s1[i] = idxs[:, 0].reshape(G, G).astype(np.int32)
-        grid_s2[i] = idxs[:, 1].reshape(G, G).astype(np.int32)
-
-    if verbose:
-        print("done")
-
-    return Ensemble(
-        seeds=seeds, annulus=annulus,
-        grid_s1=grid_s1, grid_s2=grid_s2,
-        rho=rho, V=V, vi=realised_vi,
-        alpha_star=alpha_star, L=L,
-        mean_AV=mean_AV_val,
-        grid_spacing=gs,
+    stats = _sample_geometry_stats(
+        seeds, annulus, tree, L, realised_vi, vi_se, alpha_star, cfg, rng
     )
+    cache = _build_candidate_cache(tree, L, cfg)
+    ens = Ensemble(
+        seeds=seeds,
+        annulus=annulus,
+        grid_candidates=cache,
+        rho=stats.rho_per_uL,
+        V=stats.mean_volume_pL,
+        vi=stats.vi,
+        alpha_star=alpha_star,
+        L=L,
+        mean_AV=stats.mean_A_over_V_um_inv,
+        grid_spacing=float(cfg.grid_spacing),
+        classifier_candidates=int(cfg.classifier_candidates),
+        geometry=stats,
+        rho_requested=float(rho),
+        V_requested=float(V),
+        periodic_tree=tree,
+    )
+    if verbose:
+        print(
+            "    [geometry] "
+            f"cells={n_cells}, rho={ens.rho:.1f}/uL, "
+            f"target v_i={target_vi:.5f}, realised={ens.vi:.5f}±{vi_se:.5f}, "
+            f"V={ens.V:.5f} pL, alpha*={alpha_star:.5f} um, "
+            f"<A/V>={ens.mean_AV:.5f} um^-1"
+        )
+    return ens
 
-
-# ===========================================================================
-# Helpers (unchanged)
-# ===========================================================================
 
 def create_dummy_ensemble(cfg: SimConfig) -> Ensemble:
-    """Pure water — no cells."""
-    L = cfg.L
-    G = cfg.grid_size
-    seeds = np.array([[0., 0., 0.], [L, L, L]])
-    annulus = np.array([1e10, 1e10])
-    grid_s1 = np.zeros((G, G, G), dtype=np.int32)
-    grid_s2 = np.ones((G, G, G), dtype=np.int32)
+    """Pure-water sentinel.  It has no classifier or cellular geometry."""
+    stats = GeometryStats(
+        vi=0.0, vi_se=0.0, rho_per_uL=0.0,
+        mean_volume_um3=0.0, mean_volume_pL=0.0,
+        sampled_mean_volume_um3=0.0, sampled_mean_volume_se_um3=0.0,
+        mean_area_um2=0.0, mean_area_se_um2=0.0,
+        mean_A_over_V_um_inv=0.0, mean_A_over_V_se_um_inv=0.0,
+        alpha_star_um=0.0,
+        annulus_mean_um=0.0, annulus_std_um=0.0,
+        annulus_min_um=0.0, annulus_max_um=0.0,
+        annulus_q05_um=0.0, annulus_q50_um=0.0, annulus_q95_um=0.0,
+        n_primary_cells=0, n_geometry_cells=0, n_vi_validation_points=0,
+    )
     return Ensemble(
-        seeds=seeds, annulus=annulus,
-        grid_s1=grid_s1, grid_s2=grid_s2,
-        rho=0, V=0, vi=0,
-        alpha_star=0, L=L, mean_AV=1.0,
-        grid_spacing=cfg.grid_spacing,
+        seeds=np.zeros((2, 3), dtype=np.float64),
+        annulus=np.zeros(2, dtype=np.float64),
+        grid_candidates=np.zeros((1, 1, 1, 2), dtype=np.int32),
+        rho=0.0, V=0.0, vi=0.0, alpha_star=0.0, L=float(cfg.L),
+        mean_AV=0.0, grid_spacing=float(cfg.grid_spacing),
+        classifier_candidates=2, geometry=stats,
+        rho_requested=0.0, V_requested=0.0, is_free_water=True,
     )
 
 
-def estimate_vi(ens: Ensemble, n=200_000, seed=42) -> float:
-    """Sanity-check v_i of a built ensemble by MC classification."""
-    rng = np.random.default_rng(seed)
-    pts = rng.uniform(0, ens.L, (n, 3))
-    _, inside = ens.classify_cpu(pts)
-    return inside.mean()
+def estimate_vi(ens: Ensemble, n: int = 200_000, seed: int = 42) -> float:
+    """Independent exact-KD volume-fraction estimate for a realised ensemble."""
+    if ens.is_free_water:
+        return 0.0
+    if ens.periodic_tree is None:
+        ens.periodic_tree = cKDTree(ens.seeds, boxsize=ens.L)
+    return _measure_vi(
+        ens.seeds, ens.annulus, ens.periodic_tree, ens.L,
+        n=n, rng=np.random.default_rng(seed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compatibility helpers kept only for external audit notebooks.  There is no
+# longer a v_i lookup table or a clamp path in the production constructor.
+# ---------------------------------------------------------------------------
+
+def _lookup_table_path(cfg: SimConfig) -> str:
+    """Deprecated compatibility name; no production code reads this path."""
+    return ""
+
+
+def compute_mean_AV_exact(
+    seeds: np.ndarray, annulus: np.ndarray, L: float, verbose: bool = False
+) -> Optional[float]:
+    """Untrimmed exact A/V mean over all cells in a small periodic ensemble.
+
+    This retained utility is intentionally conservative and should be used
+    for diagnostics, not large production ensembles.  The production path
+    samples cells and records its sample count and standard error.
+    """
+    tree = cKDTree(np.asarray(seeds), boxsize=float(L))
+    vals: list[float] = []
+    for i in range(len(seeds)):
+        item = _cell_polyhedron(i, seeds, annulus, tree, float(L))
+        if item is not None:
+            v, a = item
+            vals.append(a / v)
+    if verbose:
+        print(f"[exact A/V] {len(vals)}/{len(seeds)} periodic cells succeeded")
+    return float(np.mean(vals)) if vals else None

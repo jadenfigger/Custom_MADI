@@ -62,7 +62,8 @@ from madi.config   import SimConfig, BVALS_S_MM2, BVALS_UNIQUE, DELTAS_BIG
 from madi.library  import (build_library, build_library_from_triplets,
                             load_library, load_library_meta,
                             match_voxels_batch, match_voxels_batch_fits0,
-                            library_summary)
+                            library_summary, make_remediation_log_grid,
+                            edge_railing_diagnostics)
 from madi.fitters  import (bayes_fit, amico_fit, estimate_sigma_m,
                            calibrate_sigma_m,
                            DEFAULT_SIGMA_M, DEFAULT_LAMBDA1, DEFAULT_LAMBDA2)
@@ -129,11 +130,13 @@ PRESETS = {
                      L=250.0, buffer=60.0, grid_spacing=1.0),
     },
     "dense": {
-        "kios": np.linspace(1, 50, 50).tolist() + [60, 70, 80, 90, 100],
-        "rhos": np.linspace(100_000, 3_000_000, 100).tolist(),
-        "Vs":   np.linspace(0.1, 9.0, 100).tolist(),
+        # P0-E production topology: log rho × log V, diagonal v_i mask,
+        # k_io=0 family and an explicit free-water atom.  The numerical axes
+        # and analytic quadrature weights are made below, not here, so no
+        # caller can accidentally turn this back into a linear dense grid.
+        "grid": "remediation_log",
         "cfg":  dict(n_walkers=100_000, n_ensembles=40,
-                     L=300.0, buffer=80.0, grid_spacing=1.0),
+                     L=300.0, buffer=80.0, grid_spacing=0.75),
     },
 }
 
@@ -147,6 +150,13 @@ def parse_triplet(s: str):
     if len(parts) != 3:
         raise ValueError(f"Triplet must be 'kio,rho,V', got '{s}'")
     return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+def _entry_key_for_script(kio: float, rho: float, volume: float):
+    """Match the library's stable requested-coordinate weight key."""
+    if rho == 0.0 and volume == 0.0:
+        return ("free_water", 0.0, 0.0)
+    return (round(float(kio), 4), round(float(rho), 1), round(float(volume), 6))
 
 
 def parse_input(s: str):
@@ -793,6 +803,39 @@ def main():
 
     # -- Preset grid --
     ap.add_argument("--lib-preset", default="default", choices=list(PRESETS.keys()))
+    ap.add_argument("--remediation-n-rho", type=int, default=64,
+                    help="[dense remediation grid] number of uniform-log rho nodes "
+                         "(default 64; use a small value only for a pilot).")
+    ap.add_argument("--remediation-n-V", type=int, default=64,
+                    help="[dense remediation grid] number of uniform-log V nodes "
+                         "(default 64; use a small value only for a pilot).")
+    ap.add_argument("--remediation-rho-min", type=float, default=1.0e4)
+    ap.add_argument("--remediation-rho-max", type=float, default=1.0e7)
+    ap.add_argument("--remediation-V-min", type=float, default=0.01)
+    ap.add_argument("--remediation-V-max", type=float, default=200.0)
+    ap.add_argument("--remediation-kios", type=float, nargs="+", default=None,
+                    help="[dense remediation grid] explicit piecewise-linear k_io "
+                         "nodes, including zero; intended for pilot builds.")
+    ap.add_argument("--sim-walkers", type=int, default=None,
+                    help="Override walkers per ensemble for this build (pilot only).")
+    ap.add_argument("--sim-ensembles", type=int, default=None,
+                    help="Override independent ensembles per entry for this build (pilot only).")
+    ap.add_argument("--sim-L", type=float, default=None,
+                    help="Override periodic domain side in um for this build (pilot only).")
+    ap.add_argument("--sim-grid-spacing", type=float, default=None,
+                    help="Override candidate-cache spacing in um for this build.")
+    ap.add_argument("--sim-T-max", type=float, default=None,
+                    help="Override walk duration in ms; must cover every selected δ+Δ.")
+    ap.add_argument("--sim-small-deltas", type=float, nargs="+", default=None,
+                    help="Override stored δ grid in ms (pilot only).")
+    ap.add_argument("--sim-big-deltas", type=float, nargs="+", default=None,
+                    help="Override stored Δ grid in ms (pilot only).")
+    ap.add_argument("--sim-b-values", type=float, nargs="+", default=None,
+                    help="Override stored b grid in s/mm² (pilot only).")
+    ap.add_argument("--sim-exchange-calibration-walkers", type=int, default=None,
+                    help="Override per-geometry tagged-exchange calibration walkers.")
+    ap.add_argument("--sim-exchange-calibration-ms", type=float, default=None,
+                    help="Override tagged-exchange calibration duration in ms.")
 
     # -- Custom additions --
     ap.add_argument("--custom-kios", type=float, nargs="+")
@@ -817,7 +860,7 @@ def main():
                     help="Build-level RNG seed. MUST be the same across "
                          "every SLURM shard of a given library build: "
                          "ensemble/walker seeds are derived from "
-                         "(seed, ensemble_index[, kio]) only -- never from "
+                         "(seed, ensemble_index) only -- never from "
                          "(rho, V) -- so every (rho,V) grid point shares "
                          "correlated random-number streams (common random "
                          "numbers), which the Fisher/CRLB phase needs. "
@@ -954,18 +997,29 @@ def main():
                          "each input as 'δ,Δ:dwi...'. Each (δ,Δ) is matched to "
                          "the nearest stored library pair (no interpolation).")
     # -- vi bounds (used BOTH for --build-library and for matching) --
-    ap.add_argument("--vi-min", type=float, default=0.0,
+    ap.add_argument("--vi-min", type=float, default=0.40,
                     help="Lower bound on intracellular volume fraction "
                          "vi = (rho/1e9)*(V*1e3). With --build-library, only "
                          "(kio,rho,V) triplets with vi in [--vi-min, --vi-max] "
                          "are simulated (e.g. --vi-min 0.4 skips sparse/low-vi "
                          "tissue). With --fit, bounds the library candidates.")
-    ap.add_argument("--vi-max", type=float, default=0.95,
-                    help="Upper bound on vi (hard physical ceiling is 0.95; "
-                         "values above are clamped to it at build time).")
+    ap.add_argument("--vi-max", type=float, default=0.99,
+                    help="Upper bound on v_i. Production geometry directly "
+                         "calibrates every target and raises on a miss; it "
+                         "never clamps a target to a different geometry.")
     ap.add_argument("--rho-max", type=float, default=None,
                     help="Optional upper bound on library rho [cells/uL] "
                          "for matching (e.g. 1500000 for brain).")
+    ap.add_argument("--include-free-water", action="store_true",
+                    help="Include the explicit rho=V=0 free-water atom in "
+                         "the MAP candidate set. When selected, k_io is "
+                         "reported as NaN (undefined), not a false zero. "
+                         "The default remains the paper-compatible cellular "
+                         "reference matcher; use an acellular mask or this "
+                         "flag deliberately.")
+    ap.add_argument("--edge-warning-fraction", type=float, default=0.10,
+                    help="Warn when this fraction of fitted voxels sits on "
+                         "a realised cellular library boundary (default 0.10).")
 
     args = ap.parse_args()
     
@@ -1011,7 +1065,39 @@ def main():
 
         # Get simulation config from preset
         preset = PRESETS[args.lib_preset]
-        cfg = SimConfig(**preset["cfg"])
+        cfg_values = dict(preset["cfg"])
+        for arg_name, cfg_name in (
+            ("sim_walkers", "n_walkers"),
+            ("sim_ensembles", "n_ensembles"),
+            ("sim_L", "L"),
+            ("sim_grid_spacing", "grid_spacing"),
+            ("sim_T_max", "T_max_ms"),
+            ("sim_small_deltas", "small_deltas"),
+            ("sim_big_deltas", "big_deltas"),
+            ("sim_b_values", "b_values"),
+            ("sim_exchange_calibration_walkers", "exchange_calibration_walkers"),
+            ("sim_exchange_calibration_ms", "exchange_calibration_ms"),
+        ):
+            value = getattr(args, arg_name)
+            if value is not None:
+                cfg_values[cfg_name] = value
+        cfg = SimConfig(**cfg_values)
+        remediation_grid = None
+        remediation_triplets = None
+        remediation_weights = None
+        if preset.get("grid") == "remediation_log":
+            remediation_grid = make_remediation_log_grid(
+                n_rho=args.remediation_n_rho,
+                n_V=args.remediation_n_V,
+                kios=(None if args.remediation_kios is None
+                      else np.asarray(args.remediation_kios, dtype=float)),
+                rho_min=args.remediation_rho_min,
+                rho_max=args.remediation_rho_max,
+                V_min=args.remediation_V_min,
+                V_max=args.remediation_V_max,
+                vi_min=args.vi_min, vi_max=args.vi_max,
+            )
+            remediation_triplets, remediation_weights = remediation_grid.triplets_and_weights()
 
         # Load existing if appending
         existing = None
@@ -1036,6 +1122,13 @@ def main():
 
         # ---- Mode: explicit sub-grid ----
         if args.explicit:
+            if remediation_grid is not None and not (
+                args.grid_kios and args.grid_rhos and args.grid_Vs
+            ):
+                print("ERROR: --explicit with the remediation grid requires "
+                      "--grid-kios, --grid-rhos and --grid-Vs.  The production "
+                      "dense preset is intentionally not a mutable linear grid.")
+                return
             gk = args.grid_kios or preset["kios"]
             gr = [int(r) for r in (args.grid_rhos or preset["rhos"])]
             gv = args.grid_Vs or preset["Vs"]
@@ -1050,7 +1143,74 @@ def main():
                 seed=args.seed, vi_min=args.vi_min, vi_max=args.vi_max)
             return
 
-        # ---- Mode: preset grid + optional custom additions ----
+        # ---- Mode: remediation production grid ---------------------------
+        if remediation_grid is not None:
+            if args.custom_kios or args.custom_rhos or args.custom_Vs:
+                print("ERROR: custom linear-axis additions are incompatible "
+                      "with the weighted remediation grid. Use an explicit "
+                      "diagnostic grid instead; do not mutate production weights.")
+                return
+            assert remediation_triplets is not None and remediation_weights is not None
+            print("\n  Mode: weighted remediation log grid")
+            print(f"  cellular triplets: {len(remediation_triplets)-1}")
+            print(f"  rho: {args.remediation_rho_min:,.0f} .. "
+                  f"{args.remediation_rho_max:,.0f} cells/uL "
+                  f"({args.remediation_n_rho} uniform-log nodes)")
+            print(f"  V:   {args.remediation_V_min:g} .. {args.remediation_V_max:g} pL "
+                  f"({args.remediation_n_V} uniform-log nodes)")
+            print(f"  vi:  {args.vi_min:.3f} .. {args.vi_max:.3f} (diagonal mask)")
+            print(f"  kio: {remediation_grid.kios.tolist()} s^-1")
+            print("  free water: one explicit discrete atom")
+
+            if args.shard_id is not None:
+                if args.n_shards is None or args.n_shards < 1:
+                    print("ERROR: --shard-id requires --n-shards >= 1")
+                    return
+                if not (0 <= args.shard_id < args.n_shards):
+                    print(f"ERROR: --shard-id must be in [0, {args.n_shards})")
+                    return
+                cellular_pairs = sorted(
+                    {(r, v) for _, r, v in remediation_triplets if r > 0.0},
+                    key=lambda p: p[0] * p[1],
+                )
+                my_pairs = {
+                    pair for i, pair in enumerate(cellular_pairs)
+                    if i % args.n_shards == args.shard_id
+                }
+                shard_triplets = [
+                    t for t in remediation_triplets
+                    if (t[1] > 0.0 and (t[1], t[2]) in my_pairs)
+                    or (args.shard_id == 0 and t[1] == 0.0 and t[2] == 0.0)
+                ]
+                shard_weights = {
+                    key: remediation_weights[key]
+                    for key in [_entry_key_for_script(*t) for t in shard_triplets]
+                }
+                root, ext = os.path.splitext(args.library)
+                save_path = (f"{root}.shard{args.shard_id:03d}{ext}"
+                             if "shard" not in os.path.basename(args.library)
+                             else args.library.format(shard=args.shard_id, n_shards=args.n_shards))
+                print(f"\n  Sharding: {args.shard_id}/{args.n_shards}; "
+                      f"{len(shard_triplets)} triplets -> {save_path}")
+                build_library_from_triplets(
+                    shard_triplets, cfg=cfg, save_path=save_path,
+                    existing_library=existing, seed=args.seed,
+                    vi_min=args.vi_min, vi_max=args.vi_max,
+                    entry_weights=shard_weights,
+                    grid_metadata=remediation_grid.metadata(),
+                )
+                return
+
+            build_library_from_triplets(
+                remediation_triplets, cfg=cfg, save_path=args.library,
+                existing_library=existing, seed=args.seed,
+                vi_min=args.vi_min, vi_max=args.vi_max,
+                entry_weights=remediation_weights,
+                grid_metadata=remediation_grid.metadata(),
+            )
+            return
+
+        # ---- Mode: legacy/custom preset grid + optional additions ----
         kios = list(preset["kios"])
         rhos = list(preset["rhos"])
         Vs   = list(preset["Vs"])
@@ -1080,7 +1240,7 @@ def main():
             # Use the SAME vi bounds the builder will apply so shard
             # assignment matches what actually gets computed (otherwise a
             # shard could be handed entries that are then all skipped).
-            vi_hi = min(args.vi_max, 0.95)
+            vi_hi = min(args.vi_max, 0.99)
             all_triplets = [(k, r, v) for k in kios for r in rhos for v in Vs]
             valid = [(k, r, v) for k, r, v in all_triplets
                      if args.vi_min <= (r / 1e9) * (v * 1e3) <= vi_hi]
@@ -1384,6 +1544,7 @@ def main():
                     vi_min=args.vi_min,
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
+                    include_free_water=args.include_free_water,
                     use_gpu=use_gpu,
                 )
                 print(f"  Done in {time.time()-t0:.1f}s")
@@ -1408,35 +1569,42 @@ def main():
                     vi_min=args.vi_min,
                     vi_max=args.vi_max,
                     rho_max=args.rho_max,
+                    include_free_water=args.include_free_water,
                     log_space=args.log_space,
                     use_gpu=use_gpu,
                 )
                 print(f"  Done in {time.time()-t0:.1f}s")
 
             # Stats
-            print(f"\n  kio:  median={np.median(kio_map):.1f}, "
-                  f"range=[{kio_map.min():.1f}, {kio_map.max():.1f}] s-1")
+            print(f"\n  kio:  median={np.nanmedian(kio_map):.1f}, "
+                  f"range=[{np.nanmin(kio_map):.1f}, {np.nanmax(kio_map):.1f}] s-1")
             print(f"  rho:  median={np.median(rho_map)/1e3:.0f}k, "
                   f"range=[{rho_map.min()/1e3:.0f}k, "
                   f"{rho_map.max()/1e3:.0f}k] cells/uL")
             print(f"  V:    median={np.median(V_map):.2f}, "
                   f"range=[{V_map.min():.2f}, {V_map.max():.2f}] pL")
 
-            # Boundary warnings
-            for name, vals, grid in [
-                ("rho", rho_map, sorted(set(e.rho for e in lib))),
-                ("V",   V_map,   sorted(set(e.V for e in lib))),
-                ("kio", kio_map, sorted(set(e.kio for e in lib))),
-            ]:
-                n = len(vals)
-                at_max = np.sum(vals >= grid[-1] - 1e-10)
-                at_min = np.sum(vals <= grid[0] + 1e-10)
-                if at_max / n > 0.10:
-                    print(f"  ⚠ {at_max/n*100:.0f}% of voxels hit {name} "
-                          f"UPPER bound ({grid[-1]}). Extend the grid.")
-                if at_min / n > 0.10:
-                    print(f"  ⚠ {at_min/n*100:.0f}% of voxels hit {name} "
-                          f"LOWER bound ({grid[0]}). Extend the grid.")
+            edge_summary = edge_railing_diagnostics(
+                kio_map, rho_map, V_map, lib,
+                vi_min=args.vi_min, vi_max=args.vi_max,
+                rho_max=args.rho_max,
+                include_free_water=args.include_free_water,
+            )
+            print("\n  Edge-railing diagnostic (realised library labels):")
+            if edge_summary["free_water_count"]:
+                print(f"    free water: {edge_summary['free_water_count']}/"
+                      f"{edge_summary['n_voxels']} "
+                      f"({edge_summary['free_water_fraction']:.1%})")
+            for name in ("rho", "V", "kio"):
+                item = edge_summary[name]
+                print(f"    {name}: lower {item['at_lower_fraction']:.1%} "
+                      f"({item['lower_value']:.6g}), upper "
+                      f"{item['at_upper_fraction']:.1%} "
+                      f"({item['upper_value']:.6g})")
+                if max(item["at_lower_fraction"], item["at_upper_fraction"]) > args.edge_warning_fraction:
+                    print(f"      ⚠ {name} rails against a library edge above "
+                          f"{args.edge_warning_fraction:.0%}; do not interpret "
+                          "that boundary as a measurement.")
 
             print("\nSaving maps ...")
             save_map(kio_map, mask_idx, shape, affine,

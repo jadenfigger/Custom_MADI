@@ -41,11 +41,14 @@ match_voxels_batch_fits0()
 
 from __future__ import annotations
 
-import numpy as np
+import json
+import math
 import os
 import time
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Mapping, Optional, List, Tuple
+
+import numpy as np
 
 from collections import defaultdict
 
@@ -64,6 +67,24 @@ class LibraryEntry:
     rho:    float
     V:      float
     vector: np.ndarray   # flat S[δ,Δ,b].ravel() — pair-major then b
+    # Everything below is optional so legacy files and small test fixtures
+    # remain readable.  New builds always populate these fields.
+    vi: float | None = None
+    weight: float | None = None
+    kio_nominal: float | None = None
+    rho_nominal: float | None = None
+    V_nominal: float | None = None
+    pp: float | None = None
+    kio_analytic_eq5: float | None = None
+    kio_measured_se: float | None = None
+    is_free_water: bool = False
+    metadata: dict = field(default_factory=dict)
+
+    @property
+    def realised_vi(self) -> float:
+        if self.vi is not None and np.isfinite(self.vi):
+            return float(self.vi)
+        return float(self.rho) * float(self.V) * 1e-6
 
 
 DEFAULT_KIOS = [2, 5, 8, 12, 18, 25, 35, 50, 75, 100]
@@ -71,21 +92,196 @@ DEFAULT_RHOS = [100_000, 200_000, 400_000, 600_000, 800_000]
 DEFAULT_VS   = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
 
 
+@dataclass(frozen=True)
+class LogGridDefinition:
+    """Masked log-coordinate cellular grid plus one discrete free-water atom.
+
+    ``weights`` are midpoint quadrature elements for a prior density uniform
+    in physical ``(rho, V, k_io)`` coordinates.  With x=log(rho), y=log(V),
+    d rho dV dk = rho*V dx dy dk, hence the analytic rho*V Jacobian below.
+    The k=0 slice uses its one-sided piecewise-cell width.  Free water is a
+    separately declared point-mass component and receives
+    ``free_water_weight`` rather than pretending to occupy a volume in the
+    cellular coordinate system.
+    """
+
+    kios: np.ndarray
+    rhos: np.ndarray
+    Vs: np.ndarray
+    vi_min: float = 0.40
+    vi_max: float = 0.99
+    free_water_weight: float = 1.0
+
+    def triplets_and_weights(self) -> tuple[list[tuple[float, float, float]], dict]:
+        if np.any(self.rhos <= 0.0) or np.any(self.Vs <= 0.0):
+            raise ValueError("log-coordinate rho and V grid values must be positive")
+        if np.any(self.kios < 0.0):
+            raise ValueError("k_io grid values must be non-negative")
+        lx = np.log(self.rhos)
+        ly = np.log(self.Vs)
+        # The declared extrema are the integration-domain bounds, not
+        # midpoint centres outside the requested box.  Endpoint cells are
+        # therefore half-width in transformed coordinates.  Extending them
+        # by half a step would silently give posterior mass to rho/V/k_io
+        # values outside the stated remediation grid.
+        dx = _cell_widths(lx, lower_bound=float(lx[0]), upper_bound=float(lx[-1]))
+        dy = _cell_widths(ly, lower_bound=float(ly[0]), upper_bound=float(ly[-1]))
+        dk = _cell_widths(
+            self.kios, lower_bound=0.0, upper_bound=float(self.kios[-1]),
+        )
+        triplets: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
+        weights: dict = {_entry_key(0.0, 0.0, 0.0): float(self.free_water_weight)}
+        for ik, k in enumerate(self.kios):
+            for ir, rho in enumerate(self.rhos):
+                for iv, volume in enumerate(self.Vs):
+                    vi = float(rho * volume * 1e-6)
+                    if not (self.vi_min <= vi <= self.vi_max):
+                        continue
+                    item = (float(k), float(rho), float(volume))
+                    triplets.append(item)
+                    weights[_entry_key(*item)] = float(rho * volume * dx[ir] * dy[iv] * dk[ik])
+        return triplets, weights
+
+    def metadata(self) -> dict:
+        return {
+            "coordinate_transform": {
+                "rho": "uniform_log",
+                "V": "uniform_log",
+                "kio": "piecewise_uniform_linear",
+            },
+            "vi_min": float(self.vi_min),
+            "vi_max": float(self.vi_max),
+            "rho_values": self.rhos.tolist(),
+            "V_values": self.Vs.tolist(),
+            "kio_values": self.kios.tolist(),
+            "free_water_weight": float(self.free_water_weight),
+            "weight_expression": "rho * V * dlogrho * dlogV * dkio",
+        }
+
+
+def _cell_widths(
+    values: np.ndarray,
+    lower_bound: float | None = None,
+    upper_bound: float | None = None,
+) -> np.ndarray:
+    """Midpoint-cell widths for a strictly increasing 1-D grid."""
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 1 or len(arr) < 2 or np.any(np.diff(arr) <= 0.0):
+        raise ValueError("grid axis must be strictly increasing with at least two values")
+    edges = np.empty(len(arr) + 1, dtype=float)
+    edges[1:-1] = 0.5 * (arr[:-1] + arr[1:])
+    edges[0] = (float(lower_bound) if lower_bound is not None
+                else arr[0] - 0.5 * (arr[1] - arr[0]))
+    edges[-1] = (float(upper_bound) if upper_bound is not None
+                 else arr[-1] + 0.5 * (arr[-1] - arr[-2]))
+    if edges[0] > arr[0] or edges[-1] < arr[-1]:
+        raise ValueError("quadrature bounds must enclose every grid node")
+    return np.diff(edges)
+
+
+def make_remediation_log_grid(
+    *,
+    n_rho: int = 64,
+    n_V: int = 64,
+    kios: Optional[np.ndarray] = None,
+    rho_min: float = 1.0e4,
+    rho_max: float = 1.0e7,
+    V_min: float = 0.01,
+    V_max: float = 200.0,
+    vi_min: float = 0.40,
+    vi_max: float = 0.99,
+) -> LogGridDefinition:
+    """Production-grid design mandated by remediation P0-E (not a build)."""
+    if not (0.0 < rho_min < rho_max):
+        raise ValueError("remediation rho bounds must satisfy 0 < min < max")
+    if not (0.0 < V_min < V_max):
+        raise ValueError("remediation V bounds must satisfy 0 < min < max")
+    if kios is None:
+        kios = np.r_[0.0, np.arange(1.0, 31.0, 1.0), np.arange(35.0, 131.0, 5.0)]
+    return LogGridDefinition(
+        kios=np.asarray(kios, dtype=float),
+        rhos=np.geomspace(float(rho_min), float(rho_max), int(n_rho)),
+        Vs=np.geomspace(float(V_min), float(V_max), int(n_V)),
+        vi_min=float(vi_min),
+        vi_max=float(vi_max),
+    )
+
+
 def _entry_key(kio, rho, V):
-    return (round(kio, 4), round(rho, 1), round(V, 6))
+    if not np.isfinite(kio) or (rho == 0.0 and V == 0.0):
+        return ("free_water", 0.0, 0.0)
+    return (round(float(kio), 4), round(float(rho), 1), round(float(V), 6))
 
 def _existing_keys(library):
-    return {_entry_key(e.kio, e.rho, e.V) for e in library}
+    return {
+        _entry_key(
+            e.kio_nominal if e.kio_nominal is not None else e.kio,
+            e.rho_nominal if e.rho_nominal is not None else e.rho,
+            e.V_nominal if e.V_nominal is not None else e.V,
+        )
+        for e in library
+    }
 
-# Hard physical ceiling: create_ensemble() raises for vi > 0.95, so no build
+# Hard physical ceiling: create_ensemble() raises for vi > 0.99, so no build
 # may request an entry above it regardless of the caller's vi_max.
-VI_HARD_MAX = 0.95
+VI_HARD_MAX = 0.99
 
 
 def _filter_valid(triplets, vi_min=0.0, vi_max=VI_HARD_MAX):
     hi = min(vi_max, VI_HARD_MAX)
-    return [(k, r, v) for k, r, v in triplets
-            if vi_min <= (r / 1e9) * (v * 1e3) <= hi]
+    valid = []
+    for k, r, v in triplets:
+        # A genuine free-water atom is a discrete model component, not an
+        # invalid rho*V product.  k_io is undefined physically; use NaN in
+        # labels and preserve the nominal coordinate as zero in metadata.
+        if r == 0.0 and v == 0.0:
+            valid.append((k, r, v))
+            continue
+        vi = (r / 1e9) * (v * 1e3)
+        if vi_min <= vi <= hi:
+            valid.append((k, r, v))
+    return valid
+
+
+def _summarise_realised_geometry(per_ensemble: list[dict], cfg: SimConfig) -> dict:
+    """Aggregate direct geometry measurements without replacing them by targets."""
+    if not per_ensemble:
+        return {
+            "vi": 0.0, "rho_per_uL": 0.0, "mean_volume_pL": 0.0,
+            "mean_A_over_V_um_inv": 0.0, "mean_area_um2": 0.0,
+            "n_primary_cells": 0,
+        }
+    n_cells = np.asarray([int(x["n_primary_cells"]) for x in per_ensemble], dtype=float)
+    vis = np.asarray([float(x["vi"]) for x in per_ensemble], dtype=float)
+    L3 = float(cfg.L) ** 3
+    total_cells = float(n_cells.sum())
+    total_intracellular_volume = float(np.sum(vis * L3))
+    # These three labels satisfy rho*V*1e-6 == mean direct v_i by
+    # construction, while retaining the Poisson-realised cell count.
+    rho = total_cells / (len(per_ensemble) * L3) * 1e9
+    V_pL = total_intracellular_volume / total_cells / 1e3 if total_cells else 0.0
+    weights = n_cells / max(total_cells, 1.0)
+    def cell_weighted(name: str) -> float:
+        return float(np.sum(weights * np.asarray([float(x[name]) for x in per_ensemble])))
+    return {
+        "vi": float(np.mean(vis)),
+        "vi_between_ensemble_sd": float(np.std(vis, ddof=1)) if len(vis) > 1 else 0.0,
+        "rho_per_uL": float(rho),
+        "mean_volume_pL": float(V_pL),
+        "mean_volume_um3": float(V_pL * 1e3),
+        "sampled_mean_volume_um3": cell_weighted("sampled_mean_volume_um3"),
+        "mean_area_um2": cell_weighted("mean_area_um2"),
+        "mean_A_over_V_um_inv": cell_weighted("mean_A_over_V_um_inv"),
+        "annulus_mean_um": cell_weighted("annulus_mean_um"),
+        "annulus_std_um": cell_weighted("annulus_std_um"),
+        "annulus_min_um": float(min(float(x["annulus_min_um"]) for x in per_ensemble)),
+        "annulus_max_um": float(max(float(x["annulus_max_um"]) for x in per_ensemble)),
+        "annulus_q05_um": cell_weighted("annulus_q05_um"),
+        "annulus_q50_um": cell_weighted("annulus_q50_um"),
+        "annulus_q95_um": cell_weighted("annulus_q95_um"),
+        "n_primary_cells": int(total_cells),
+        "n_geometry_cells": int(sum(int(x["n_geometry_cells"]) for x in per_ensemble)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +296,8 @@ def build_library_from_triplets(
     seed: int = 0,
     vi_min: float = 0.0,
     vi_max: float = VI_HARD_MAX,
+    entry_weights: Optional[Mapping[tuple, float]] = None,
+    grid_metadata: Optional[dict] = None,
     verbose: bool = True,
 ) -> list[LibraryEntry]:
     """Build/extend library from an explicit list of (kio, rho, V) triplets.
@@ -140,7 +338,7 @@ def build_library_from_triplets(
         if verbose:
             print("  Nothing new to compute!")
         if save_path:
-            _save_library(library, save_path, cfg=cfg)
+            _save_library(library, save_path, cfg=cfg, grid_metadata=grid_metadata)
         return library
 
     columns = sig.build_columns(cfg)
@@ -188,8 +386,69 @@ def build_library_from_triplets(
         )
 
         for kio in kios_for_group:
-            vec = sig.signals_to_flat(results[kio])
-            library.append(LibraryEntry(kio=kio, rho=rho, V=V, vector=vec))
+            result = results[kio]
+            vec = sig.signals_to_flat(result)
+            summary = _summarise_realised_geometry(result["geometry_stats"], cfg)
+            is_free = rho == 0.0 and V == 0.0
+            nominal_key = _entry_key(kio, rho, V)
+            weight = None if entry_weights is None else entry_weights.get(nominal_key)
+            entry_metadata = {
+                "schema": "madi-library-entry-v3",
+                "nominal": {"kio": float(kio), "rho": float(rho), "V": float(V)},
+                "realised_geometry": summary,
+                "per_ensemble_geometry": result["geometry_stats"],
+                "exchange": {
+                    "kio_measured_s_inv": float(result["kio_measured"]),
+                    "kio_measured_se_s_inv": float(result["kio_measured_se"]),
+                    "kio_survival_fit_s_inv": float(result["kio_survival_fit"]),
+                    "kio_stationary_residence_s_inv": float(result["kio_stationary_residence"]),
+                    "kio_analytic_eq5_s_inv": float(result["kio_analytic_eq5"]),
+                    "analytic_over_measured": (
+                        float(result["kio_analytic_eq5"] / result["kio_measured"])
+                        if result["kio_measured"] > 0.0 else None
+                    ),
+                    "p_p_mean": float(result["pp"]),
+                    "calibration": [asdict(x) for x in result["calibration"]],
+                    "intra_time_ms": float(result["intra_time_ms"]),
+                    "efflux_events": int(result["efflux_events"]),
+                    "influx_events": int(result["influx_events"]),
+                    "first_exit_events": int(result["first_exit_events"]),
+                    "start_initial_intra": int(result["start_initial_intra"]),
+                    "start_survival_time_ms": float(result["start_survival_time_ms"]),
+                },
+                "boundary": {
+                    "mode": cfg.boundary_mode,
+                    "n_escaped": int(result["n_escaped"]),
+                    "n_walkers_total": int(result["n_eff"] // 3),
+                    "escape_fraction": float(
+                        result["n_escaped"] / max(result["n_eff"] // 3, 1)
+                    ),
+                    "escape_times_ms": [],
+                    "surviving_walkers_by_checkpoint": np.asarray(
+                        result["surviving_walkers_by_checkpoint"], dtype=int
+                    ).tolist(),
+                    "occupancy_fraction": np.asarray(result["occupancy_fraction"]).tolist(),
+                },
+                "weight": None if weight is None else float(weight),
+            }
+            library.append(LibraryEntry(
+                # k_io is undefined for the free-water atom; preserve NaN
+                # rather than pretending it is a zero-exchange cell.
+                kio=(float("nan") if is_free else float(result["kio_measured"])),
+                rho=(0.0 if is_free else summary["rho_per_uL"]),
+                V=(0.0 if is_free else summary["mean_volume_pL"]),
+                vector=vec,
+                vi=(0.0 if is_free else summary["vi"]),
+                weight=None if weight is None else float(weight),
+                kio_nominal=float(kio),
+                rho_nominal=float(rho),
+                V_nominal=float(V),
+                pp=float(result["pp"]),
+                kio_analytic_eq5=float(result["kio_analytic_eq5"]),
+                kio_measured_se=float(result["kio_measured_se"]),
+                is_free_water=is_free,
+                metadata=entry_metadata,
+            ))
             entry_idx += 1
 
         dt = time.time() - tt
@@ -202,7 +461,8 @@ def build_library_from_triplets(
         # Checkpoint after every (rho, V) group — cheap insurance
         # against SLURM preemption / walltime kills.
         if save_path:
-            _save_library(library, save_path, cfg=cfg, columns=columns)
+            _save_library(library, save_path, cfg=cfg, columns=columns,
+                          grid_metadata=grid_metadata)
 
     elapsed = time.time() - t0
     if verbose:
@@ -210,7 +470,8 @@ def build_library_from_triplets(
               f"({len(new_triplets)} new in {elapsed:.0f}s)")
 
     if save_path:
-        _save_library(library, save_path, cfg=cfg, columns=columns)
+        _save_library(library, save_path, cfg=cfg, columns=columns,
+                      grid_metadata=grid_metadata)
         if verbose:
             print(f"Saved to {save_path}")
 
@@ -224,7 +485,8 @@ def build_library_from_triplets(
 def build_library(
     kios=None, rhos=None, Vs=None,
     cfg=None, save_path=None, existing_library=None, seed=0,
-    vi_min=0.0, vi_max=VI_HARD_MAX, verbose=True,
+    vi_min=0.0, vi_max=VI_HARD_MAX, entry_weights=None, grid_metadata=None,
+    verbose=True,
 ) -> list[LibraryEntry]:
     """Build/extend library from kio × rho × V grid (full cross-product)."""
     if kios is None: kios = DEFAULT_KIOS
@@ -239,7 +501,8 @@ def build_library(
     return build_library_from_triplets(
         triplets, cfg=cfg, save_path=save_path,
         existing_library=existing_library, seed=seed,
-        vi_min=vi_min, vi_max=vi_max, verbose=verbose,
+        vi_min=vi_min, vi_max=vi_max, entry_weights=entry_weights,
+        grid_metadata=grid_metadata, verbose=verbose,
     )
 
 
@@ -247,9 +510,54 @@ def build_library(
 # I/O
 # ---------------------------------------------------------------------------
 
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"cannot JSON-serialise {type(value)!r}")
+
+
+def _cfg_metadata(cfg: SimConfig) -> dict:
+    """Library-embedded physics/build configuration, with no hidden defaults."""
+    return {
+        "schema": "madi-library-v3",
+        "D0_um2_ms": cfg.D0,
+        "ts_ms": cfg.ts,
+        "T_max_ms": cfg.T_max_ms,
+        "domain_L_um": cfg.L,
+        "legacy_buffer_um": cfg.buffer,
+        "legacy_pop_margin_um": cfg.pop_margin,
+        "boundary_mode": cfg.boundary_mode,
+        "kappa": cfg.kappa,
+        "grid_spacing_um": cfg.grid_spacing,
+        "classifier_candidates": cfg.classifier_candidates,
+        "geometry_calibration_points": cfg.geometry_calibration_points,
+        "geometry_validation_points": cfg.geometry_validation_points,
+        "geometry_sample_cells": cfg.geometry_sample_cells,
+        "geometry_vi_tolerance": cfg.geometry_vi_tolerance,
+        "walkers_per_ensemble": cfg.n_walkers,
+        "ensembles_per_entry": cfg.n_ensembles,
+        "exchange_calibration_walkers": cfg.exchange_calibration_walkers,
+        "exchange_calibration_ms": cfg.exchange_calibration_ms,
+        "exchange_calibration_response_points": cfg.exchange_calibration_response_points,
+        "exchange_calibration_min_pp": cfg.exchange_calibration_min_pp,
+        "exchange_calibration_min_events": cfg.exchange_calibration_min_events,
+        "exchange_calibration_max_batches": cfg.exchange_calibration_max_batches,
+        "phase_model": cfg.phase_model,
+        "checkpoint_h_ms": cfg.h_ms,
+        "common_random_numbers": "base_seed + ensemble_index; shared across rho,V,kio",
+        "kio_label": "direct tagged-starting-cell first-exit hazard; event-count and survival-fit cross-check stored per entry",
+        "kio_calibration": "one measured monotone p_p response curve per realised geometry; Eq. 5 is metadata only",
+        "analytic_kio_comparator": "MADI-I Eq. 5",
+    }
+
+
 def _save_library(lib: list[LibraryEntry], path: str,
                   cfg: SimConfig | None = None,
-                  columns: "sig.ColumnGrid | None" = None):
+                  columns: "sig.ColumnGrid | None" = None,
+                  grid_metadata: Optional[dict] = None,
+                  build_metadata: Optional[dict] = None):
     """Persist library + (δ,Δ,b) grid metadata to npz.
 
     Stores:
@@ -264,15 +572,55 @@ def _save_library(lib: list[LibraryEntry], path: str,
     if columns is None:
         columns = sig.build_columns(cfg)
 
-    kios = np.array([e.kio for e in lib])
-    rhos = np.array([e.rho for e in lib])
-    Vs   = np.array([e.V for e in lib])
+    kios = np.array([e.kio for e in lib], dtype=float)
+    rhos = np.array([e.rho for e in lib], dtype=float)
+    Vs   = np.array([e.V for e in lib], dtype=float)
+    vis = np.array([e.realised_vi for e in lib], dtype=float)
+    weights = np.array([
+        np.nan if e.weight is None else float(e.weight) for e in lib
+    ], dtype=float)
     vecs = np.array([e.vector for e in lib])
+    nominal_kios = np.array([
+        e.kio if e.kio_nominal is None else e.kio_nominal for e in lib
+    ], dtype=float)
+    nominal_rhos = np.array([
+        e.rho if e.rho_nominal is None else e.rho_nominal for e in lib
+    ], dtype=float)
+    nominal_Vs = np.array([
+        e.V if e.V_nominal is None else e.V_nominal for e in lib
+    ], dtype=float)
+    pps = np.array([np.nan if e.pp is None else e.pp for e in lib], dtype=float)
+    kio_eq5 = np.array([
+        np.nan if e.kio_analytic_eq5 is None else e.kio_analytic_eq5 for e in lib
+    ], dtype=float)
+    kio_se = np.array([
+        np.nan if e.kio_measured_se is None else e.kio_measured_se for e in lib
+    ], dtype=float)
+    free = np.array([e.is_free_water for e in lib], dtype=np.bool_)
+    entry_json = np.array([
+        json.dumps(e.metadata, sort_keys=True, default=_json_default) for e in lib
+    ])
     pair_deltas = np.array([d for d, D in columns.delta_pairs], dtype=float)
     pair_Deltas = np.array([D for d, D in columns.delta_pairs], dtype=float)
+    embedded_build_metadata = (
+        dict(build_metadata) if build_metadata is not None
+        else {**_cfg_metadata(cfg), "grid": grid_metadata or {}}
+    )
+    # A caller preserving existing build metadata (the shard merger) may
+    # still explicitly replace just its grid section.
+    if grid_metadata is not None:
+        embedded_build_metadata["grid"] = grid_metadata
     np.savez(
         path,
-        kios=kios, rhos=rhos, Vs=Vs, vectors=vecs,
+        library_schema=np.array("madi-library-v3"),
+        kios=kios, rhos=rhos, Vs=Vs, vis=vis, vectors=vecs,
+        nominal_kios=nominal_kios, nominal_rhos=nominal_rhos, nominal_Vs=nominal_Vs,
+        weights=weights, has_weights=np.array(bool(np.all(np.isfinite(weights)))),
+        pps=pps, kio_analytic_eq5=kio_eq5, kio_measured_se=kio_se,
+        is_free_water=free, entry_metadata_json=entry_json,
+        build_metadata_json=np.array(json.dumps(
+            embedded_build_metadata, sort_keys=True, default=_json_default,
+        )),
         pair_deltas=pair_deltas, pair_Deltas=pair_Deltas,
         b_values=np.asarray(columns.b_values, dtype=float),
         n_b=np.array(columns.n_b),
@@ -292,13 +640,42 @@ def load_library(path: str) -> list[LibraryEntry]:
     rhos    = data['rhos']
     Vs      = data['Vs']
     vectors = data['vectors']
+    n = len(kios)
+    def optional(name, default):
+        return data[name] if name in data.files else default
+    vis = optional('vis', np.asarray([None] * n, dtype=object))
+    weights = optional('weights', np.full(n, np.nan))
+    nominal_kios = optional('nominal_kios', kios)
+    nominal_rhos = optional('nominal_rhos', rhos)
+    nominal_Vs = optional('nominal_Vs', Vs)
+    pps = optional('pps', np.full(n, np.nan))
+    kio_eq5 = optional('kio_analytic_eq5', np.full(n, np.nan))
+    kio_se = optional('kio_measured_se', np.full(n, np.nan))
+    free = optional('is_free_water', np.zeros(n, dtype=bool))
+    entry_json = optional('entry_metadata_json', np.asarray(["{}"] * n))
     lib = []
-    for i in range(len(kios)):
+    for i in range(n):
+        try:
+            entry_meta = json.loads(str(entry_json[i]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            entry_meta = {}
+        vi = None if vis.dtype == object or not np.isfinite(vis[i]) else float(vis[i])
+        weight = None if not np.isfinite(weights[i]) else float(weights[i])
         lib.append(LibraryEntry(
             kio=float(kios[i]),
             rho=float(rhos[i]),
             V=float(Vs[i]),
             vector=vectors[i],
+            vi=vi,
+            weight=weight,
+            kio_nominal=float(nominal_kios[i]),
+            rho_nominal=float(nominal_rhos[i]),
+            V_nominal=float(nominal_Vs[i]),
+            pp=None if not np.isfinite(pps[i]) else float(pps[i]),
+            kio_analytic_eq5=None if not np.isfinite(kio_eq5[i]) else float(kio_eq5[i]),
+            kio_measured_se=None if not np.isfinite(kio_se[i]) else float(kio_se[i]),
+            is_free_water=bool(free[i]),
+            metadata=entry_meta,
         ))
     return lib
 
@@ -319,6 +696,18 @@ def load_library_meta(path: str) -> dict:
     data = np.load(path)
     meta = {}
 
+    if 'library_schema' in data.files:
+        meta['library_schema'] = str(data['library_schema'])
+    if 'has_weights' in data.files:
+        meta['has_weights'] = bool(data['has_weights'])
+    else:
+        meta['has_weights'] = False
+    if 'build_metadata_json' in data.files:
+        try:
+            meta['build_metadata'] = json.loads(str(data['build_metadata_json']))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            meta['build_metadata'] = None
+
     if 'pair_deltas' in data.files and 'pair_Deltas' in data.files:
         meta['format'] = 'v2'
         pair_deltas = np.asarray(data['pair_deltas'], dtype=float)
@@ -328,6 +717,7 @@ def load_library_meta(path: str) -> dict:
         meta['b_values'] = (list(np.asarray(data['b_values'], dtype=float))
                              if 'b_values' in data.files else None)
         meta['h_ms'] = float(data['h_ms']) if 'h_ms' in data.files else None
+        meta['has_free_water'] = bool(np.any(data['is_free_water'])) if 'is_free_water' in data.files else False
         return meta
 
     # ---- Legacy fixed-δ format: synthesize an equivalent delta_pairs ----
@@ -355,15 +745,18 @@ def library_summary(lib: list[LibraryEntry], meta: dict | None = None):
     if not lib:
         print("  (empty library)")
         return
-    kios = sorted(set(e.kio for e in lib))
-    rhos = sorted(set(e.rho for e in lib))
-    Vs   = sorted(set(e.V for e in lib))
-    vis  = sorted(set(round((e.rho/1e9)*(e.V*1e3), 4) for e in lib))
+    cellular = [e for e in lib if not e.is_free_water]
+    kios = sorted(set(e.kio for e in cellular))
+    rhos = sorted(set(e.rho for e in cellular))
+    Vs   = sorted(set(e.V for e in cellular))
+    vis  = sorted(set(round(e.realised_vi, 4) for e in cellular))
     print(f"  Entries: {len(lib)}")
     print(f"  kio  ({len(kios)}): {[f'{k:.1f}' for k in kios]}")
     print(f"  rho  ({len(rhos)}): {[f'{r/1e3:.0f}k' for r in rhos]}")
     print(f"  V    ({len(Vs)}):   {[f'{v:.2f}' for v in Vs]}")
-    print(f"  vi range: [{min(vis):.3f}, {max(vis):.3f}]")
+    if vis:
+        print(f"  vi range: [{min(vis):.3f}, {max(vis):.3f}]")
+    print(f"  free-water atom: {any(e.is_free_water for e in lib)}")
 
     vec_len = lib[0].vector.size
     if meta is not None:
@@ -450,7 +843,8 @@ def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
 
 def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
                                  n_b, vi_min, vi_max, rho_max,
-                                 fit_triples):
+                                 fit_triples, *, include_free_water=False,
+                                 return_weights=False, require_weights=False):
     """Apply candidate filtering and produce the masked, subset library matrix.
 
     Returns
@@ -458,10 +852,15 @@ def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
     lib_mat : (n_candidates, n_features)
     kios_arr, rhos_arr, Vs_arr : (n_candidates,)
     """
-    vis  = np.array([(e.rho / 1e9) * (e.V * 1e3) for e in library])
+    vis  = np.array([e.realised_vi for e in library])
     rhos = np.array([e.rho for e in library])
+    free = np.array([e.is_free_water for e in library], dtype=bool)
 
     mask = (vis >= vi_min) & (vis <= vi_max)
+    if include_free_water:
+        mask |= free
+    else:
+        mask &= ~free
     if rho_max is not None:
         mask &= (rhos <= rho_max)
 
@@ -484,7 +883,84 @@ def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
     rhos_arr = np.array([e.rho for e in lib_entries])
     Vs_arr   = np.array([e.V   for e in lib_entries])
 
-    return lib_mat, kios_arr, rhos_arr, Vs_arr
+    if not return_weights:
+        return lib_mat, kios_arr, rhos_arr, Vs_arr
+    weights = np.array([
+        np.nan if e.weight is None else float(e.weight) for e in lib_entries
+    ], dtype=float)
+    if require_weights and not np.all(np.isfinite(weights) & (weights > 0.0)):
+        raise ValueError(
+            "Bayesian fitting requires positive per-entry quadrature weights. "
+            "This library is legacy/unweighted; rebuild it with the remediation grid."
+        )
+    return lib_mat, kios_arr, rhos_arr, Vs_arr, weights
+
+
+def edge_railing_diagnostics(
+    kio_values: np.ndarray,
+    rho_values: np.ndarray,
+    V_values: np.ndarray,
+    library: list[LibraryEntry],
+    *,
+    vi_min: float,
+    vi_max: float,
+    rho_max: float | None = None,
+    include_free_water: bool = False,
+) -> dict:
+    """Summarise returned fits at the *actual* candidate-library edges.
+
+    The diagnostic is deliberately based on realised entry labels rather
+    than the nominal grid request.  That makes it sensitive to a build whose
+    Poisson geometry or direct exchange measurement did not land where its
+    requested coordinates suggested.  Free-water selections are reported as
+    their own category, never folded into a cellular lower-bound fraction.
+    """
+    vis = np.asarray([e.realised_vi for e in library], dtype=float)
+    rhos = np.asarray([e.rho for e in library], dtype=float)
+    free = np.asarray([e.is_free_water for e in library], dtype=bool)
+    candidate = (vis >= float(vi_min)) & (vis <= float(vi_max)) & ~free
+    if include_free_water:
+        candidate |= free
+    if rho_max is not None:
+        candidate &= rhos <= float(rho_max)
+    cellular = [entry for entry, keep in zip(library, candidate) if keep and not entry.is_free_water]
+    if not cellular:
+        raise ValueError("edge diagnostic has no cellular candidate entries")
+
+    kio = np.asarray(kio_values, dtype=float)
+    rho = np.asarray(rho_values, dtype=float)
+    volume = np.asarray(V_values, dtype=float)
+    if not (kio.shape == rho.shape == volume.shape):
+        raise ValueError("kio, rho and V diagnostic arrays must have the same shape")
+    n_total = int(kio.size)
+    free_selected = (~np.isfinite(kio)) & (rho == 0.0) & (volume == 0.0)
+
+    def one(name: str, returned: np.ndarray, grid: np.ndarray) -> dict:
+        finite = np.isfinite(returned) & ~free_selected
+        lower = float(np.min(grid))
+        upper = float(np.max(grid))
+        # Directly measured entries are floating point values, so a tight
+        # isclose test is more appropriate than relying on printed rounding.
+        at_lower = finite & np.isclose(returned, lower, rtol=1e-10, atol=1e-12)
+        at_upper = finite & np.isclose(returned, upper, rtol=1e-10, atol=1e-12)
+        denom = max(n_total, 1)
+        return {
+            "lower_value": lower,
+            "upper_value": upper,
+            "at_lower_count": int(np.count_nonzero(at_lower)),
+            "at_upper_count": int(np.count_nonzero(at_upper)),
+            "at_lower_fraction": float(np.count_nonzero(at_lower) / denom),
+            "at_upper_fraction": float(np.count_nonzero(at_upper) / denom),
+        }
+
+    return {
+        "n_voxels": n_total,
+        "free_water_count": int(np.count_nonzero(free_selected)),
+        "free_water_fraction": float(np.count_nonzero(free_selected) / max(n_total, 1)),
+        "rho": one("rho", rho, np.asarray([e.rho for e in cellular], dtype=float)),
+        "V": one("V", volume, np.asarray([e.V for e in cellular], dtype=float)),
+        "kio": one("kio", kio, np.asarray([e.kio for e in cellular], dtype=float)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +974,7 @@ def match_voxels_batch(
     fit_triples,
     log_space=False, s_floor=1e-3,
     vi_min=0.5, vi_max=0.95, rho_max=None,
+    include_free_water=False,
     use_gpu=None,
 ):
     """Log-space nearest-neighbour matching, S0 fixed (data already
@@ -515,7 +992,7 @@ def match_voxels_batch(
 
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
         library, lib_delta_pairs, lib_b_values, n_b, vi_min, vi_max, rho_max,
-        fit_triples)
+        fit_triples, include_free_water=include_free_water)
 
     if log_space:
         measured = np.log(np.clip(measured_batch, s_floor, 1.0))
@@ -551,6 +1028,7 @@ def match_voxels_batch_fits0(
     lib_delta_pairs, lib_b_values, n_b,
     fit_triples,
     vi_min=0.5, vi_max=0.95, rho_max=None,
+    include_free_water=False,
     use_gpu=None,
 ):
     """Match un-normalized signals with S0 as a free per-voxel linear param.
@@ -569,7 +1047,7 @@ def match_voxels_batch_fits0(
     """
     lib_mat, kios_arr, rhos_arr, Vs_arr = _build_candidate_lib_matrix(
         library, lib_delta_pairs, lib_b_values, n_b, vi_min, vi_max, rho_max,
-        fit_triples)
+        fit_triples, include_free_water=include_free_water)
 
     M = raw_signal.astype(np.float64)            # (n_vox, n_feat)
     R = lib_mat.astype(np.float64)               # (n_lib, n_feat)
