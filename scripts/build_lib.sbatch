@@ -39,8 +39,11 @@ if [[ "${PYTHON_BIN}" != */madiEnv/bin/python ]]; then
 fi
 python -c "import numpy, scipy, numba, nibabel; from numba import cuda; print('imports OK'); print('CUDA:', cuda.is_available()); print('GPU:', cuda.get_current_device().name.decode() if cuda.is_available() else 'NONE')"
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-/scratch/jfigger/madi/Custom_MADI}"
-cd "${REPO_ROOT}"
+if [[ -z "${SLURM_SUBMIT_DIR:-}" ]]; then
+  echo "ERROR: SLURM_SUBMIT_DIR is not set; this launcher must be submitted with sbatch." >&2
+  exit 2
+fi
+cd "${SLURM_SUBMIT_DIR}"
 # Module-style invocation below places this repository root on Python's import
 # path.  This avoids inheriting or exporting PYTHONPATH while retaining the
 # clean ``--export=NONE`` Sol environment.
