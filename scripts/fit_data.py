@@ -52,7 +52,17 @@ EXAMPLES
       --rician-correct
 """
 
-import argparse, os, sys, time
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 import numpy as np
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -63,12 +73,14 @@ from madi.library  import (build_library, build_library_from_triplets,
                             load_library, load_library_meta,
                             match_voxels_batch, match_voxels_batch_fits0,
                             library_summary, make_remediation_log_grid,
-                            edge_railing_diagnostics)
+                            edge_railing_diagnostics, resolve_grid_columns,
+                            B_SNAP_TOL_S_MM2, TIMING_SNAP_TOL_MS)
 from madi.fitters  import (bayes_fit, amico_fit, estimate_sigma_m,
                            calibrate_sigma_m,
                            DEFAULT_SIGMA_M, DEFAULT_LAMBDA1, DEFAULT_LAMBDA2)
 from madi.signal   import signals_to_flat
 from madi import fitters_gpu
+from madi.biomarkers import derive_voxelwise_biomarkers
 
 
 # ===================================================================
@@ -94,7 +106,292 @@ B0_THRESHOLD = 50.0
 # clustered with its neighbors first) against the library's b-value grid:
 # if the nearest library b-value is within B_LIB_MATCH_TOL, that volume is
 # snapped to it; otherwise the volume is discarded from the fit entirely.
-B_LIB_MATCH_TOL = 30.0
+B_LIB_MATCH_TOL = B_SNAP_TOL_S_MM2
+
+# Direction-contract values deliberately mirror the language of the
+# remediation request.  The scheme is a property of the input acquisition,
+# not a fitting preference: a macroscopically isotropic MADI library cannot
+# silently be compared to an unlabelled single-direction image.
+DIRECTION_SCHEMES = (
+    "single_direction",
+    "orthogonal_3",
+    "powder_N",
+    "prescanner_averaged",
+)
+DIRECTION_ISOTROPY_SPREAD_MAX = 0.15
+MADI_III_SINGLE_DIRECTION_BIAS = {
+    "context": "Reported mean change when moving from one encoding direction to three in MADI III.",
+    "ADC_percent": 18.1,
+    "kioV_percent": 16.9,
+    "kio_percent": -4.2,
+    "rho_percent": -7.6,
+    "V_percent": 1.1,
+    "vi_percent": -8.4,
+}
+
+
+# ===================================================================
+# Fit-run provenance and terminal capture
+# ===================================================================
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"cannot JSON-serialise {type(value)!r}")
+
+
+def _sha256_file(path: str | None) -> str | None:
+    """Return a streaming SHA-256 without loading an image/library into RAM."""
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _file_provenance(path: str | None) -> dict | None:
+    if path is None:
+        return None
+    absolute = os.path.abspath(path)
+    exists = os.path.isfile(absolute)
+    return {
+        "path": absolute,
+        "exists": exists,
+        "size_bytes": os.path.getsize(absolute) if exists else None,
+        "sha256": _sha256_file(absolute) if exists else None,
+    }
+
+
+def _git_revision() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _environment_provenance() -> dict:
+    versions = {"python": platform.python_version(), "numpy": np.__version__}
+    for module_name in ("scipy", "nibabel", "numba"):
+        try:
+            module = __import__(module_name)
+            versions[module_name] = getattr(module, "__version__", "unknown")
+        except Exception:
+            versions[module_name] = None
+    gpu = None
+    if fitters_gpu.HAS_CUDA:
+        try:
+            from numba import cuda
+            gpu = cuda.get_current_device().name.decode()
+        except Exception as exc:  # provenance must never abort a successful fit
+            gpu = f"CUDA available; device query failed: {exc}"
+    return {
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "python_executable": sys.executable,
+        "package_versions": versions,
+        "gpu": gpu,
+        "code_commit_hash": _git_revision(),
+    }
+
+
+def _finite_summary(values) -> dict | None:
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return {
+        "n": int(arr.size),
+        "min": float(np.min(arr)),
+        "median": float(np.median(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _library_provenance(path: str, meta: dict, library) -> dict:
+    """Collect the immutable library facts required to interpret one fit."""
+    build = meta.get("build_metadata") or {}
+    escape_fractions = []
+    kio_ses = []
+    for entry in library:
+        boundary = entry.metadata.get("boundary", {}) if entry.metadata else {}
+        if "escape_fraction" in boundary:
+            escape_fractions.append(boundary["escape_fraction"])
+        if entry.kio_measured_se is not None:
+            kio_ses.append(entry.kio_measured_se)
+    return {
+        "filename": os.path.abspath(path),
+        "sha256": _sha256_file(path),
+        "build_commit_hash": build.get("code_commit_hash"),
+        "build_configuration": build,
+        "library_schema": meta.get("library_schema"),
+        "has_per_entry_weights": bool(meta.get("has_weights")),
+        "phase_model": build.get("phase_model"),
+        "checkpoint_h_ms": meta.get("h_ms"),
+        "delta_pairs": meta.get("delta_pairs"),
+        "b_values_s_mm2": meta.get("b_values"),
+        "escape_statistics_summary": _finite_summary(escape_fractions),
+        "per_entry_monte_carlo_error": {
+            "method": "stored tagged-first-exit Poisson standard error",
+            "kio_measured_se_s_inv": _finite_summary(kio_ses),
+        },
+    }
+
+
+class _TeeStream:
+    """Mirror a text stream to the terminal and one run log file."""
+
+    def __init__(self, terminal, log_file):
+        self._terminal = terminal
+        self._log_file = log_file
+
+    def write(self, text):
+        self._terminal.write(text)
+        self._log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        self._terminal.flush()
+        self._log_file.flush()
+
+    def isatty(self):
+        return self._terminal.isatty()
+
+
+class FitRunArtifacts:
+    """Exactly two sidecars for a fit: one JSON record and one full log."""
+
+    def __init__(self, out_dir: str, run_name: str):
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name).strip("._")
+        self.run_name = safe_name or "madi_fit"
+        self.out_dir = os.path.abspath(out_dir)
+        self.json_path = os.path.join(self.out_dir, f"{self.run_name}.json")
+        self.log_path = os.path.join(self.out_dir, f"{self.run_name}.log")
+        self._stdout = None
+        self._stderr = None
+        self._log_file = None
+        self._finalized = False
+        self.record: dict = {
+            "schema": "madi-fit-run-v1",
+            "run_name": self.run_name,
+            "status": "running",
+            "start_timestamp": _utc_now(),
+        }
+
+    def start(self) -> None:
+        os.makedirs(self.out_dir, exist_ok=True)
+        self._log_file = open(self.log_path, "w", encoding="utf-8", buffering=1)
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout = _TeeStream(self._stdout, self._log_file)
+        sys.stderr = _TeeStream(self._stderr, self._log_file)
+
+    def update(self, **fields) -> None:
+        self.record.update(fields)
+
+    def mark_success(self) -> None:
+        self.record["status"] = "completed"
+
+    def mark_error(self, exc: BaseException) -> None:
+        self.record["status"] = "failed"
+        self.record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        if self.record.get("status") == "running":
+            self.record["status"] = "incomplete"
+        self.record["end_timestamp"] = _utc_now()
+        self.record.setdefault("environment", _environment_provenance())
+        try:
+            with open(self.json_path, "w", encoding="utf-8") as fh:
+                json.dump(self.record, fh, indent=2, sort_keys=True,
+                          default=_json_default)
+                fh.write("\n")
+        finally:
+            if self._stdout is not None:
+                sys.stdout = self._stdout
+            if self._stderr is not None:
+                sys.stderr = self._stderr
+            if self._log_file is not None:
+                self._log_file.close()
+
+
+_ACTIVE_FIT_ARTIFACTS: FitRunArtifacts | None = None
+
+
+def _start_fit_artifacts(out_dir: str, run_name: str | None) -> FitRunArtifacts:
+    global _ACTIVE_FIT_ARTIFACTS
+    derived_name = run_name or os.path.basename(os.path.normpath(out_dir)) or "madi_fit"
+    artifacts = FitRunArtifacts(out_dir, derived_name)
+    artifacts.start()
+    _ACTIVE_FIT_ARTIFACTS = artifacts
+    return artifacts
+
+
+def _snap_summary(events: list[dict]) -> dict:
+    b_events = [event for event in events if event.get("axis") == "b"]
+    timing_events = [event for event in events if event.get("axis") == "timing"]
+    return {
+        "n_snapped_b_shells": len(b_events),
+        "n_snapped_timing_pairs": len(timing_events),
+        "max_b_abs_offset_s_mm2": max(
+            (float(event["abs_offset"]) for event in b_events), default=0.0),
+        "max_timing_abs_offset_ms": {
+            "delta": max(
+                (float(event["abs_offset"]["delta_ms"]) for event in timing_events),
+                default=0.0),
+            "Delta": max(
+                (float(event["abs_offset"]["Delta_ms"]) for event in timing_events),
+                default=0.0),
+        },
+    }
+
+
+def _deduplicate_snap_events(events: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for event in events:
+        key = json.dumps(event, sort_keys=True, default=_json_default)
+        if key not in seen:
+            seen.add(key)
+            unique.append(event)
+    return unique
+
+
+def _print_snap_events(events: list[dict]) -> None:
+    for event in events:
+        if event["axis"] == "b":
+            print(
+                "  SNAP[b]: requested "
+                f"{event['requested']:g} s/mm² → stored {event['used']:g} s/mm² "
+                f"(|offset|={event['abs_offset']:g} s/mm², "
+                f"{event['rel_offset']:.3%})")
+        else:
+            requested = event["requested"]
+            used = event["used"]
+            absolute = event["abs_offset"]
+            relative = event["rel_offset"]
+            print(
+                "  SNAP[timing]: requested "
+                f"(δ={requested['delta_ms']:g}, Δ={requested['Delta_ms']:g}) ms → "
+                f"stored (δ={used['delta_ms']:g}, Δ={used['Delta_ms']:g}) ms "
+                f"(|offset|=(δ {absolute['delta_ms']:g}, Δ {absolute['Delta_ms']:g}) ms; "
+                f"relative=(δ {relative['delta']:.3%}, Δ {relative['Delta']:.3%}))")
 
 
 # ===================================================================
@@ -238,7 +535,8 @@ def parse_z_slice(s):
 # ===================================================================
 
 def parse_bvals(path: str, lib_b_values, b0_thresh: float = B0_THRESHOLD,
-                tol: float = B_LIB_MATCH_TOL):
+                tol: float = B_LIB_MATCH_TOL, *,
+                return_snap_events: bool = False):
     """Read an FSL-format bvals file and match each volume directly against
     the library's b-value grid.
 
@@ -278,6 +576,9 @@ def parse_bvals(path: str, lib_b_values, b0_thresh: float = B0_THRESHOLD,
     n_dropped : int
         Number of non-b0 volumes discarded (too far from every library
         b-value).
+    snap_events : list[dict], optional
+        Returned only when ``return_snap_events=True``. Events are grouped by
+        distinct raw b-value and identify the canonical library b used.
     """
     raw = np.loadtxt(path).ravel().astype(float)
     if raw.size == 0:
@@ -309,6 +610,23 @@ def parse_bvals(path: str, lib_b_values, b0_thresh: float = B0_THRESHOLD,
             shells.append((float(lb), np.sort(idx)))
     shells.sort(key=lambda x: x[0])
 
+    events: list[dict] = []
+    for requested in np.unique(nz_vals[keep]):
+        j = int(np.argmin(np.abs(lib_arr - requested)))
+        used = float(lib_arr[j])
+        offset = abs(used - float(requested))
+        if offset > 1e-12:
+            events.append({
+                "axis": "b",
+                "requested": float(requested),
+                "used": used,
+                "abs_offset": offset,
+                "rel_offset": offset / max(abs(float(requested)), 1e-12),
+                "n_volumes": int(np.count_nonzero(nz_vals[keep] == requested)),
+            })
+
+    if return_snap_events:
+        return raw, b0_idx, shells, n_dropped, events
     return raw, b0_idx, shells, n_dropped
 
 
@@ -339,31 +657,155 @@ def parse_bvecs(path: str, n_vols_expected: int):
     return arr
 
 
-def check_direction_uniformity(bvecs, idx, label=""):
-    """Loose check that a set of directions is reasonably uniformly
-    distributed on the sphere.  Prints a warning if highly biased.
+def _unique_antipodal_direction_count(unit_vectors: np.ndarray,
+                                      *, tolerance: float = 1e-4) -> int:
+    """Count directions after treating ``v`` and ``-v`` as equivalent."""
+    representatives: list[np.ndarray] = []
+    for vector in unit_vectors.T:
+        if not any(abs(float(np.dot(vector, other))) >= 1.0 - tolerance
+                   for other in representatives):
+            representatives.append(vector)
+    return len(representatives)
 
-    Heuristic: the mean of the unit vectors (after antipodal symmetry
-    folding) should have small magnitude for an isotropic set.  We use
-    the resultant length of v_k ⊗ v_k (rank-2 tensor) eigenvalue spread:
-    isotropic → all eigenvalues ≈ 1/3.
-    """
-    if bvecs is None or len(idx) < 3:
-        return
-    v = bvecs[:, idx]                   # (3, n)
-    norms = np.linalg.norm(v, axis=0)
+
+def b_tensor_diagnostic(bvecs: np.ndarray | None, idx: np.ndarray) -> dict:
+    """Describe the b-tensor direction sampling for one retained shell."""
+    report = {
+        "bvecs_available": bvecs is not None,
+        "n_volumes": int(len(idx)),
+        "n_valid_bvecs": 0,
+        "n_unique_directions": None,
+        "b_tensor": None,
+        "eigenvalues": None,
+        "eigenvalue_spread": None,
+        "isotropic": None,
+    }
+    if bvecs is None:
+        return report
+    vectors = np.asarray(bvecs[:, idx], dtype=float)
+    norms = np.linalg.norm(vectors, axis=0)
     keep = norms > 1e-6
-    if keep.sum() < 3:
-        return
-    v = v[:, keep] / norms[keep]
-    T = (v @ v.T) / v.shape[1]          # (3,3) rank-2 tensor
-    eigvals = np.sort(np.linalg.eigvalsh(T))[::-1]
-    spread = eigvals[0] - eigvals[2]
-    # spread = 0 → perfect isotropy; spread ≥ ~0.4 → strongly biased
-    if spread > 0.4:
-        print(f"    ⚠ {label}: directions look biased "
-              f"(eigenvalue spread = {spread:.2f}, isotropic = 0). "
-              f"Powder average may be skewed.")
+    if not np.any(keep):
+        return report
+    unit = vectors[:, keep] / norms[keep]
+    tensor = (unit @ unit.T) / unit.shape[1]
+    eigenvalues = np.sort(np.linalg.eigvalsh(tensor))[::-1]
+    spread = float(eigenvalues[0] - eigenvalues[2])
+    report.update(
+        n_valid_bvecs=int(unit.shape[1]),
+        n_unique_directions=_unique_antipodal_direction_count(unit),
+        b_tensor=tensor.tolist(),
+        eigenvalues=eigenvalues.tolist(),
+        eigenvalue_spread=spread,
+        isotropic=bool(
+            unit.shape[1] >= 3 and spread <= DIRECTION_ISOTROPY_SPREAD_MAX),
+    )
+    return report
+
+
+def _direction_contract(
+    declared_scheme: str | None,
+    shell_reports: list[dict],
+) -> dict:
+    """Infer/validate the required acquisition-direction declaration.
+
+    A direction-free MADI library represents an isotropic/powder-averaged
+    signal.  The validation intentionally operates on b-vectors rather than
+    merely counting images: three repeated collinear acquisitions are not an
+    orthogonal three-direction acquisition.
+    """
+    if declared_scheme is not None and declared_scheme not in DIRECTION_SCHEMES:
+        raise ValueError(f"unknown direction scheme {declared_scheme!r}")
+    if not shell_reports:
+        raise ValueError("no retained diffusion shells are available for direction validation")
+
+    all_have_bvecs = all(bool(report["bvecs_available"]) for report in shell_reports)
+    inferred = None
+    if all_have_bvecs:
+        counts = [int(report["n_unique_directions"] or 0) for report in shell_reports]
+        isotropic = [bool(report["isotropic"]) for report in shell_reports]
+        if all(count == 1 for count in counts):
+            inferred = "single_direction"
+        elif all(count == 3 for count in counts) and all(isotropic):
+            inferred = "orthogonal_3"
+        elif all(count >= 4 for count in counts) and all(isotropic):
+            inferred = "powder_N"
+
+    if declared_scheme is None:
+        if inferred is None:
+            raise ValueError(
+                "--direction-scheme is required because the b-vectors do not "
+                "unambiguously identify single_direction, orthogonal_3, or "
+                "an isotropic powder_N acquisition.")
+        declared_scheme = inferred
+        inferred_from_bvecs = True
+        print(f"  Direction scheme inferred from b-vectors: {declared_scheme}")
+    else:
+        inferred_from_bvecs = False
+
+    warnings_list: list[str] = []
+    for report in shell_reports:
+        label = (f"δ={report['delta_ms']:g}, Δ={report['Delta_ms']:g}, "
+                 f"b={report['b_s_mm2']:g}")
+        available = bool(report["bvecs_available"])
+        n_unique = report["n_unique_directions"]
+        isotropic = report["isotropic"]
+        if declared_scheme == "single_direction":
+            if available and n_unique != 1:
+                raise ValueError(
+                    f"{label}: declared single_direction but b-vectors contain "
+                    f"{n_unique} unique directions.")
+            if not available:
+                warnings_list.append(
+                    f"{label}: single-direction declaration cannot be verified; bvecs absent.")
+        elif declared_scheme == "orthogonal_3":
+            if not available:
+                raise ValueError(
+                    f"{label}: orthogonal_3 requires bvecs for verification.")
+            if n_unique != 3:
+                raise ValueError(
+                    f"{label}: declared orthogonal_3 but b-vectors contain "
+                    f"{n_unique} unique directions.")
+            if not isotropic:
+                warnings_list.append(
+                    f"{label}: declared orthogonal_3 is degenerate "
+                    f"(b-tensor eigenvalue spread={report['eigenvalue_spread']:.3f}).")
+        elif declared_scheme == "powder_N":
+            if not available:
+                raise ValueError(
+                    f"{label}: powder_N requires bvecs for isotropy verification.")
+            if n_unique is None or n_unique < 4:
+                raise ValueError(
+                    f"{label}: declared powder_N but b-vectors contain fewer than "
+                    "four unique directions.")
+            if not isotropic:
+                warnings_list.append(
+                    f"{label}: declared powder_N is degenerate "
+                    f"(b-tensor eigenvalue spread={report['eigenvalue_spread']:.3f}).")
+        else:  # prescanner_averaged
+            if available and n_unique not in (None, 1):
+                warnings_list.append(
+                    f"{label}: declared prescanner_averaged but raw b-vectors "
+                    f"contain {n_unique} directions; verify the input was actually averaged.")
+
+    for message in warnings_list:
+        print(f"  ⚠ Direction contract: {message}")
+    single_direction_bias = None
+    if declared_scheme == "single_direction":
+        single_direction_bias = dict(MADI_III_SINGLE_DIRECTION_BIAS)
+        print(
+            "  ⚠ SINGLE-DIRECTION INPUT: these maps are not trace/powder maps. "
+            "MADI III reported the following one→three-direction shifts: "
+            "ADC +18.1%, k_ioV +16.9%, k_io -4.2%, rho -7.6%, "
+            "V +1.1%, v_i -8.4%.")
+    return {
+        "declared_scheme": declared_scheme,
+        "inferred_from_bvecs": inferred_from_bvecs,
+        "isotropy_spread_threshold": DIRECTION_ISOTROPY_SPREAD_MAX,
+        "shells": shell_reports,
+        "warnings": warnings_list,
+        "single_direction_madi_iii_bias_percent": single_direction_bias,
+    }
 
 
 # ===================================================================
@@ -445,6 +887,8 @@ def load_dwi_and_average(input_specs, mask_path,
                          noise_bg_dilate_iters=16,
                          avg_s0=False,
                          return_raw=False,
+                         return_metadata=False,
+                         direction_scheme=None,
                          z_slice=None,
                          b_tol=B_LIB_MATCH_TOL):
     """Load DWI NIfTIs, derive (δ, Δ, b) layout from each input's bvals,
@@ -488,6 +932,13 @@ def load_dwi_and_average(input_specs, mask_path,
     avg_s0 : bool
         If True, replace each Δ's S0 with the grand mean across Δs.
     return_raw : bool
+    return_metadata : bool
+        Return acquisition provenance, snap events, and direction-contract
+        diagnostics even when an un-normalised raw signal is not needed.
+    direction_scheme : str or None
+        Declared acquisition direction convention. Required by the CLI fit
+        path; direct library/testing callers may omit it when
+        ``return_metadata`` is False.
     b_tol : float
         Tolerance for matching data b-values to library b-values.
 
@@ -496,7 +947,9 @@ def load_dwi_and_average(input_specs, mask_path,
     measured : (n_voxels, n_features) ndarray  — S/S0 ratios
     fit_triples : list of (δ, Δ, b) tuples in the column order of ``measured``
     affine, mask_indices, shape
-    extras (if return_raw) : dict with 'raw', 's0', 'sigma'
+    extras (if return_raw or return_metadata) : dict
+        Includes acquisition provenance, snapping and direction diagnostics;
+        contains ``raw`` only when ``return_raw`` is True.
     sigma_used : float
         The noise standard deviation used for fitting.
     """
@@ -569,6 +1022,9 @@ def load_dwi_and_average(input_specs, mask_path,
     all_b0_idx       = []         # list of int arrays
     all_shells_kept  = []         # list of [(b, idx)] retained against library
     all_small_delta  = []         # list of resolved per-scan δ [ms]
+    all_snap_events: list[dict] = []
+    direction_shell_reports: list[dict] = []
+    input_provenance: list[dict] = []
 
     for di, (delta_small_in, delta_ms, dwi_path, bvals_path, bvecs_path) \
             in enumerate(input_specs):
@@ -581,6 +1037,7 @@ def load_dwi_and_average(input_specs, mask_path,
         n_vols = data.shape[-1]
         print(f"    DWI shape: {data.shape}")
 
+        n_dropped = 0
         if bvals_path is None:
             # Legacy path: rebuild shell layout from LEGACY_SHELLS
             if n_vols != LEGACY_N_VOLS:
@@ -601,8 +1058,19 @@ def load_dwi_and_average(input_specs, mask_path,
                 nearest = min(lib_b_values, key=lambda lb: abs(lb - b))
                 if abs(nearest - b) <= b_tol:
                     kept.append((float(nearest), idx))
+                    offset = abs(float(nearest) - float(b))
+                    if offset > 1e-12:
+                        all_snap_events.append({
+                            "axis": "b",
+                            "requested": float(b),
+                            "used": float(nearest),
+                            "abs_offset": offset,
+                            "rel_offset": offset / max(abs(float(b)), 1e-12),
+                            "n_volumes": int(len(idx)),
+                        })
                 else:
                     dropped.append(b)
+                    n_dropped += int(len(idx))
             if dropped:
                 print(f"    ⚠ dropping legacy shells not in library: "
                       f"{[f'{b:g}' for b in dropped]} "
@@ -615,8 +1083,9 @@ def load_dwi_and_average(input_specs, mask_path,
             print(f"    LEGACY mode: 1 b=0 vol, {len(kept)} shells "
                   f"matched to library")
         else:
-            bvals, b0_idx, shells, n_dropped = parse_bvals(
-                bvals_path, lib_b_values, tol=b_tol)
+            bvals, b0_idx, shells, n_dropped, snap_events = parse_bvals(
+                bvals_path, lib_b_values, tol=b_tol, return_snap_events=True)
+            all_snap_events.extend(snap_events)
             if bvals.size != n_vols:
                 raise ValueError(
                     f"bvals length ({bvals.size}) ≠ DWI volumes ({n_vols}) "
@@ -636,18 +1105,31 @@ def load_dwi_and_average(input_specs, mask_path,
                     f"b-value within {b_tol:g} s/mm² "
                     f"(library: {sorted(lib_b_values)}).")
 
-            # Optional bvecs uniformity check
-            bvecs = parse_bvecs(bvecs_path, n_vols_expected=n_vols)
-            if bvecs is not None:
-                for b, idx in shells:
-                    check_direction_uniformity(bvecs, idx,
-                                               label=f"Δ={delta_ms:g}, b={int(b)}")
-
             kept = shells
+
+        bvecs = parse_bvecs(bvecs_path, n_vols_expected=n_vols)
+        for b, idx in kept:
+            direction_report = b_tensor_diagnostic(bvecs, idx)
+            direction_report.update(
+                delta_ms=float(delta_small),
+                Delta_ms=float(delta_ms),
+                b_s_mm2=float(b),
+            )
+            direction_shell_reports.append(direction_report)
 
         all_data.append(data)
         all_b0_idx.append(b0_idx)
         all_shells_kept.append(kept)
+        input_provenance.append({
+            "declared_timing": {"delta_ms": float(delta_small), "Delta_ms": float(delta_ms)},
+            "dwi": _file_provenance(dwi_path),
+            "bvals": _file_provenance(bvals_path),
+            "bvecs": _file_provenance(bvecs_path),
+            "shape": [int(v) for v in data.shape],
+            "voxel_dimensions_mm": [float(v) for v in img.header.get_zooms()[:3]],
+            "n_b0_volumes": int(len(b0_idx)),
+            "n_dropped_nonzero_volumes": int(n_dropped),
+        })
 
     # ----------------------------------------------------------------
     # Build the column ordering: (Δ, b) pairs sorted by Δ then by b
@@ -744,14 +1226,29 @@ def load_dwi_and_average(input_specs, mask_path,
             col += 1
     assert col == n_features
 
-    if return_raw:
+    direction_contract = None
+    if return_metadata:
+        direction_contract = _direction_contract(direction_scheme, direction_shell_reports)
+
+    if return_raw or return_metadata:
         s0_ref = np.mean(np.stack(s0_used, axis=0), axis=0)
         # Mean number of averaged directions per kept (Δ,b) shell — used to
         # propagate Rician σ through shell averaging when auto-estimating σ_m.
         n_dir = [len(idx) for kept in all_shells_kept for _, idx in kept]
         mean_n_dir = float(np.mean(n_dir)) if n_dir else 1.0
-        extras = dict(raw=raw_signal, s0=s0_ref, sigma=sigma_used,
-                      mean_n_dir=mean_n_dir, s0_median=float(np.median(s0_ref)))
+        extras = dict(
+            s0=s0_ref,
+            sigma=sigma_used,
+            mean_n_dir=mean_n_dir,
+            s0_median=float(np.median(s0_ref)),
+            rician_correction_applied=bool(rician_correct and sigma_used is not None),
+            direction_contract=direction_contract,
+            snap_events=_deduplicate_snap_events(all_snap_events),
+            input_provenance=input_provenance,
+            mask_provenance=_file_provenance(mask_path),
+        )
+        if return_raw:
+            extras["raw"] = raw_signal
         return measured, fit_triples, affine, mask_idx, shape, extras, sigma_used
 
     return measured, fit_triples, affine, mask_idx, shape, sigma_used
@@ -767,6 +1264,105 @@ def save_map(data_1d, mask_idx, shape, affine, path, dtype=np.float32):
     vol[mask_idx] = data_1d.astype(dtype)
     nib.save(nib.Nifti1Image(vol, affine), path)
     print(f"  Saved {path}")
+
+
+def save_derived_biomarker_maps(kio_map, rho_map, V_map,
+                                mask_idx, shape, affine, out_dir: str) -> list[str]:
+    """Write voxel-first MADI derived endpoints and return their filenames."""
+    biomarkers = derive_voxelwise_biomarkers(kio_map, rho_map, V_map)
+    outputs = {
+        "vi_map.nii.gz": biomarkers.vi,
+        "kioV_map.nii.gz": biomarkers.kioV,
+        "kioVrho_map.nii.gz": biomarkers.kioVrho,
+        "water_efflux_nmol_s_cell_map.nii.gz": biomarkers.water_efflux_nmol_s_cell,
+    }
+    for filename, values in outputs.items():
+        save_map(values, mask_idx, shape, affine, os.path.join(out_dir, filename))
+    return list(outputs)
+
+
+def _distribution_summary(values: np.ndarray) -> dict:
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"n_finite": 0}
+    return {
+        "n_finite": int(finite.size),
+        "min": float(np.min(finite)),
+        "median": float(np.median(finite)),
+        "p05": float(np.percentile(finite, 5)),
+        "p95": float(np.percentile(finite, 95)),
+        "max": float(np.max(finite)),
+    }
+
+
+def _record_fit_completion(
+    artifacts: FitRunArtifacts | None,
+    *,
+    args,
+    resolved_device: str,
+    fit_triples,
+    extras: dict,
+    sigma_used,
+    edge_summary: dict,
+    residual: np.ndarray,
+    primary_maps: list[str],
+    derived_maps: list[str],
+    method_metadata: dict | None = None,
+) -> None:
+    """Fill the single structured sidecar at the successful end of a fit."""
+    if artifacts is None:
+        return
+    artifacts.update(
+        fit_configuration={
+            "method": args.method,
+            "device": resolved_device,
+            "linear_or_log_space": "log" if args.log_space else "linear",
+            "S0_mode": "free" if args.fit_s0 else "fixed",
+            "rician_correction": bool(extras.get("rician_correction_applied")),
+            "noise_sigma": sigma_used,
+            "masks_applied": {
+                "mask": extras.get("mask_provenance"),
+                "z_slice": args.z_slice,
+            },
+            "direction_scheme": extras.get("direction_contract"),
+            "fit_triples_delta_Delta_b": [
+                [float(delta), float(Delta), float(b)] for delta, Delta, b in fit_triples
+            ],
+            "grid_edge_policy": {
+                "vi_min": float(args.vi_min),
+                "vi_max": float(args.vi_max),
+                "rho_max": args.rho_max,
+                "include_free_water": bool(args.include_free_water),
+                "warning_fraction": float(args.edge_warning_fraction),
+            },
+            "tie_breaking": "first array-order entry among exact minima (numpy.argmin)",
+            "rng_seed": int(args.seed),
+            "method_options": method_metadata or {},
+        },
+        input_data_provenance={
+            "inputs": extras.get("input_provenance", []),
+            "mask": extras.get("mask_provenance"),
+            "voxel_dimensions_mm": [
+                item.get("voxel_dimensions_mm")
+                for item in extras.get("input_provenance", [])
+            ],
+        },
+        snap_events=extras.get("all_snap_events", []),
+        snap_summary=extras.get("snap_summary", {}),
+        results_summary={
+            "n_voxels": int(len(residual)),
+            "edge_railing": edge_summary,
+            "residual": _distribution_summary(residual),
+            "primary_maps_written": primary_maps,
+            "derived_maps_written": derived_maps,
+            "aggregation_order_assertion": (
+                "PASS: v_i, k_ioV, k_ioVrho, and water efflux were computed "
+                "voxel-wise before any ROI aggregation API can operate."
+            ),
+        },
+    )
+    artifacts.mark_success()
 
 
 # ===================================================================
@@ -883,6 +1479,16 @@ def main():
                          "if both are given.  Noise σ estimation still "
                          "uses the un-sliced volume.")
     ap.add_argument("--out", default="madi_output")
+    ap.add_argument("--run-name", default=None,
+                    help="Basename for the exactly two fit sidecars "
+                         "<run-name>.json and <run-name>.log. Defaults to "
+                         "the --out directory name.")
+    ap.add_argument("--direction-scheme", choices=DIRECTION_SCHEMES,
+                    default=None,
+                    help="Required acquisition contract: single_direction, "
+                         "orthogonal_3, powder_N, or prescanner_averaged. "
+                         "If omitted, the fitter proceeds only when b-vectors "
+                         "unambiguously infer it.")
 
     # -- NEW: Rician + S0 options --
     ap.add_argument("--rician-correct", action="store_true",
@@ -1022,6 +1628,29 @@ def main():
                          "a realised cellular library boundary (default 0.10).")
 
     args = ap.parse_args()
+    artifacts = None
+    if args.fit:
+        artifacts = _start_fit_artifacts(args.out, args.run_name)
+        artifacts.update(
+            command=[sys.executable, *sys.argv],
+            requested_cli_arguments=vars(args).copy(),
+            requested_fit_configuration={
+                "method": args.method,
+                "device": args.device,
+                "linear_or_log_space": "log" if args.log_space else "linear",
+                "fit_s0": bool(args.fit_s0),
+                "rician_correction_requested": bool(args.rician_correct),
+                "direction_scheme_requested": args.direction_scheme,
+                "vi_min": float(args.vi_min),
+                "vi_max": float(args.vi_max),
+                "rho_max": args.rho_max,
+                "include_free_water": bool(args.include_free_water),
+                "tie_breaking": "first array-order entry among exact minima (numpy.argmin)",
+                "b_snap_tolerance_s_mm2": B_LIB_MATCH_TOL,
+                "timing_snap_tolerance_ms": TIMING_SNAP_TOL_MS,
+                "rng_seed": int(args.seed),
+            },
+        )
     
     # # Manually overridden arguments matching the terminal command
     # args.fit = True
@@ -1438,6 +2067,9 @@ def main():
             print(f"ERROR: Library not found: {args.library}"); return
         lib = load_library(args.library)
         meta = load_library_meta(args.library)
+        if artifacts is not None:
+            print("  Hashing library for run provenance ...")
+            artifacts.update(library_provenance=_library_provenance(args.library, meta, lib))
         lib_delta_pairs = meta['delta_pairs']
         lib_n_b         = meta['n_b']
         lib_b_values    = meta['b_values']
@@ -1468,11 +2100,10 @@ def main():
             if not any(abs(d - ld) < 0.01 for ld in lib_deltas):
                 print(f"ERROR: Δ = {d} ms not in library {list(lib_deltas)}"); return
 
-        # Load data; produces fit_triples ----
-        # bayes/amico always need the extras dict (raw signal for --fit-s0,
-        # plus σ / S0 / n_dir for σ_m auto-estimation), so request it for any
-        # non-map method regardless of --fit-s0.
-        need_extras = args.fit_s0 or (args.method != "map")
+        # Load data; produces fit_triples.  Metadata is always returned for
+        # the required run sidecar, while the un-normalised raw matrix is
+        # retained only for a free-S0 fit to avoid doubling MAP memory use.
+        need_raw_signal = args.fit_s0
         print("\nLoading DWI data ...")
         z_slice_obj = parse_z_slice(args.z_slice)
         load_out = load_dwi_and_average(
@@ -1483,37 +2114,46 @@ def main():
             noise_sigma=args.noise_sigma,
             noise_bg_dilate_iters=args.noise_bg_dilate_iters,
             avg_s0=args.avg_s0,
-            return_raw=need_extras,
+            return_raw=need_raw_signal,
+            return_metadata=True,
+            direction_scheme=args.direction_scheme,
             z_slice=z_slice_obj,
         )
-
-
-        if need_extras:
-            measured, fit_triples, affine, mask_idx, shape, extras, sigma_used = load_out
-        else:
-            measured, fit_triples, affine, mask_idx, shape, sigma_used = load_out
-            extras = None
+        measured, fit_triples, affine, mask_idx, shape, extras, sigma_used = load_out
 
         n_features = len(fit_triples)
         print(f"\n  Feature vector ({n_features} cols):")
         for dd, D, b in fit_triples:
             print(f"    δ={dd:g} ms,  Δ={D:g} ms,  b={b:g} s/mm²")
 
-        # ---- Consistency check: every distinct (δ,Δ) the data asks for must
-        # land near a stored library pair. NEAREST-column matching accepts a
-        # small mismatch as error (per design), but a pair far off the grid
-        # almost always means a protocol/library mismatch -- fail loudly. ----
-        unique_dD = sorted(set((dd, D) for dd, D, _ in fit_triples))
-        for dd, D in unique_dD:
-            d2 = ((lib_pairs_arr[:, 0] - dd) ** 2
-                  + (lib_pairs_arr[:, 1] - D) ** 2)
-            j = int(np.argmin(d2))
-            nd, nD = lib_pairs_arr[j]
-            if abs(nd - dd) > 1.5 or abs(nD - D) > 1.5:
-                print(f"ERROR: (δ={dd:g}, Δ={D:g}) ms is not on the library "
-                      f"grid; nearest stored pair is (δ={nd:g}, Δ={nD:g}) ms. "
-                      f"Rebuild the library to cover this protocol, or fix "
-                      f"--small-delta / the input Δ."); return
+        # ---- Resolve, report, and record every allowed snap.  This uses the
+        # exact same resolver as the matcher; the resolver refuses values
+        # outside 30 s/mm² in b or 1.5 ms in either timing coordinate. ----
+        try:
+            _, column_snap_events = resolve_grid_columns(
+                fit_triples, lib_delta_pairs, lib_b_values, lib_n_b,
+                b_tol=B_LIB_MATCH_TOL, timing_tol=TIMING_SNAP_TOL_MS,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return
+        snap_events = _deduplicate_snap_events(
+            list(extras.get("snap_events", [])) + column_snap_events)
+        if snap_events:
+            print("\n  Acquisition snaps (no interpolation):")
+            _print_snap_events(snap_events)
+        else:
+            print("\n  Acquisition snaps: none (all requested coordinates are stored exactly).")
+        snap_summary = _snap_summary(snap_events)
+        extras["all_snap_events"] = snap_events
+        extras["snap_summary"] = snap_summary
+        print("  Snap summary: "
+              f"{snap_summary['n_snapped_b_shells']} b shell(s), "
+              f"{snap_summary['n_snapped_timing_pairs']} timing pair(s); "
+              f"max b offset={snap_summary['max_b_abs_offset_s_mm2']:g} s/mm², "
+              "max timing offsets="
+              f"(δ {snap_summary['max_timing_abs_offset_ms']['delta']:g}, "
+              f"Δ {snap_summary['max_timing_abs_offset_ms']['Delta']:g}) ms")
 
         # Underdetermination warning (3 free params: kio, ρ, V)
         if n_features < 3:
@@ -1530,6 +2170,7 @@ def main():
         #  METHOD DISPATCH
         # ================================================================
         if args.method == "map":
+            map_extra_maps: list[str] = []
             # ---- MAP: point-estimate matcher (UNCHANGED behaviour) ----
             if args.fit_s0:
                 raw_signal = extras['raw']
@@ -1550,9 +2191,11 @@ def main():
                 print(f"  Done in {time.time()-t0:.1f}s")
                 save_map(s0_fit_map, mask_idx, shape, affine,
                          os.path.join(args.out, "s0_fit_map.nii.gz"))
+                map_extra_maps.append("s0_fit_map.nii.gz")
                 s0_ratio = s0_fit_map / (extras['s0'] + 1e-10)
                 save_map(s0_ratio, mask_idx, shape, affine,
                          os.path.join(args.out, "s0_fit_over_measured.nii.gz"))
+                map_extra_maps.append("s0_fit_over_measured.nii.gz")
                 print(f"\n  Fitted-S0 / Measured-S0 ratio:")
                 print(f"    median = {np.median(s0_ratio):.3f}")
                 print(f"    5-95%  = [{np.percentile(s0_ratio, 5):.3f}, "
@@ -1615,6 +2258,30 @@ def main():
                      os.path.join(args.out, "V_map.nii.gz"))
             save_map(res_map, mask_idx, shape, affine,
                      os.path.join(args.out, "residual_map.nii.gz"))
+
+            derived_maps = save_derived_biomarker_maps(
+                kio_map, rho_map, V_map, mask_idx, shape, affine, args.out)
+            primary_maps = [
+                "kio_map.nii.gz", "rho_map.nii.gz", "V_map.nii.gz",
+                "residual_map.nii.gz", *map_extra_maps,
+            ]
+            _record_fit_completion(
+                artifacts,
+                args=args,
+                resolved_device=resolved_device,
+                fit_triples=fit_triples,
+                extras=extras,
+                sigma_used=sigma_used,
+                edge_summary=edge_summary,
+                residual=res_map,
+                primary_maps=primary_maps,
+                derived_maps=derived_maps,
+                method_metadata={
+                    "reference_mode": bool(
+                        not args.fit_s0 and not args.log_space and
+                        not args.rician_correct and args.method == "map"),
+                },
+            )
 
             print("\nDone!")
             return
@@ -1733,6 +2400,20 @@ def main():
         print(f"  V_std:    median={np.median(res['V_std']):.3f}")
         print(f"  n_eff:    median={np.median(res['n_eff']):.2f} "f"(effective # of library atoms per voxel)")
 
+        edge_summary = edge_railing_diagnostics(
+            res['kio_mean'], res['rho_mean'], res['V_mean'], lib,
+            vi_min=args.vi_min, vi_max=args.vi_max,
+            rho_max=args.rho_max,
+            include_free_water=args.include_free_water,
+        )
+        print("\n  Edge-railing diagnostic (reported estimator maps):")
+        for name in ("rho", "V", "kio"):
+            item = edge_summary[name]
+            print(f"    {name}: lower {item['at_lower_fraction']:.1%} "
+                  f"({item['lower_value']:.6g}), upper "
+                  f"{item['at_upper_fraction']:.1%} "
+                  f"({item['upper_value']:.6g})")
+
         # ---- Save maps ----
         print("\nSaving maps ...")
         save_map(res['kio_mean'], mask_idx, shape, affine,
@@ -1754,40 +2435,40 @@ def main():
             save_map(res['s0_fit'], mask_idx, shape, affine,
                      os.path.join(args.out, "s0_fit_map.nii.gz"))
 
-        # ---- JSON run metadata ----
-        import json
-        print("Saving metadata ...")
-
-        sigma = args.noise_sigma if args.noise_sigma is not None else sigma_used
-        meta_out = dict(
-            method=args.method,
-            device=resolved_device,
-            library=args.library,
-            inputs=[list(s) for s in input_specs],
-            fit_deltas=fit_deltas,
-            fit_triples=[[float(dd), float(D), float(b)]
-                         for dd, D, b in fit_triples],
-            n_features=n_features,
-            rician_correct=bool(args.rician_correct),
-            noise_sigma=sigma,
-            noise_bg_dilate_iters=(args.noise_bg_dilate_iters
-                                    if args.rician_correct and
-                                    args.noise_sigma is None else None),
-            avg_s0=bool(args.avg_s0),
-            fit_s0=bool(args.fit_s0),
-            log_space=bool(args.log_space),
-            vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
-            n_voxels=int(measured.shape[0]),
-            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-            **method_meta,
+        derived_maps = save_derived_biomarker_maps(
+            res['kio_mean'], res['rho_mean'], res['V_mean'],
+            mask_idx, shape, affine, args.out)
+        primary_maps = [
+            "kio_mean.nii.gz", "rho_mean.nii.gz", "V_mean.nii.gz",
+            "kio_std.nii.gz", "rho_std.nii.gz", "V_std.nii.gz",
+            "residual.nii.gz", "n_eff.nii.gz",
+        ]
+        if "s0_fit" in res:
+            primary_maps.append("s0_fit_map.nii.gz")
+        _record_fit_completion(
+            artifacts,
+            args=args,
+            resolved_device=resolved_device,
+            fit_triples=fit_triples,
+            extras=extras,
+            sigma_used=sigma_used,
+            edge_summary=edge_summary,
+            residual=res['residual'],
+            primary_maps=primary_maps,
+            derived_maps=derived_maps,
+            method_metadata=method_meta,
         )
-        meta_path = os.path.join(args.out, "fit_metadata.json")
-        with open(meta_path, "w") as fh:
-            json.dump(meta_out, fh, indent=2)
-        print(f"  Saved {meta_path}")
 
         print("\nDone!")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        if _ACTIVE_FIT_ARTIFACTS is not None:
+            _ACTIVE_FIT_ARTIFACTS.mark_error(exc)
+        raise
+    finally:
+        if _ACTIVE_FIT_ARTIFACTS is not None:
+            _ACTIVE_FIT_ARTIFACTS.finalize()

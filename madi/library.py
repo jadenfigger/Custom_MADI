@@ -784,23 +784,26 @@ def library_summary(lib: list[LibraryEntry], meta: dict | None = None):
 # Matching helpers — NEAREST column, never interpolated (see module docstring)
 # ---------------------------------------------------------------------------
 
+# These are acquisition-contract tolerances, not interpolation radii.  A
+# requested coordinate inside the tolerance is snapped to a stored column and
+# recorded by ``resolve_grid_columns``; a request outside it is rejected.
+# Keeping the values here makes the direct matcher and the CLI agree.
+B_SNAP_TOL_S_MM2 = 30.0
+TIMING_SNAP_TOL_MS = 1.5
+
 def _nearest_pair_index(delta: float, Delta: float, lib_pairs: np.ndarray) -> int:
     d2 = (lib_pairs[:, 0] - delta) ** 2 + (lib_pairs[:, 1] - Delta) ** 2
     return int(np.argmin(d2))
 
 
-def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
-                   b_tol=50.0, pair_warn_tol=1.5):
-    """Column indices into a flat library vector for a list of (δ,Δ,b)
-    triples.
+def resolve_grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
+                         b_tol=B_SNAP_TOL_S_MM2,
+                         timing_tol=TIMING_SNAP_TOL_MS):
+    """Resolve requested columns and return explicit non-interpolating snaps.
 
-    NOT interpolation: each triple is matched to its NEAREST stored (δ,Δ)
-    pair and NEAREST b-value (b must be within ``b_tol``, matching the
-    existing rounding-tolerance convention; (δ,Δ) has no hard tolerance —
-    any mismatch is accepted and simply becomes matching error, per design).
-    A warning is printed if the nearest (δ,Δ) pair is more than
-    ``pair_warn_tol`` ms away in either coordinate, since that likely means
-    the library's grid doesn't actually cover the requested protocol.
+    The returned events are suitable for a fit run record.  Each request is
+    matched to the nearest stored (δ, Δ, b) coordinate only if it falls
+    inside the declared snap tolerance; no signal interpolation occurs.
 
     Parameters
     ----------
@@ -812,6 +815,9 @@ def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
     Returns
     -------
     cols : (n_triples,) int array
+    snap_events : list[dict]
+        One event per distinct snapped timing pair or b-value.  Exact matches
+        are intentionally absent.
     """
     if lib_b_values is None:
         raise ValueError(
@@ -822,22 +828,68 @@ def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
     lib_b_arr = np.asarray(lib_b_values, dtype=float)
 
     cols = np.empty(len(fit_triples), dtype=int)
+    snap_events: list[dict] = []
+    seen_timing: set[tuple[float, float, float, float]] = set()
+    seen_b: set[tuple[float, float]] = set()
     for k, (delta, Delta, b) in enumerate(fit_triples):
         pi = _nearest_pair_index(delta, Delta, lib_pairs_arr)
         nd, nD = lib_pairs_arr[pi]
-        if abs(nd - delta) > pair_warn_tol or abs(nD - Delta) > pair_warn_tol:
-            import warnings
-            warnings.warn(
-                f"(δ={delta:g}, Δ={Delta:g}) ms not on the library grid; "
-                f"nearest stored pair is (δ={nd:g}, Δ={nD:g}) ms — "
-                f"matching error will be introduced (no interpolation).")
+        delta_offset = abs(float(nd - delta))
+        Delta_offset = abs(float(nD - Delta))
+        if delta_offset > timing_tol or Delta_offset > timing_tol:
+            raise ValueError(
+                f"(δ={delta:g}, Δ={Delta:g}) ms is outside the "
+                f"{timing_tol:g} ms timing snap tolerance; nearest stored "
+                f"pair is (δ={nd:g}, Δ={nD:g}) ms. No interpolation is "
+                "implemented.")
+        timing_key = (float(delta), float(Delta), float(nd), float(nD))
+        if (delta_offset > 1e-12 or Delta_offset > 1e-12) and timing_key not in seen_timing:
+            seen_timing.add(timing_key)
+            snap_events.append({
+                "axis": "timing",
+                "requested": {"delta_ms": float(delta), "Delta_ms": float(Delta)},
+                "used": {"delta_ms": float(nd), "Delta_ms": float(nD)},
+                "abs_offset": {"delta_ms": delta_offset, "Delta_ms": Delta_offset},
+                "rel_offset": {
+                    "delta": delta_offset / max(abs(float(delta)), 1e-12),
+                    "Delta": Delta_offset / max(abs(float(Delta)), 1e-12),
+                },
+            })
 
         bi = int(np.argmin(np.abs(lib_b_arr - b)))
-        if abs(lib_b_arr[bi] - b) > b_tol:
+        b_used = float(lib_b_arr[bi])
+        b_offset = abs(b_used - float(b))
+        if b_offset > b_tol:
             raise ValueError(
                 f"b = {b} s/mm² not within {b_tol:g} of any library "
                 f"b-value {sorted(lib_b_values)}.")
+        b_key = (float(b), b_used)
+        if b_offset > 1e-12 and b_key not in seen_b:
+            seen_b.add(b_key)
+            snap_events.append({
+                "axis": "b",
+                "requested": float(b),
+                "used": b_used,
+                "abs_offset": b_offset,
+                "rel_offset": b_offset / max(abs(float(b)), 1e-12),
+            })
         cols[k] = pi * n_b + bi
+    return cols, snap_events
+
+
+def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
+                  b_tol=B_SNAP_TOL_S_MM2,
+                  pair_warn_tol=TIMING_SNAP_TOL_MS):
+    """Column-only compatibility wrapper around :func:`resolve_grid_columns`.
+
+    Direct API callers retain the historic return type.  The command-line
+    fitter calls ``resolve_grid_columns`` once up front to make every snap
+    visible and persist it in the run record.
+    """
+    cols, _ = resolve_grid_columns(
+        fit_triples, lib_delta_pairs, lib_b_values, n_b,
+        b_tol=b_tol, timing_tol=pair_warn_tol,
+    )
     return cols
 
 
