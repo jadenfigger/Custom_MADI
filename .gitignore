@@ -1,4 +1,8 @@
-data/
+# Generated data remain local, except the small certified SI geometry reference
+# required by the P0 library builder on Sol.
+data/*
+!data/geometry_reference_si_kappa_0p9.npz
+!data/geometry_reference_si_kappa_0p9.npz.sha256
 figures/
 error_landscape_3d_out/
 out_singleshell/
@@ -6,3 +10,4 @@ __pycache__/
 *.nii
 *.nii.gz
 *.npz
+!data/geometry_reference_si_kappa_0p9.npz
