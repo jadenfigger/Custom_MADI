@@ -43,7 +43,10 @@ def test_pilot_validator_accepts_a_schema_valid_complete_fixture(tmp_path) -> No
     )
     grid = _pilot_grid()
     triplets, weights = grid.triplets_and_weights()
-    pairs = sorted({(rho, volume) for _, rho, volume in triplets if rho > 0.0})
+    pairs = sorted(
+        {(rho, volume) for _, rho, volume in triplets if rho > 0.0},
+        key=lambda pair: pair[0] * pair[1],
+    )
     columns = sig.build_columns(cfg)
     paths = []
     for shard_id in range(PILOT_N_SHARDS):

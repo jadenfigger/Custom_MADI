@@ -59,7 +59,13 @@ def _pilot_triplets_and_weights() -> tuple[list[tuple[float, float, float]], dic
 
 def _expected_shard_keys(shard_id: int) -> set[tuple]:
     triplets, _ = _pilot_triplets_and_weights()
-    pairs = sorted({(rho, volume) for _, rho, volume in triplets if rho > 0.0})
+    # Match scripts.fit_data exactly: groups are round-robined after sorting
+    # by the same rho*V cost proxy used by the builder.  Lexicographic sorting
+    # would validate the right 25 coordinates against the wrong shard IDs.
+    pairs = sorted(
+        {(rho, volume) for _, rho, volume in triplets if rho > 0.0},
+        key=lambda pair: pair[0] * pair[1],
+    )
     selected: set[tuple] = set()
     for kio, rho, volume in triplets:
         if rho == 0.0 and volume == 0.0:
@@ -152,6 +158,33 @@ def validate(paths: list[Path]) -> dict:
         shard_errors = _metadata_errors(meta, path)
         errors.extend(shard_errors)
         entries = load_library(str(path))
+        geometry_tolerance = float(
+            (meta.get("build_metadata") or {}).get("geometry_vi_tolerance", np.nan)
+        )
+        if not np.isfinite(geometry_tolerance) or geometry_tolerance <= 0.0:
+            message = f"{path}: missing positive realised-v_i tolerance in build metadata"
+            shard_errors.append(message)
+            errors.append(message)
+        else:
+            for entry in entries:
+                if entry.is_free_water:
+                    continue
+                target_vi = float(entry.rho_nominal * entry.V_nominal * 1e-6)
+                if abs(float(entry.vi) - target_vi) > geometry_tolerance:
+                    message = (
+                        f"{path}: realised v_i={entry.vi:.8g} is outside "
+                        f"{geometry_tolerance:.8g} of target {target_vi:.8g} "
+                        f"for {_entry_nominal_key(entry)}"
+                    )
+                    shard_errors.append(message)
+                    errors.append(message)
+                realised = (entry.metadata.get("realised_geometry") or {}).get("vi")
+                if realised is None or not np.isclose(
+                    float(realised), float(entry.vi), rtol=0.0, atol=1e-12,
+                ):
+                    message = f"{path}: entry label and realised-geometry v_i disagree"
+                    shard_errors.append(message)
+                    errors.append(message)
         actual_keys = {_entry_nominal_key(entry) for entry in entries}
         expected_keys = _expected_shard_keys(shard_id)
         expected_counts[shard_id] = len(expected_keys)

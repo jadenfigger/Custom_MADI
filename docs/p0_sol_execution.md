@@ -1,7 +1,7 @@
 # P0 Sol execution package
 
-This is the only GPU work remaining before the pilot: first the deterministic
-CPU/GPU full-facet golden check, then the small pilot library.  It follows
+This execution package defines the deterministic CPU/GPU full-facet golden
+check and the small pilot library. It follows
 `docs/sol_package_guide.md`: the existing `scripts/build_lib.sbatch` is the
 only launcher; it has `#SBATCH --export=NONE`, and performs exactly `module
 load mamba/latest` followed by `source activate madiEnv`.  Do not pre-activate
@@ -12,12 +12,19 @@ remains `public/public` because its wall time is one day.
 
 The Sol repository path below is `/scratch/jfigger/madi/Custom_MADI`.
 
-The uploaded `sol_outputs/gpu_golden_60169767` and
-`sol_outputs/gpu_golden_60222142` results are **not** substitutes for this
-run: both report schema `v1`, golden hash `226946…`, cache-era geometry fields,
-and survivor metrics.  The current full-facet fixture is schema `v3` with the
-different hash stated below, so the hardware check must be rerun once after
-the full-facet remediation commit is pushed and pulled on Sol.
+## Execution record — 2026-08-03
+
+- `gpu_golden_60169767` and `gpu_golden_60222142` are retired cache-era runs:
+  schema `v1`, golden hash `226946…`, and obsolete survivor metrics.
+- `gpu_golden_60222901` is the accepted full-facet CPU/GPU check. It reports
+  schema `madi-cpu-gpu-golden-report-v3-full-facet`, fixture SHA-256
+  `9db549929e5b63542b5de335fbc415419d3e61909f82dc0604aa98fb366ec9df`,
+  `pass: true`, zero escapes, identical occupancy, and maximum `Y` difference
+  `5.684341886080802e-14` under `atol=5e-12`, `rtol=5e-11`.
+- Pilot array `60223180` completed all four tasks. Its returned shards pass
+  the structural/provenance validator; see `docs/p0_pilot_validation.md`.
+  The pilot's deliberately low walker count makes it unsuitable as a fitting
+  library and it must not be substituted for a production build.
 
 ## Gate before either submission
 
