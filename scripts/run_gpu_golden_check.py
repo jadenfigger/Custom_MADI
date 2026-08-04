@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run the CUDA half of the committed CPU/GPU MADI golden-file check.
+"""Run the CUDA half of the committed CPU/GPU full-facet golden check.
 
-Exit status is the result: zero means the CUDA walk reproduced the committed
-CPU reference within the stated float64 tolerance; nonzero means the written
-``gpu_golden_diff.json`` explains the mismatch.  This is designed for a
-single unattended Sol sbatch invocation, not an interactive debugging loop.
+The exit status is the result: zero means the CUDA kernel reproduced the
+committed CPU reference within the stated float64 tolerance.  Nonzero writes
+``gpu_golden_diff.json`` explaining the mismatch, for a single unattended Sol
+job rather than an interactive GPU debugging session.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import sys
 import numpy as np
 
 from madi.config import SimConfig
-from madi.ensemble import Ensemble, GeometryStats
+from madi.ensemble import Ensemble, GeometryStats, PopulationCertificate
 from madi.walker_gpu import HAS_CUDA, WalkRandomStream, run_walk_Y
 
 
@@ -29,43 +29,48 @@ ATOL = 5e-12
 
 
 def _max_abs_rel(actual: np.ndarray, expected: np.ndarray) -> dict:
-    a = np.asarray(actual, dtype=np.float64)
-    e = np.asarray(expected, dtype=np.float64)
-    delta = np.abs(a - e)
-    denom = np.maximum(np.abs(e), ATOL)
+    actual = np.asarray(actual, dtype=np.float64)
+    expected = np.asarray(expected, dtype=np.float64)
+    delta = np.abs(actual - expected)
+    denom = np.maximum(np.abs(expected), ATOL)
     return {
-        "shape": list(a.shape),
+        "shape": list(actual.shape),
         "max_abs": float(np.max(delta)) if delta.size else 0.0,
         "max_rel": float(np.max(delta / denom)) if delta.size else 0.0,
-        "allclose": bool(np.allclose(a, e, rtol=RTOL, atol=ATOL, equal_nan=True)),
+        "allclose": bool(np.allclose(actual, expected, rtol=RTOL, atol=ATOL, equal_nan=True)),
     }
 
 
 def _read_hash(path: Path) -> str | None:
-    sha_path = path.with_suffix(path.suffix + ".sha256")
-    if not sha_path.exists():
+    hash_path = path.with_suffix(path.suffix + ".sha256")
+    if not hash_path.exists():
         return None
-    return sha_path.read_text(encoding="utf-8").split()[0]
+    return hash_path.read_text(encoding="utf-8").split()[0]
 
 
 def _ensemble_from_golden(data, cfg: SimConfig, case: dict) -> Ensemble:
-    geometry_keys = {item.name for item in fields(GeometryStats)}
-    geometry = GeometryStats(**{key: case["geometry"][key] for key in geometry_keys})
+    geometry_values = {item.name: case["geometry"][item.name] for item in fields(GeometryStats)}
+    geometry_values["population"] = PopulationCertificate(**geometry_values["population"])
+    geometry = GeometryStats(**geometry_values)
     return Ensemble(
         seeds=np.asarray(data["seeds"], dtype=np.float64),
         annulus=np.asarray(data["annulus"], dtype=np.float64),
-        grid_candidates=np.asarray(data["grid_candidates"], dtype=np.int32),
         rho=float(case["rho_realised_per_uL"]),
         V=float(case["V_realised_pL"]),
         vi=float(case["vi_realised"]),
         alpha_star=float(case["alpha_star_um"]),
         L=float(cfg.L),
+        source_lo=float(case["source_lo_um"]),
+        source_hi=float(case["source_hi_um"]),
         mean_AV=float(case["mean_A_over_V_um_inv"]),
-        grid_spacing=float(cfg.grid_spacing),
-        classifier_candidates=int(cfg.classifier_candidates),
         geometry=geometry,
         rho_requested=float(case["rho_requested_per_uL"]),
         V_requested=float(case["V_requested_pL"]),
+        kd_node_seed=np.asarray(data["kd_node_seed"], dtype=np.int32),
+        kd_node_axis=np.asarray(data["kd_node_axis"], dtype=np.int8),
+        kd_node_left=np.asarray(data["kd_node_left"], dtype=np.int32),
+        kd_node_right=np.asarray(data["kd_node_right"], dtype=np.int32),
+        kd_node_parent=np.asarray(data["kd_node_parent"], dtype=np.int32),
     )
 
 
@@ -78,18 +83,17 @@ def main() -> int:
     if not HAS_CUDA:
         print("FAIL: CUDA is unavailable; this must run in the Sol GPU job.", file=sys.stderr)
         return 2
-    golden = args.golden
-    if not golden.exists():
-        print(f"FAIL: golden file is missing: {golden}", file=sys.stderr)
+    if not args.golden.exists():
+        print(f"FAIL: golden file is missing: {args.golden}", file=sys.stderr)
         return 2
-    expected_hash = _read_hash(golden)
-    actual_hash = hashlib.sha256(golden.read_bytes()).hexdigest()
+    expected_hash = _read_hash(args.golden)
+    actual_hash = hashlib.sha256(args.golden.read_bytes()).hexdigest()
     if expected_hash is None or actual_hash != expected_hash:
         print("FAIL: committed CPU golden hash is missing or does not match.", file=sys.stderr)
         return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    data = np.load(golden, allow_pickle=False)
+    data = np.load(args.golden, allow_pickle=False)
     cfg = SimConfig(**json.loads(str(data["config_json"])))
     cfg.assert_grid_alignment()
     case = json.loads(str(data["case_json"]))
@@ -99,29 +103,24 @@ def main() -> int:
         increments=np.asarray(data["increments"], dtype=np.float64),
         acceptance_uniforms=np.asarray(data["acceptance_uniforms"], dtype=np.float64),
     )
-
     Y, n_escaped, telemetry = run_walk_Y(
         ensemble, 0.0, cfg, pp=float(case["pp"]), seed=0, verbose=False,
-        return_telemetry=True, classifier="cache", random_stream=stream,
+        return_telemetry=True, classifier="exact", random_stream=stream,
         use_gpu=True,
     )
     comparisons = {
         "Y": _max_abs_rel(Y, data["Y_cpu"]),
-        "metrics": _max_abs_rel(telemetry["metrics"], data["metrics_cpu"]),
         "occupancy_fraction": _max_abs_rel(
             telemetry["occupancy_fraction"], data["occupancy_fraction_cpu"]
-        ),
-        "start_survivor_fraction": _max_abs_rel(
-            telemetry["start_survivor_fraction"], data["start_survivor_fraction_cpu"]
         ),
         "escaped_equal": bool(int(n_escaped) == int(data["escaped_cpu"])),
     }
     passed = bool(comparisons["escaped_equal"] and all(
-        item["allclose"] for name, item in comparisons.items() if name != "escaped_equal"
+        item["allclose"] for key, item in comparisons.items() if key != "escaped_equal"
     ))
     report = {
-        "schema": "madi-cpu-gpu-golden-report-v1",
-        "golden": str(golden),
+        "schema": "madi-cpu-gpu-golden-report-v3-full-facet",
+        "golden": str(args.golden),
         "golden_sha256": actual_hash,
         "rtol": RTOL,
         "atol": ATOL,
@@ -137,9 +136,7 @@ def main() -> int:
         args.output_dir / "gpu_golden_result.npz",
         Y_gpu=Y,
         escaped_gpu=np.array(n_escaped, dtype=np.int64),
-        metrics_gpu=np.asarray(telemetry["metrics"], dtype=np.float64),
         occupancy_fraction_gpu=np.asarray(telemetry["occupancy_fraction"], dtype=np.float64),
-        start_survivor_fraction_gpu=np.asarray(telemetry["start_survivor_fraction"], dtype=np.float64),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if passed else 1

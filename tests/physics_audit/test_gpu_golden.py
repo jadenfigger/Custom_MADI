@@ -1,4 +1,4 @@
-"""Tier-A integrity check for the committed CPU reference golden file."""
+"""Tier A integrity check for the committed CPU full-facet golden file."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from madi.config import SimConfig
-from madi.ensemble import Ensemble, GeometryStats
+from madi.ensemble import Ensemble, GeometryStats, PopulationCertificate
 from madi.walker_gpu import WalkRandomStream, run_walk_Y
 
 
@@ -22,28 +22,32 @@ GOLDEN = ROOT / "tests/physics_audit/data/cpu_gpu_golden_v1.npz"
 
 
 def _ensemble(data, cfg: SimConfig, case: dict) -> Ensemble:
-    geometry_keys = {field.name for field in fields(GeometryStats)}
-    geometry = GeometryStats(**{key: case["geometry"][key] for key in geometry_keys})
+    values = {field.name: case["geometry"][field.name] for field in fields(GeometryStats)}
+    values["population"] = PopulationCertificate(**values["population"])
     return Ensemble(
         seeds=np.asarray(data["seeds"], dtype=np.float64),
         annulus=np.asarray(data["annulus"], dtype=np.float64),
-        grid_candidates=np.asarray(data["grid_candidates"], dtype=np.int32),
         rho=float(case["rho_realised_per_uL"]),
         V=float(case["V_realised_pL"]),
         vi=float(case["vi_realised"]),
         alpha_star=float(case["alpha_star_um"]),
         L=float(cfg.L),
+        source_lo=float(case["source_lo_um"]),
+        source_hi=float(case["source_hi_um"]),
         mean_AV=float(case["mean_A_over_V_um_inv"]),
-        grid_spacing=float(cfg.grid_spacing),
-        classifier_candidates=int(cfg.classifier_candidates),
-        geometry=geometry,
+        geometry=GeometryStats(**values),
         rho_requested=float(case["rho_requested_per_uL"]),
         V_requested=float(case["V_requested_pL"]),
+        kd_node_seed=np.asarray(data["kd_node_seed"], dtype=np.int32),
+        kd_node_axis=np.asarray(data["kd_node_axis"], dtype=np.int8),
+        kd_node_left=np.asarray(data["kd_node_left"], dtype=np.int32),
+        kd_node_right=np.asarray(data["kd_node_right"], dtype=np.int32),
+        kd_node_parent=np.asarray(data["kd_node_parent"], dtype=np.int32),
     )
 
 
 def test_cpu_golden_hash_and_deterministic_reference_replay() -> None:
-    """The committed reference is intact and CPU replay remains bitwise stable."""
+    """The fixed CPU trajectory remains bitwise stable after source changes."""
     expected = GOLDEN.with_suffix(GOLDEN.suffix + ".sha256").read_text().split()[0]
     assert hashlib.sha256(GOLDEN.read_bytes()).hexdigest() == expected
     data = np.load(GOLDEN, allow_pickle=False)
@@ -56,13 +60,11 @@ def test_cpu_golden_hash_and_deterministic_reference_replay() -> None:
     )
     Y, escaped, telemetry = run_walk_Y(
         _ensemble(data, cfg, case), 0.0, cfg, pp=float(case["pp"]),
-        seed=0, verbose=False, return_telemetry=True, classifier="cache",
+        seed=0, verbose=False, return_telemetry=True, classifier="exact",
         random_stream=stream, use_gpu=False,
     )
     assert escaped == int(data["escaped_cpu"])
     assert np.array_equal(Y, data["Y_cpu"])
-    assert np.array_equal(telemetry["metrics"], data["metrics_cpu"])
-    assert np.array_equal(telemetry["occupancy_fraction"], data["occupancy_fraction_cpu"])
     assert np.array_equal(
-        telemetry["start_survivor_fraction"], data["start_survivor_fraction_cpu"]
+        telemetry["occupancy_fraction"], data["occupancy_fraction_cpu"]
     )

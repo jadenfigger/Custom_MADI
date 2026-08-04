@@ -160,54 +160,39 @@ class SimConfig:
     # ensemble in one launch; set lower on memory-constrained GPUs).
     walker_chunk: Optional[int] = None
 
-    # --- Ensemble geometry -----------------------------------------------------
-    L:           float = 250.0          # Ω_sim cube side             [μm]
-    # ``buffer`` and ``pop_margin`` are retained for loading old command
-    # lines.  The production boundary mode is periodic, so walkers are
-    # started uniformly in the whole box and no finite source domain is used.
-    # They are used only by the explicit ``absorbing_legacy`` diagnostic mode.
-    buffer:      float = 60.0           # legacy walker spawn margin [μm]
-    pop_margin:  float = 40.0           # legacy source-seed margin  [μm]
-    kappa:       float = 0.95           # per-cell annulus cap: α_i ≤ κ·d_nn/2
+    # --- Ensemble geometry -------------------------------------------------
+    # SI §S.III Eq. S8 determines the production Ω_sim edge W separately for
+    # every requested density.  ``L`` is intentionally an explicit
+    # diagnostic override only; a production build leaves it ``None``.
+    L: Optional[float] = None
+    source_fraction: float = 0.40        # Ω_src edge / Ω_sim edge (SI §S.III)
+    kappa: float = 0.90                  # SI Eq. S5: α_i^lim = κ d_nn / 2
 
-    # --- Periodic candidate classifier -------------------------------------
-    # The GPU cannot call scipy's KD tree.  Both CPU and GPU therefore use
-    # this same finite candidate cache and re-rank every candidate at the
-    # actual walker location.  The cache resolution / candidate count are
-    # validated against an exact periodic KD-tree in Tier-A tests.
-    grid_spacing: float = 0.75           # μm per cache voxel
-    classifier_candidates: int = 8       # primary seeds retained per voxel
-    boundary_mode: str = "periodic"      # production: periodic; legacy only: absorbing_legacy
+    # Ω_pop is enlarged and certified against SI Eqs. S10--S12.  The
+    # certificate evaluates a Lipschitz upper bound for the nearest-seed
+    # distance throughout Ω_sim and verifies that every potentially touching
+    # cell has an unbiased nearest neighbour for its annulus cap.
+    population_initial_margin_cell_spacings: float = 3.0
+    population_certification_spacing_um: float = 8.0
+    population_max_expansions: int = 8
 
-    # Geometry calibration is deliberately performed on every realised
-    # Poisson ensemble.  ``geometry_vi_tolerance`` is an absolute tolerance:
-    # 0.005 is >10x the binomial MC SE for 200k probes at all requested v_i,
-    # while remaining far below one practical library grid cell.
-    geometry_calibration_points: int = 200_000
+    # The SI's 5e6 single-cell / 26-alpha reference table supplies the
+    # governing-process <A/V>.  Production refuses an uncertified table;
+    # unit tests may opt in to a deliberately small fixture.
+    geometry_reference_path: Optional[str] = None
+    allow_uncertified_geometry_reference: bool = False
+    geometry_reference_required_cells: int = 5_000_000
+    geometry_reference_required_alpha_values: int = 26
+
+    # Direct volume sampling validates that a finite Ω_sim realization is
+    # close to the target generating-process v_i.  It does *not* calibrate
+    # α* and it does not supply <A/V> for k_io.
     geometry_validation_points: int = 200_000
-    geometry_sample_cells: int = 128
     geometry_vi_tolerance: float = 0.005
-    geometry_alpha_iterations: int = 24
 
-    # --- Boundary-escape policy --------------------------------------------
-    # Only meaningful in the explicit legacy absorbing diagnostic.  A
-    # production build rejects that mode rather than silently discarding
-    # walkers from all columns.
-    max_escape_frac: float = 0.01
-
-    # --- Exchange calibration ------------------------------------------------
-    # A direct tagged-starting-cell calibration is run once for each realised
-    # geometry before its k_io sweep.  It measures a *response curve*, not a
-    # single analytic or linear p_p→k_io slope: Gaussian proposals can make
-    # the high-p response sub-linear because rejected walkers remain near a
-    # membrane.  The final entry is always labelled by the independently
-    # measured first-exit rate from its own signal walk.
-    exchange_calibration_walkers: int = 4_096
-    exchange_calibration_ms: float = 32.0
-    exchange_calibration_response_points: int = 9
-    exchange_calibration_min_pp: float = 1e-5
-    exchange_calibration_min_events: int = 32
-    exchange_calibration_max_batches: int = 4
+    # SI §S.III: escaping Ω_sim is a fatal simulation error.  There is no
+    # periodic production mode and no survivor selection / escape fraction.
+    boundary_mode: str = "si_fatal_escape"
 
     # --- Phase model ---------------------------------------------------------
     # ``finite_lobe`` is the only production model: it evaluates
@@ -292,27 +277,35 @@ class SimConfig:
                 "phase_model must be 'finite_lobe' or 'narrow_pulse', got "
                 f"{self.phase_model!r}."
             )
-        if self.boundary_mode not in {"periodic", "absorbing_legacy"}:
+        if self.boundary_mode != "si_fatal_escape":
             raise ValueError(
-                "boundary_mode must be 'periodic' or 'absorbing_legacy', got "
+                "boundary_mode must be 'si_fatal_escape'; periodic wrapping "
+                "and survivor pruning contradict SI §S.III, got "
                 f"{self.boundary_mode!r}."
             )
-        if self.classifier_candidates < 2:
-            raise ValueError("classifier_candidates must be at least two.")
-        if self.exchange_calibration_walkers <= 0:
-            raise ValueError("exchange_calibration_walkers must be positive.")
-        if self.exchange_calibration_ms <= 0.0:
-            raise ValueError("exchange_calibration_ms must be positive.")
-        if self.exchange_calibration_response_points < 3:
-            raise ValueError("exchange_calibration_response_points must be at least three.")
-        if not (0.0 < self.exchange_calibration_min_pp <= 1.0):
-            raise ValueError("exchange_calibration_min_pp must lie in (0, 1].")
-        if self.exchange_calibration_min_events < 1:
-            raise ValueError("exchange_calibration_min_events must be positive.")
-        if self.exchange_calibration_max_batches < 1:
-            raise ValueError("exchange_calibration_max_batches must be positive.")
+        if not (0.0 < self.source_fraction <= 1.0):
+            raise ValueError("source_fraction must lie in (0, 1].")
+        if not np.isclose(self.kappa, 0.90, rtol=0.0, atol=1e-12):
+            raise ValueError("kappa must be the SI-specified 0.90.")
+        if self.population_initial_margin_cell_spacings <= 0.0:
+            raise ValueError("population_initial_margin_cell_spacings must be positive.")
+        if self.population_certification_spacing_um <= 0.0:
+            raise ValueError("population_certification_spacing_um must be positive.")
+        if self.population_max_expansions < 1:
+            raise ValueError("population_max_expansions must be positive.")
+        if self.geometry_validation_points <= 0:
+            raise ValueError("geometry_validation_points must be positive.")
+        if self.geometry_reference_required_cells < 1:
+            raise ValueError("geometry_reference_required_cells must be positive.")
+        if self.geometry_reference_required_alpha_values < 1:
+            raise ValueError("geometry_reference_required_alpha_values must be positive.")
 
     @property
     def grid_size(self) -> int:
-        """Number of grid points per axis (Ω_sim only)."""
-        return int(np.ceil(self.L / self.grid_spacing))
+        """Removed cache-grid compatibility property.
+
+        The production classifier evaluates the full SI Eq. S2 facet
+        conjunction with an exact adaptive KD radius query; therefore a
+        voxel-centre classifier grid is not part of the representation.
+        """
+        raise RuntimeError("the SI-exact classifier has no voxel cache grid")

@@ -45,7 +45,7 @@ import json
 import math
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Mapping, Optional, List, Tuple
 
 import numpy as np
@@ -76,7 +76,6 @@ class LibraryEntry:
     V_nominal: float | None = None
     pp: float | None = None
     kio_analytic_eq5: float | None = None
-    kio_measured_se: float | None = None
     is_free_water: bool = False
     metadata: dict = field(default_factory=dict)
 
@@ -244,43 +243,47 @@ def _filter_valid(triplets, vi_min=0.0, vi_max=VI_HARD_MAX):
 
 
 def _summarise_realised_geometry(per_ensemble: list[dict], cfg: SimConfig) -> dict:
-    """Aggregate direct geometry measurements without replacing them by targets."""
+    """Aggregate finite Ω_sim measurements without replacing Eq.-5 inputs.
+
+    The requested process parameters determine alpha_star and the governing
+    single-cell ``<A/V>``.  The values here describe only the finite realised
+    geometries carried by library labels/provenance; none is fed back into
+    permeability calibration (SI §S.IV).
+    """
     if not per_ensemble:
         return {
             "vi": 0.0, "rho_per_uL": 0.0, "mean_volume_pL": 0.0,
-            "mean_A_over_V_um_inv": 0.0, "mean_area_um2": 0.0,
-            "n_primary_cells": 0,
+            "governing_mean_A_over_V_um_inv": 0.0, "n_seeds_sim": 0,
         }
-    n_cells = np.asarray([int(x["n_primary_cells"]) for x in per_ensemble], dtype=float)
-    vis = np.asarray([float(x["vi"]) for x in per_ensemble], dtype=float)
-    L3 = float(cfg.L) ** 3
+    n_cells = np.asarray([int(x["n_seeds_sim"]) for x in per_ensemble], dtype=float)
+    vis = np.asarray([float(x["realised_vi"]) for x in per_ensemble], dtype=float)
+    volumes_um3 = np.asarray([float(x["sim_side_um"]) ** 3 for x in per_ensemble])
     total_cells = float(n_cells.sum())
-    total_intracellular_volume = float(np.sum(vis * L3))
-    # These three labels satisfy rho*V*1e-6 == mean direct v_i by
-    # construction, while retaining the Poisson-realised cell count.
-    rho = total_cells / (len(per_ensemble) * L3) * 1e9
+    total_volume = float(volumes_um3.sum())
+    total_intracellular_volume = float(np.sum(vis * volumes_um3))
+    # The aggregate labels satisfy rho*V*1e-6 == aggregate direct v_i.
+    rho = total_cells / total_volume * 1e9 if total_volume else 0.0
     V_pL = total_intracellular_volume / total_cells / 1e3 if total_cells else 0.0
-    weights = n_cells / max(total_cells, 1.0)
-    def cell_weighted(name: str) -> float:
-        return float(np.sum(weights * np.asarray([float(x[name]) for x in per_ensemble])))
+    volume_weights = volumes_um3 / max(total_volume, 1.0)
+    def volume_weighted(name: str) -> float:
+        return float(np.sum(volume_weights * np.asarray([float(x[name]) for x in per_ensemble])))
     return {
-        "vi": float(np.mean(vis)),
+        "vi": float(total_intracellular_volume / total_volume) if total_volume else 0.0,
         "vi_between_ensemble_sd": float(np.std(vis, ddof=1)) if len(vis) > 1 else 0.0,
         "rho_per_uL": float(rho),
         "mean_volume_pL": float(V_pL),
         "mean_volume_um3": float(V_pL * 1e3),
-        "sampled_mean_volume_um3": cell_weighted("sampled_mean_volume_um3"),
-        "mean_area_um2": cell_weighted("mean_area_um2"),
-        "mean_A_over_V_um_inv": cell_weighted("mean_A_over_V_um_inv"),
-        "annulus_mean_um": cell_weighted("annulus_mean_um"),
-        "annulus_std_um": cell_weighted("annulus_std_um"),
+        "governing_mean_A_over_V_um_inv": volume_weighted("governing_mean_A_over_V_um_inv"),
+        "annulus_mean_um": volume_weighted("annulus_mean_um"),
+        "annulus_std_um": volume_weighted("annulus_std_um"),
         "annulus_min_um": float(min(float(x["annulus_min_um"]) for x in per_ensemble)),
         "annulus_max_um": float(max(float(x["annulus_max_um"]) for x in per_ensemble)),
-        "annulus_q05_um": cell_weighted("annulus_q05_um"),
-        "annulus_q50_um": cell_weighted("annulus_q50_um"),
-        "annulus_q95_um": cell_weighted("annulus_q95_um"),
-        "n_primary_cells": int(total_cells),
-        "n_geometry_cells": int(sum(int(x["n_geometry_cells"]) for x in per_ensemble)),
+        "annulus_q05_um": volume_weighted("annulus_q05_um"),
+        "annulus_q50_um": volume_weighted("annulus_q50_um"),
+        "annulus_q95_um": volume_weighted("annulus_q95_um"),
+        "n_seeds_sim": int(total_cells),
+        "sim_side_um": [float(x["sim_side_um"]) for x in per_ensemble],
+        "source_side_um": [float(x["source_side_um"]) for x in per_ensemble],
     }
 
 
@@ -393,40 +396,23 @@ def build_library_from_triplets(
             nominal_key = _entry_key(kio, rho, V)
             weight = None if entry_weights is None else entry_weights.get(nominal_key)
             entry_metadata = {
-                "schema": "madi-library-entry-v3",
+                "schema": "madi-library-entry-v4",
                 "nominal": {"kio": float(kio), "rho": float(rho), "V": float(V)},
                 "realised_geometry": summary,
                 "per_ensemble_geometry": result["geometry_stats"],
                 "exchange": {
-                    "kio_measured_s_inv": float(result["kio_measured"]),
-                    "kio_measured_se_s_inv": float(result["kio_measured_se"]),
-                    "kio_survival_fit_s_inv": float(result["kio_survival_fit"]),
-                    "kio_stationary_residence_s_inv": float(result["kio_stationary_residence"]),
                     "kio_analytic_eq5_s_inv": float(result["kio_analytic_eq5"]),
-                    "analytic_over_measured": (
-                        float(result["kio_analytic_eq5"] / result["kio_measured"])
-                        if result["kio_measured"] > 0.0 else None
-                    ),
                     "p_p_mean": float(result["pp"]),
-                    "calibration": [asdict(x) for x in result["calibration"]],
-                    "intra_time_ms": float(result["intra_time_ms"]),
-                    "efflux_events": int(result["efflux_events"]),
-                    "influx_events": int(result["influx_events"]),
-                    "first_exit_events": int(result["first_exit_events"]),
-                    "start_initial_intra": int(result["start_initial_intra"]),
-                    "start_survival_time_ms": float(result["start_survival_time_ms"]),
+                    "definition": (
+                        "MADI I Eq. 5 using SI §S.IV untrimmed governing-process "
+                        "arithmetic <A/V>; no residence-time proxy is used."
+                    ),
                 },
                 "boundary": {
                     "mode": cfg.boundary_mode,
                     "n_escaped": int(result["n_escaped"]),
                     "n_walkers_total": int(result["n_eff"] // 3),
-                    "escape_fraction": float(
-                        result["n_escaped"] / max(result["n_eff"] // 3, 1)
-                    ),
-                    "escape_times_ms": [],
-                    "surviving_walkers_by_checkpoint": np.asarray(
-                        result["surviving_walkers_by_checkpoint"], dtype=int
-                    ).tolist(),
+                    "fatal_on_escape": True,
                     "occupancy_fraction": np.asarray(result["occupancy_fraction"]).tolist(),
                 },
                 "weight": None if weight is None else float(weight),
@@ -434,7 +420,7 @@ def build_library_from_triplets(
             library.append(LibraryEntry(
                 # k_io is undefined for the free-water atom; preserve NaN
                 # rather than pretending it is a zero-exchange cell.
-                kio=(float("nan") if is_free else float(result["kio_measured"])),
+                kio=(float("nan") if is_free else float(kio)),
                 rho=(0.0 if is_free else summary["rho_per_uL"]),
                 V=(0.0 if is_free else summary["mean_volume_pL"]),
                 vector=vec,
@@ -445,7 +431,6 @@ def build_library_from_triplets(
                 V_nominal=float(V),
                 pp=float(result["pp"]),
                 kio_analytic_eq5=float(result["kio_analytic_eq5"]),
-                kio_measured_se=float(result["kio_measured_se"]),
                 is_free_water=is_free,
                 metadata=entry_metadata,
             ))
@@ -521,35 +506,41 @@ def _json_default(value):
 def _cfg_metadata(cfg: SimConfig) -> dict:
     """Library-embedded physics/build configuration, with no hidden defaults."""
     return {
-        "schema": "madi-library-v3",
+        "schema": "madi-library-v4",
         "D0_um2_ms": cfg.D0,
         "ts_ms": cfg.ts,
         "T_max_ms": cfg.T_max_ms,
-        "domain_L_um": cfg.L,
-        "legacy_buffer_um": cfg.buffer,
-        "legacy_pop_margin_um": cfg.pop_margin,
+        "domain_sizing": "MADI I SI Eq. S8; per-entry W unless diagnostic L override",
+        "diagnostic_domain_L_override_um": cfg.L,
+        "source_fraction": cfg.source_fraction,
         "boundary_mode": cfg.boundary_mode,
         "kappa": cfg.kappa,
-        "grid_spacing_um": cfg.grid_spacing,
-        "classifier_candidates": cfg.classifier_candidates,
-        "geometry_calibration_points": cfg.geometry_calibration_points,
+        "population_certification": {
+            "equations": ["S10", "S11", "S12"],
+            "initial_margin_cell_spacings": cfg.population_initial_margin_cell_spacings,
+            "certification_spacing_um": cfg.population_certification_spacing_um,
+            "max_expansions": cfg.population_max_expansions,
+        },
+        "geometry_reference": {
+            "path": cfg.geometry_reference_path,
+            "required_single_cells": cfg.geometry_reference_required_cells,
+            "required_alpha_values": cfg.geometry_reference_required_alpha_values,
+            "allow_uncertified": cfg.allow_uncertified_geometry_reference,
+            "mean_estimator": "untrimmed_arithmetic_mean_A_over_V",
+        },
         "geometry_validation_points": cfg.geometry_validation_points,
-        "geometry_sample_cells": cfg.geometry_sample_cells,
         "geometry_vi_tolerance": cfg.geometry_vi_tolerance,
         "walkers_per_ensemble": cfg.n_walkers,
         "ensembles_per_entry": cfg.n_ensembles,
-        "exchange_calibration_walkers": cfg.exchange_calibration_walkers,
-        "exchange_calibration_ms": cfg.exchange_calibration_ms,
-        "exchange_calibration_response_points": cfg.exchange_calibration_response_points,
-        "exchange_calibration_min_pp": cfg.exchange_calibration_min_pp,
-        "exchange_calibration_min_events": cfg.exchange_calibration_min_events,
-        "exchange_calibration_max_batches": cfg.exchange_calibration_max_batches,
         "phase_model": cfg.phase_model,
         "checkpoint_h_ms": cfg.h_ms,
         "common_random_numbers": "base_seed + ensemble_index; shared across rho,V,kio",
-        "kio_label": "direct tagged-starting-cell first-exit hazard; event-count and survival-fit cross-check stored per entry",
-        "kio_calibration": "one measured monotone p_p response curve per realised geometry; Eq. 5 is metadata only",
-        "analytic_kio_comparator": "MADI-I Eq. 5",
+        "classifier": (
+            "exact full-facet shifted-Voronoi contraction at every endpoint; "
+            "SI Eq. S2, with the provable d1+2*alpha1 adaptive KD radius bound"
+        ),
+        "kio_label": "MADI I Eq. 5 with governing-process untrimmed arithmetic <A/V>",
+        "residence_time_measurement": "intentionally absent: SI §S.IV states k_io != 1/<tau_i>",
     }
 
 
@@ -593,9 +584,6 @@ def _save_library(lib: list[LibraryEntry], path: str,
     kio_eq5 = np.array([
         np.nan if e.kio_analytic_eq5 is None else e.kio_analytic_eq5 for e in lib
     ], dtype=float)
-    kio_se = np.array([
-        np.nan if e.kio_measured_se is None else e.kio_measured_se for e in lib
-    ], dtype=float)
     free = np.array([e.is_free_water for e in lib], dtype=np.bool_)
     entry_json = np.array([
         json.dumps(e.metadata, sort_keys=True, default=_json_default) for e in lib
@@ -612,11 +600,11 @@ def _save_library(lib: list[LibraryEntry], path: str,
         embedded_build_metadata["grid"] = grid_metadata
     np.savez(
         path,
-        library_schema=np.array("madi-library-v3"),
+        library_schema=np.array("madi-library-v4"),
         kios=kios, rhos=rhos, Vs=Vs, vis=vis, vectors=vecs,
         nominal_kios=nominal_kios, nominal_rhos=nominal_rhos, nominal_Vs=nominal_Vs,
         weights=weights, has_weights=np.array(bool(np.all(np.isfinite(weights)))),
-        pps=pps, kio_analytic_eq5=kio_eq5, kio_measured_se=kio_se,
+        pps=pps, kio_analytic_eq5=kio_eq5,
         is_free_water=free, entry_metadata_json=entry_json,
         build_metadata_json=np.array(json.dumps(
             embedded_build_metadata, sort_keys=True, default=_json_default,
@@ -650,7 +638,6 @@ def load_library(path: str) -> list[LibraryEntry]:
     nominal_Vs = optional('nominal_Vs', Vs)
     pps = optional('pps', np.full(n, np.nan))
     kio_eq5 = optional('kio_analytic_eq5', np.full(n, np.nan))
-    kio_se = optional('kio_measured_se', np.full(n, np.nan))
     free = optional('is_free_water', np.zeros(n, dtype=bool))
     entry_json = optional('entry_metadata_json', np.asarray(["{}"] * n))
     lib = []
@@ -673,7 +660,6 @@ def load_library(path: str) -> list[LibraryEntry]:
             V_nominal=float(nominal_Vs[i]),
             pp=None if not np.isfinite(pps[i]) else float(pps[i]),
             kio_analytic_eq5=None if not np.isfinite(kio_eq5[i]) else float(kio_eq5[i]),
-            kio_measured_se=None if not np.isfinite(kio_se[i]) else float(kio_se[i]),
             is_free_water=bool(free[i]),
             metadata=entry_meta,
         ))

@@ -226,13 +226,10 @@ def _library_provenance(path: str, meta: dict, library) -> dict:
     """Collect the immutable library facts required to interpret one fit."""
     build = meta.get("build_metadata") or {}
     escape_fractions = []
-    kio_ses = []
     for entry in library:
         boundary = entry.metadata.get("boundary", {}) if entry.metadata else {}
         if "escape_fraction" in boundary:
             escape_fractions.append(boundary["escape_fraction"])
-        if entry.kio_measured_se is not None:
-            kio_ses.append(entry.kio_measured_se)
     return {
         "filename": os.path.abspath(path),
         "sha256": _sha256_file(path),
@@ -246,8 +243,10 @@ def _library_provenance(path: str, meta: dict, library) -> dict:
         "b_values_s_mm2": meta.get("b_values"),
         "escape_statistics_summary": _finite_summary(escape_fractions),
         "per_entry_monte_carlo_error": {
-            "method": "stored tagged-first-exit Poisson standard error",
-            "kio_measured_se_s_inv": _finite_summary(kio_ses),
+            "method": (
+                "not yet available in the current artifact; P2-M will use "
+                "held-out ensemble signal variation, not a tagged-exit k_io proxy"
+            ),
         },
     }
 
@@ -408,23 +407,20 @@ PRESETS = {
         "kios": [10, 35],
         "rhos": [200_000, 800_000],
         "Vs":   [1.0, 3.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120,
-                     L=250.0, buffer=60.0, grid_spacing=1.0),
+        "cfg":  dict(n_walkers=100_000, n_ensembles=120),
     },
     "small": {
         "kios": [5, 12, 25, 50],
         "rhos": [100_000, 200_000, 400_000, 800_000, 1_200_000],
         "Vs":   [0.5, 1.0, 2.0, 3.5],
-        "cfg":  dict(n_walkers=5_000, n_ensembles=2,
-                     L=180.0, buffer=45.0, grid_spacing=1.2),
+        "cfg":  dict(n_walkers=5_000, n_ensembles=2),
     },
     "default": {
         "kios": [2, 5, 8, 12, 18, 25, 35, 50, 75],
         "rhos": [100_000, 200_000, 300_000, 400_000, 600_000,
                  800_000, 1_000_000, 1_200_000, 1_500_000],
         "Vs":   [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0],
-        "cfg":  dict(n_walkers=100_000, n_ensembles=120,
-                     L=250.0, buffer=60.0, grid_spacing=1.0),
+        "cfg":  dict(n_walkers=100_000, n_ensembles=120),
     },
     "dense": {
         # P0-E production topology: log rho × log V, diagonal v_i mask,
@@ -432,8 +428,7 @@ PRESETS = {
         # and analytic quadrature weights are made below, not here, so no
         # caller can accidentally turn this back into a linear dense grid.
         "grid": "remediation_log",
-        "cfg":  dict(n_walkers=100_000, n_ensembles=40,
-                     L=300.0, buffer=80.0, grid_spacing=0.75),
+        "cfg":  dict(n_walkers=100_000, n_ensembles=40),
     },
 }
 
@@ -1416,10 +1411,10 @@ def main():
                     help="Override walkers per ensemble for this build (pilot only).")
     ap.add_argument("--sim-ensembles", type=int, default=None,
                     help="Override independent ensembles per entry for this build (pilot only).")
-    ap.add_argument("--sim-L", type=float, default=None,
-                    help="Override periodic domain side in um for this build (pilot only).")
-    ap.add_argument("--sim-grid-spacing", type=float, default=None,
-                    help="Override candidate-cache spacing in um for this build.")
+    ap.add_argument("--geometry-reference", type=str, default=None,
+                    help="Certified SI §S.IV 5e6-cell / 26-alpha geometry-reference "
+                         "table. Defaults to data/geometry_reference_si_kappa_0p9.npz. "
+                         "A library build fails if the certified table is absent.")
     ap.add_argument("--sim-T-max", type=float, default=None,
                     help="Override walk duration in ms; must cover every selected δ+Δ.")
     ap.add_argument("--sim-small-deltas", type=float, nargs="+", default=None,
@@ -1428,10 +1423,6 @@ def main():
                     help="Override stored Δ grid in ms (pilot only).")
     ap.add_argument("--sim-b-values", type=float, nargs="+", default=None,
                     help="Override stored b grid in s/mm² (pilot only).")
-    ap.add_argument("--sim-exchange-calibration-walkers", type=int, default=None,
-                    help="Override per-geometry tagged-exchange calibration walkers.")
-    ap.add_argument("--sim-exchange-calibration-ms", type=float, default=None,
-                    help="Override tagged-exchange calibration duration in ms.")
 
     # -- Custom additions --
     ap.add_argument("--custom-kios", type=float, nargs="+")
@@ -1698,14 +1689,11 @@ def main():
         for arg_name, cfg_name in (
             ("sim_walkers", "n_walkers"),
             ("sim_ensembles", "n_ensembles"),
-            ("sim_L", "L"),
-            ("sim_grid_spacing", "grid_spacing"),
+            ("geometry_reference", "geometry_reference_path"),
             ("sim_T_max", "T_max_ms"),
             ("sim_small_deltas", "small_deltas"),
             ("sim_big_deltas", "big_deltas"),
             ("sim_b_values", "b_values"),
-            ("sim_exchange_calibration_walkers", "exchange_calibration_walkers"),
-            ("sim_exchange_calibration_ms", "exchange_calibration_ms"),
         ):
             value = getattr(args, arg_name)
             if value is not None:

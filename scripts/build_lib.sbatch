@@ -15,7 +15,10 @@
 #SBATCH --export=NONE
 
 # This is the single Sol launcher for production, the P0-D golden check and
-# the pilot build.  Select a mode at submission time, for example:
+# the pilot build.  The 24-hour production default stays on public/public.
+# For the sub-four-hour golden and pilot jobs, override it at submission with
+# ``--partition=htc --qos=public`` and request at least 24G host memory.
+# Select a mode at submission time, for example:
 #   sbatch --array=0-0 scripts/build_lib.sbatch golden
 #
 # ``#SBATCH --export=NONE`` is mandatory on Sol.  Mode and shard-count are
@@ -70,10 +73,13 @@ case "${MODE}" in
       echo "pilot task ${TASK_ID} is outside [0, ${N_SHARDS})" >&2
       exit 2
     fi
-    # 4 log-rho × 5 log-V nodes with the 0.4<=vi<=0.99 diagonal mask give
-    # four cellular geometry pairs. Five k_io nodes yield 20 cellular rows,
-    # plus the one free-water atom in shard 0. Timings cover both published
-    # finite-lobe cases while keeping a pilot compact.
+    # This pilot is intentionally blocked on the certified SI geometry
+    # reference.  It exercises the SI Eq. S8 source-domain and exact
+    # full-facet (Eq. S2) per-position KD classifier, so it must not override
+    # W or restore the retired candidate cache / tagged-exit calibration
+    # options.  The 8x12 log grid leaves eight masked cellular (rho,V) pairs,
+    # spanning v_i=0.428..0.966; with kio={0,20,130} plus free water it writes
+    # exactly 25 entries across four shards.
     python -m scripts.fit_data \
       --build-library \
       --lib-preset dense \
@@ -83,23 +89,20 @@ case "${MODE}" in
       --seed 20260803 \
       --vi-min 0.4 \
       --vi-max 0.99 \
-      --remediation-n-rho 4 \
-      --remediation-n-V 5 \
-      --remediation-rho-min 100000 \
-      --remediation-rho-max 2000000 \
-      --remediation-V-min 0.205 \
-      --remediation-V-max 12 \
-      --remediation-kios 0 5 20 60 130 \
-      --sim-walkers 2048 \
+      --remediation-n-rho 8 \
+      --remediation-n-V 12 \
+      --remediation-rho-min 10000 \
+      --remediation-rho-max 10000000 \
+      --remediation-V-min 0.01 \
+      --remediation-V-max 200 \
+      --remediation-kios 0 20 130 \
+      --sim-walkers 512 \
       --sim-ensembles 1 \
-      --sim-L 80 \
-      --sim-grid-spacing 0.75 \
-      --sim-T-max 80 \
+      --geometry-reference data/geometry_reference_si_kappa_0p9.npz \
+      --sim-T-max 128 \
       --sim-small-deltas 7 20 \
       --sim-big-deltas 25 50 \
-      --sim-b-values 0 500 1000 2000 4000 6000 \
-      --sim-exchange-calibration-walkers 2048 \
-      --sim-exchange-calibration-ms 32
+      --sim-b-values 0 500 1000 2000 4000 6000
     ;;
 
   production)
@@ -119,7 +122,8 @@ case "${MODE}" in
       --n-shards "${N_SHARDS}" \
       --seed 20260803 \
       --vi-min 0.4 \
-      --vi-max 0.99
+      --vi-max 0.99 \
+      --geometry-reference data/geometry_reference_si_kappa_0p9.npz
     ;;
 
   *)

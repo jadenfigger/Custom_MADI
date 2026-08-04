@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Create the fixed CPU reference artifact for the Tier-C GPU golden test.
 
-The artifact contains the *input random stream* as well as the expected CPU
-trajectory telemetry.  CUDA is therefore checked against exactly the same
-positions, Gaussian proposals and acceptance uniforms—not against a merely
-similar stochastic run.
+The artifact contains one exact full-facet SI §S.II geometry, a fixed full random-input
+stream, and the CPU output.  The Sol job runs the CUDA transliteration on
+those same inputs and exits nonzero if the two implementations diverge.
 
-This script deliberately requires ``--overwrite`` to refresh the committed
-reference.  Updating a golden is a physics-affecting change and should be
-visible in review.
+This is deliberately a *test-only* small geometry reference.  It exercises
+the classifier and crossing implementation, not the production 5e6-cell
+``<A/V>`` calibration table.  A production library build remains blocked
+until that certified table exists.
 """
 
 from __future__ import annotations
@@ -18,11 +18,12 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 
 import numpy as np
 
 from madi.config import SimConfig
-from madi.ensemble import create_ensemble
+from madi.ensemble import alpha_star_from_vi, create_ensemble
 from madi.walker_gpu import make_walk_random_stream, run_walk_Y
 
 
@@ -37,31 +38,55 @@ def _json_default(value):
     raise TypeError(f"cannot JSON-encode {type(value)!r}")
 
 
-def _case_config() -> SimConfig:
-    """Small but nontrivial periodic/high-packing crossing case."""
+def _write_test_reference(path: Path) -> None:
+    """Write a clearly non-certified SI-schema fixture for this golden case."""
+    vi = np.linspace(0.40, 1.00, 26, dtype=np.float64)
+    # rho=1 cell/um^3 makes alpha_star numerically equal to SI x.
+    alpha_x = np.asarray([
+        0.0 if value >= 1.0 else alpha_star_from_vi(value, 1.0e9)
+        for value in vi
+    ])
+    # The magnitude is immaterial to the golden comparison; it only selects
+    # a nonzero p_p for the exercised trajectory.  Its metadata prevents the
+    # fixture from ever passing as a production calibration table.
+    mean = 4.0 - 2.0 * vi
+    metadata = {
+        "schema": "madi-si-test-reference-v1",
+        "source": "test fixture; not a production SI reference cloud",
+        "rho_reference": 1.0,
+        "kappa": 0.90,
+        "n_single_cells": 16,
+        "n_alpha": 26,
+        "alpha_spacing": "linear",
+        "mean_estimator": "untrimmed_arithmetic_mean_A_over_V",
+        "contraction_rule": "all_shifted_voronoi_facets_S2",
+    }
+    np.savez(
+        path,
+        vi=vi,
+        alpha_x=alpha_x,
+        mean_A_over_V_norm=mean,
+        metadata_json=np.array(json.dumps(metadata, sort_keys=True)),
+    )
+
+
+def _case_config(reference: Path) -> SimConfig:
+    """Small exact-classifier case with a source-to-boundary safety margin."""
     return SimConfig(
-        L=48.0,
-        grid_spacing=0.75,
-        classifier_candidates=8,
-        geometry_calibration_points=20_000,
-        geometry_validation_points=20_000,
-        geometry_sample_cells=20,
-        geometry_vi_tolerance=0.005,
+        # Explicit L is permitted only in a Tier-A/Tier-C diagnostic.  The
+        # production builder leaves it None and uses SI Eq. S8 per entry.
+        L=160.0,
+        geometry_reference_path=str(reference),
+        allow_uncertified_geometry_reference=True,
+        geometry_validation_points=10_000,
+        geometry_vi_tolerance=0.03,
         n_walkers=64,
         n_ensembles=1,
         T_max_ms=4.0,
         small_deltas=[1.0],
         big_deltas=[2.0, 3.0],
         b_values=[0.0, 500.0, 1_000.0, 2_000.0],
-        exchange_calibration_walkers=64,
-        exchange_calibration_ms=4.0,
     )
-
-
-def _config_metadata(cfg: SimConfig) -> dict:
-    # ``asdict`` is stable and includes every physics-relevant default in
-    # this deliberately fixed test configuration.
-    return asdict(cfg)
 
 
 def main() -> int:
@@ -75,51 +100,61 @@ def main() -> int:
         parser.error(f"{output} exists; pass --overwrite to replace the CPU golden")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg = _case_config()
-    # vi = 1e6 * 0.9 * 1e-6 = 0.9: deliberately exercises thin annuli.
-    rho, V, pp = 1.0e6, 0.9, 0.02
-    geometry_seed, stream_seed = 20_260_811, 20_260_812
-    ensemble = create_ensemble(rho, V, cfg, seed=geometry_seed, verbose=False)
-    stream = make_walk_random_stream(cfg, stream_seed)
-    Y, n_escaped, telemetry = run_walk_Y(
-        ensemble, 0.0, cfg, pp=pp, seed=0, verbose=False,
-        return_telemetry=True, classifier="cache", random_stream=stream,
-        use_gpu=False,
-    )
+    with tempfile.TemporaryDirectory(prefix="madi_gpu_golden_") as temporary:
+        reference = Path(temporary) / "test_geometry_reference.npz"
+        _write_test_reference(reference)
+        cfg = _case_config(reference)
+        # v_i=0.90 deliberately exercises thin annuli, full-facet
+        # classification, and two-membrane endpoint transitions.  It is not
+        # a production calibration case.
+        rho, V, pp = 1.0e6, 0.9, 0.02
+        geometry_seed, stream_seed = 20_260_811, 20_260_812
+        ensemble = create_ensemble(rho, V, cfg, seed=geometry_seed, verbose=False)
+        stream = make_walk_random_stream(cfg, stream_seed, ensemble)
+        Y, n_escaped, telemetry = run_walk_Y(
+            ensemble, 0.0, cfg, pp=pp, seed=0, verbose=False,
+            return_telemetry=True, classifier="exact", random_stream=stream,
+            use_gpu=False,
+        )
     if n_escaped:
-        raise RuntimeError("periodic CPU golden unexpectedly recorded an escape")
+        raise RuntimeError("SI source-domain CPU golden recorded an escape")
 
     case = {
-        "schema": "madi-cpu-gpu-golden-v1",
+        "schema": "madi-cpu-gpu-golden-v3-full-facet",
         "rho_requested_per_uL": rho,
         "V_requested_pL": V,
         "pp": pp,
         "geometry_seed": geometry_seed,
         "stream_seed": stream_seed,
         "n_escaped": int(n_escaped),
-        "geometry": asdict(ensemble.geometry),
+        "geometry": ensemble.geometry.to_dict(),
         "rho_realised_per_uL": ensemble.rho,
         "V_realised_pL": ensemble.V,
         "vi_realised": ensemble.vi,
         "alpha_star_um": ensemble.alpha_star,
         "mean_A_over_V_um_inv": ensemble.mean_AV,
+        "source_lo_um": ensemble.source_lo,
+        "source_hi_um": ensemble.source_hi,
+        "reference_fixture": "non-certified test fixture; production table not used",
     }
     np.savez_compressed(
         output,
         schema=np.array(case["schema"]),
-        config_json=np.array(json.dumps(_config_metadata(cfg), sort_keys=True, default=_json_default)),
+        config_json=np.array(json.dumps(asdict(cfg), sort_keys=True, default=_json_default)),
         case_json=np.array(json.dumps(case, sort_keys=True, default=_json_default)),
         seeds=ensemble.seeds,
         annulus=ensemble.annulus,
-        grid_candidates=ensemble.grid_candidates,
+        kd_node_seed=ensemble.kd_node_seed,
+        kd_node_axis=ensemble.kd_node_axis,
+        kd_node_left=ensemble.kd_node_left,
+        kd_node_right=ensemble.kd_node_right,
+        kd_node_parent=ensemble.kd_node_parent,
         initial_positions=stream.initial_positions,
         increments=stream.increments,
         acceptance_uniforms=stream.acceptance_uniforms,
         Y_cpu=Y,
         escaped_cpu=np.array(n_escaped, dtype=np.int64),
-        metrics_cpu=np.asarray(telemetry["metrics"], dtype=np.float64),
         occupancy_fraction_cpu=np.asarray(telemetry["occupancy_fraction"], dtype=np.float64),
-        start_survivor_fraction_cpu=np.asarray(telemetry["start_survivor_fraction"], dtype=np.float64),
     )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     sha_path = output.with_suffix(output.suffix + ".sha256")
