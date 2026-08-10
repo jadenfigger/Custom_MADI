@@ -158,11 +158,30 @@ def _assemble(res: ReducedResult, columns: ColumnGrid) -> dict:
     n_eff = res.n_eff
     S = (res.cos_sum / n_eff).reshape(columns.n_pairs, columns.n_b)
     S_imag = (res.sin_sum / n_eff).reshape(columns.n_pairs, columns.n_b)
+    if len(res.ensemble_cos_means) != len(res.ensemble_sin_means):
+        raise RuntimeError("reduction returned mismatched real/imaginary ensemble means")
+    if res.ensemble_cos_means:
+        ensemble_S = np.asarray(res.ensemble_cos_means, dtype=np.float64).reshape(
+            len(res.ensemble_cos_means), columns.n_pairs, columns.n_b,
+        )
+        ensemble_S_imag = np.asarray(res.ensemble_sin_means, dtype=np.float64).reshape(
+            len(res.ensemble_sin_means), columns.n_pairs, columns.n_b,
+        )
+    else:
+        # Keep direct unit tests that construct a bare ReducedResult useful;
+        # production library builds require the populated arrays below.
+        ensemble_S = None
+        ensemble_S_imag = None
     return {
         'delta_pairs': columns.delta_pairs,
         'b_values':    columns.b_values,
         'S':           S,
         'S_imag':      S_imag,
+        # Transient v5 inputs: one value per independently constructed
+        # ensemble, ordered by ensemble index.  library.py retains only the
+        # declared 200-column real subset in the final artifact.
+        'ensemble_S': ensemble_S,
+        'ensemble_S_imag': ensemble_S_imag,
         'phase_model': columns.phase_model,
         'n_eff':       n_eff,
         'n_escaped':   res.n_escaped,

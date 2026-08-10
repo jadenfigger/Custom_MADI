@@ -1,0 +1,42 @@
+{
+  "schema": "madi-replicate-entry-subset-v1",
+  "purpose": "Independent-seed replicate for calibrating the v5 between-ensemble variance estimator after the production build. This is a restricted diagnostic build, not a replacement production library.",
+  "parent_grid": {
+    "rho_nodes": 64,
+    "V_nodes": 64,
+    "rho_min": 10000.0,
+    "rho_max": 10000000.0,
+    "V_min": 0.01,
+    "V_max": 200.0,
+    "vi_min": 0.4,
+    "vi_max": 0.99
+  },
+  "triplet_order": "cellular_pairs order below, then kio_values order within each pair; free water follows last",
+  "kio_values_s_inv": [0.0, 5.0, 10.0, 15.0, 25.0, 35.0, 55.0, 90.0, 130.0],
+  "cellular_pairs": [
+    {"rho_index": 0, "V_index": 53, "rho": 10000.0, "V": 41.52664275536708},
+    {"rho_index": 3, "V_index": 54, "rho": 13894.954943731389, "V": 48.59562131612258},
+    {"rho_index": 6, "V_index": 54, "rho": 19306.977288832495, "V": 48.59562131612258},
+    {"rho_index": 9, "V_index": 47, "rho": 26826.957952797275, "V": 16.169810020515047},
+    {"rho_index": 12, "V_index": 48, "rho": 37275.93720314938, "V": 18.922357127197234},
+    {"rho_index": 15, "V_index": 48, "rho": 51794.74679231213, "V": 18.922357127197234},
+    {"rho_index": 18, "V_index": 41, "rho": 71968.56730011514, "V": 6.2962652107424715},
+    {"rho_index": 21, "V_index": 42, "rho": 100000.0, "V": 7.368062997280774},
+    {"rho_index": 24, "V_index": 41, "rho": 138949.5494373136, "V": 6.2962652107424715},
+    {"rho_index": 27, "V_index": 34, "rho": 193069.77288832495, "V": 2.095032629260912},
+    {"rho_index": 30, "V_index": 35, "rho": 268269.57952797273, "V": 2.451664896106383},
+    {"rho_index": 33, "V_index": 35, "rho": 372759.3720314938, "V": 2.451664896106383},
+    {"rho_index": 36, "V_index": 28, "rho": 517947.46792312124, "V": 0.8157721730960482},
+    {"rho_index": 39, "V_index": 29, "rho": 719685.6730011514, "V": 0.9546390696098913},
+    {"rho_index": 42, "V_index": 29, "rho": 1000000.0, "V": 0.9546390696098913},
+    {"rho_index": 45, "V_index": 22, "rho": 1389495.494373136, "V": 0.3176486270920845},
+    {"rho_index": 48, "V_index": 23, "rho": 1930697.7288832497, "V": 0.37172117391450143},
+    {"rho_index": 51, "V_index": 22, "rho": 2682695.7952797273, "V": 0.3176486270920845},
+    {"rho_index": 54, "V_index": 16, "rho": 3727593.720314938, "V": 0.12368729115942305},
+    {"rho_index": 57, "V_index": 17, "rho": 5179474.679231202, "V": 0.14474227541602736},
+    {"rho_index": 63, "V_index": 14, "rho": 10000000.0, "V": 0.09032010701366826}
+  ],
+  "include_free_water": true,
+  "expected_cellular_entries": 189,
+  "expected_total_entries": 190
+}

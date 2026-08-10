@@ -451,6 +451,85 @@ def _entry_key_for_script(kio: float, rho: float, volume: float):
     return (round(float(kio), 4), round(float(rho), 1), round(float(volume), 6))
 
 
+def load_remediation_entry_subset(
+    path: str,
+    canonical_triplets: list[tuple[float, float, float]],
+) -> tuple[list[tuple[float, float, float]], dict]:
+    """Resolve the declared v5 replicate subset against the full P0 grid.
+
+    A restricted build must not accept arbitrary coordinates: each declared
+    pair/k_io combination is checked against the canonical weighted
+    remediation grid, retaining the production quadrature weights and making
+    a typo fail before any expensive GPU work begins.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            declaration = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read remediation entry subset {path!r}: {exc}") from exc
+
+    if declaration.get("schema") != "madi-replicate-entry-subset-v1":
+        raise ValueError("unsupported remediation entry-subset schema")
+    pairs = declaration.get("cellular_pairs")
+    kios = declaration.get("kio_values_s_inv")
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("remediation entry subset must declare non-empty cellular_pairs")
+    if not isinstance(kios, list) or not kios:
+        raise ValueError("remediation entry subset must declare non-empty kio_values_s_inv")
+
+    canonical = {
+        _entry_key_for_script(kio, rho, volume): (float(kio), float(rho), float(volume))
+        for kio, rho, volume in canonical_triplets
+    }
+    selected: list[tuple[float, float, float]] = []
+    selected_keys: set[tuple] = set()
+    for pair in pairs:
+        if not isinstance(pair, dict) or "rho" not in pair or "V" not in pair:
+            raise ValueError("each remediation subset pair must contain rho and V")
+        rho = float(pair["rho"])
+        volume = float(pair["V"])
+        for kio in kios:
+            key = _entry_key_for_script(float(kio), rho, volume)
+            if key not in canonical:
+                raise ValueError(
+                    "remediation subset coordinate is not a retained canonical "
+                    f"grid entry: kio={kio}, rho={rho}, V={volume}"
+                )
+            if key in selected_keys:
+                raise ValueError(f"remediation subset declares duplicate entry {key!r}")
+            selected.append(canonical[key])
+            selected_keys.add(key)
+
+    if bool(declaration.get("include_free_water", False)):
+        free_key = _entry_key_for_script(0.0, 0.0, 0.0)
+        if free_key not in canonical:
+            raise ValueError("canonical remediation grid is missing its free-water atom")
+        selected.append(canonical[free_key])
+        selected_keys.add(free_key)
+
+    expected_cellular = declaration.get("expected_cellular_entries")
+    expected_total = declaration.get("expected_total_entries")
+    cellular_count = sum(1 for _, rho, _ in selected if rho > 0.0)
+    if expected_cellular is not None and cellular_count != int(expected_cellular):
+        raise ValueError(
+            f"remediation subset has {cellular_count} cellular entries, expected {expected_cellular}"
+        )
+    if expected_total is not None and len(selected) != int(expected_total):
+        raise ValueError(
+            f"remediation subset has {len(selected)} total entries, expected {expected_total}"
+        )
+
+    provenance = {
+        "schema": declaration["schema"],
+        "path": os.path.abspath(path),
+        "sha256": _sha256_file(path),
+        "cellular_entries": cellular_count,
+        "total_entries": len(selected),
+        "purpose": declaration.get("purpose"),
+    }
+    return selected, provenance
+
+
 def parse_input(s: str):
     """Parse a single --input spec.
 
@@ -1407,6 +1486,10 @@ def main():
     ap.add_argument("--remediation-kios", type=float, nargs="+", default=None,
                     help="[dense remediation grid] explicit piecewise-linear k_io "
                          "nodes, including zero; intended for pilot builds.")
+    ap.add_argument("--remediation-entry-subset", type=str, default=None,
+                    help="[dense remediation grid] JSON declaration of a restricted, "
+                         "canonical-entry build (used only for the independent-seed "
+                         "v5 replicate validation job).")
     ap.add_argument("--sim-walkers", type=int, default=None,
                     help="Override walkers per ensemble for this build (pilot only).")
     ap.add_argument("--sim-ensembles", type=int, default=None,
@@ -1702,6 +1785,21 @@ def main():
         remediation_grid = None
         remediation_triplets = None
         remediation_weights = None
+        build_grid_metadata = None
+        if args.remediation_entry_subset is not None:
+            if preset.get("grid") != "remediation_log":
+                print("ERROR: --remediation-entry-subset requires --lib-preset dense")
+                return
+            if args.triplets or args.explicit or args.custom_kios or args.custom_rhos or args.custom_Vs:
+                print("ERROR: --remediation-entry-subset cannot be combined with other grid selectors")
+                return
+            if (args.remediation_kios is not None
+                    or args.remediation_n_rho != 64 or args.remediation_n_V != 64
+                    or args.remediation_rho_min != 1.0e4 or args.remediation_rho_max != 1.0e7
+                    or args.remediation_V_min != 0.01 or args.remediation_V_max != 200.0
+                    or args.vi_min != 0.40 or args.vi_max != 0.99):
+                print("ERROR: --remediation-entry-subset requires the unmodified P0 remediation grid")
+                return
         if preset.get("grid") == "remediation_log":
             remediation_grid = make_remediation_log_grid(
                 n_rho=args.remediation_n_rho,
@@ -1715,6 +1813,25 @@ def main():
                 vi_min=args.vi_min, vi_max=args.vi_max,
             )
             remediation_triplets, remediation_weights = remediation_grid.triplets_and_weights()
+            build_grid_metadata = remediation_grid.metadata()
+            if args.remediation_entry_subset is not None:
+                try:
+                    remediation_triplets, subset_provenance = load_remediation_entry_subset(
+                        args.remediation_entry_subset, remediation_triplets,
+                    )
+                except ValueError as exc:
+                    print(f"ERROR: {exc}")
+                    return
+                remediation_weights = {
+                    _entry_key_for_script(*triplet): remediation_weights[
+                        _entry_key_for_script(*triplet)
+                    ]
+                    for triplet in remediation_triplets
+                }
+                build_grid_metadata = {
+                    **build_grid_metadata,
+                    "restricted_entry_subset": subset_provenance,
+                }
 
         # Load existing if appending
         existing = None
@@ -1778,6 +1895,10 @@ def main():
             print(f"  vi:  {args.vi_min:.3f} .. {args.vi_max:.3f} (diagonal mask)")
             print(f"  kio: {remediation_grid.kios.tolist()} s^-1")
             print("  free water: one explicit discrete atom")
+            if args.remediation_entry_subset is not None:
+                subset = build_grid_metadata["restricted_entry_subset"]
+                print(f"  restricted replicate subset: {subset['cellular_entries']} cellular "
+                      f"+ {subset['total_entries'] - subset['cellular_entries']} free-water entries")
 
             if args.shard_id is not None:
                 if args.n_shards is None or args.n_shards < 1:
@@ -1814,7 +1935,7 @@ def main():
                     existing_library=existing, seed=args.seed,
                     vi_min=args.vi_min, vi_max=args.vi_max,
                     entry_weights=shard_weights,
-                    grid_metadata=remediation_grid.metadata(),
+                    grid_metadata=build_grid_metadata,
                 )
                 return
 
@@ -1823,7 +1944,7 @@ def main():
                 existing_library=existing, seed=args.seed,
                 vi_min=args.vi_min, vi_max=args.vi_max,
                 entry_weights=remediation_weights,
-                grid_metadata=remediation_grid.metadata(),
+                grid_metadata=build_grid_metadata,
             )
             return
 

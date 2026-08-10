@@ -14,10 +14,11 @@
 #SBATCH --mail-user=jfigger@asu.edu
 #SBATCH --export=NONE
 
-# This is the single Sol launcher for production, the P0-D golden check and
-# the pilot build.  The 24-hour production default stays on public/public.
-# For the sub-four-hour golden and pilot jobs, override it at submission with
-# ``--partition=htc --qos=public`` and request at least 24G host memory.
+# This is the single Sol launcher for production, the P0-D golden check, the
+# v5 pilot build, and the post-production restricted replicate.  The 24-hour
+# production default stays on public/public.  For the sub-four-hour golden and
+# pilot jobs, override it at submission with ``--partition=htc --qos=public``
+# and request at least 24G host memory.
 # Select a mode at submission time, for example:
 #   sbatch --array=0-0 scripts/build_lib.sbatch golden
 #
@@ -79,11 +80,15 @@ case "${MODE}" in
     # W or restore the retired candidate cache / tagged-exit calibration
     # options.  The 8x12 log grid leaves eight masked cellular (rho,V) pairs,
     # spanning v_i=0.428..0.966; with kio={0,20,130} plus free water it writes
-    # exactly 25 entries across four shards.
+    # exactly 25 entries across four shards.  Eight independent 512-walker
+    # ensembles exercise v5 variance/subset storage only; this is not a
+    # production-Monte-Carlo-precision run.  The compact 60-pair timing grid
+    # contains every declared v5 diagnostic pair, and the dense preset's
+    # unchanged default b grid supplies all 25 stored b-values.
     python -m scripts.fit_data \
       --build-library \
       --lib-preset dense \
-      --library libraries/madi_remediation_pilot.npz \
+      --library libraries/madi_v5_remediation_pilot.npz \
       --shard-id "${TASK_ID}" \
       --n-shards "${N_SHARDS}" \
       --seed 20260803 \
@@ -97,12 +102,11 @@ case "${MODE}" in
       --remediation-V-max 200 \
       --remediation-kios 0 20 130 \
       --sim-walkers 512 \
-      --sim-ensembles 1 \
+      --sim-ensembles 8 \
       --geometry-reference data/geometry_reference_si_kappa_0p9.npz \
       --sim-T-max 128 \
-      --sim-small-deltas 7 20 \
-      --sim-big-deltas 25 50 \
-      --sim-b-values 0 500 1000 2000 4000 6000
+      --sim-small-deltas 5 7 10 12 15 20 25 30 \
+      --sim-big-deltas 15 25 30 36 40 50 60 80
     ;;
 
   production)
@@ -126,8 +130,36 @@ case "${MODE}" in
       --geometry-reference data/geometry_reference_si_kappa_0p9.npz
     ;;
 
+  replicate)
+    N_SHARDS="${2:-8}"
+    if (( TASK_ID < 0 || TASK_ID >= N_SHARDS )); then
+      echo "replicate task ${TASK_ID} is outside [0, ${N_SHARDS})" >&2
+      exit 2
+    fi
+    # W4 is deliberately a post-production, independently seeded restricted
+    # build.  Its declared 190-entry subset spans the P0 (rho,V) plane and
+    # k_io axis.  Do not submit it until the production artifact exists and a
+    # separate approval is given; it compares only against that production
+    # artifact and never overwrites it.
+    if [[ ! -f libraries/madi_dense_universal_remediated.npz ]]; then
+      echo "ERROR: replicate mode is post-production; the v5 production artifact is absent." >&2
+      exit 2
+    fi
+    python -m scripts.fit_data \
+      --build-library \
+      --lib-preset dense \
+      --library libraries/madi_dense_v5_replicate_subset.npz \
+      --shard-id "${TASK_ID}" \
+      --n-shards "${N_SHARDS}" \
+      --seed 20260804 \
+      --vi-min 0.4 \
+      --vi-max 0.99 \
+      --remediation-entry-subset data/madi_v5_replicate_entry_subset.json \
+      --geometry-reference data/geometry_reference_si_kappa_0p9.npz
+    ;;
+
   *)
-    echo "Pass positional mode golden, pilot, or production; got ${MODE}." >&2
+    echo "Pass positional mode golden, pilot, production, or replicate; got ${MODE}." >&2
     exit 2
     ;;
 esac

@@ -75,6 +75,26 @@ B_MAX_S_MM2 = 12000.0
 B_STEP_S_MM2 = 500.0
 
 
+# ---------------------------------------------------------------------------
+# v5 Monte-Carlo covariance diagnostic subset
+# ---------------------------------------------------------------------------
+#
+# The production artifact stores one collapsed signal value for every column,
+# plus a between-ensemble variance.  That is enough to estimate the marginal
+# Monte-Carlo error of an entry, but not covariance between neighbouring
+# entries coupled by common random numbers.  Retaining all per-ensemble means
+# would be prohibitively large, so the v5 schema declares this small,
+# invariant diagnostic subset instead.  Its order is part of the on-disk
+# contract: pair-major, then b-major within each pair.
+ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS: tuple[tuple[float, float], ...] = (
+    (5.0, 15.0), (7.0, 25.0), (10.0, 30.0), (12.0, 36.0),
+    (15.0, 40.0), (20.0, 50.0), (25.0, 60.0), (30.0, 80.0),
+)
+ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2 = np.arange(
+    int(B_MAX_S_MM2 / B_STEP_S_MM2) + 1, dtype=float,
+) * B_STEP_S_MM2
+
+
 def sqrt_spaced_bvalues(b_max: float = B_MAX_S_MM2, n: int = 28) -> np.ndarray:
     """b-values [s/mm²] spaced uniformly in sqrt(b), including b=0.
 

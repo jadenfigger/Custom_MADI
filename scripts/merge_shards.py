@@ -84,14 +84,23 @@ def main():
     print(f"Merging {len(paths)} shard files:")
     first_meta = load_library_meta(paths[0])
     first_grid = json.dumps((first_meta.get("build_metadata") or {}).get("grid", {}), sort_keys=True)
+    first_schema = first_meta.get("library_schema")
+    first_build_seed = (first_meta.get("build_metadata") or {}).get("build_seed")
+    first_uncertainty = json.dumps(
+        ((first_meta.get("build_metadata") or {}).get("uncertainty", {})),
+        sort_keys=True,
+    )
     merged = []
     seen = set()
     for p in paths:
         shard_meta = load_library_meta(p)
         if (shard_meta["delta_pairs"] != first_meta["delta_pairs"]
                 or shard_meta["b_values"] != first_meta["b_values"]
-                or json.dumps((shard_meta.get("build_metadata") or {}).get("grid", {}), sort_keys=True) != first_grid):
-            print(f"ERROR: shard metadata grid mismatch: {p}")
+                or shard_meta.get("library_schema") != first_schema
+                or (shard_meta.get("build_metadata") or {}).get("build_seed") != first_build_seed
+                or json.dumps((shard_meta.get("build_metadata") or {}).get("grid", {}), sort_keys=True) != first_grid
+                or json.dumps(((shard_meta.get("build_metadata") or {}).get("uncertainty", {})), sort_keys=True) != first_uncertainty):
+            print(f"ERROR: shard metadata/schema/uncertainty mismatch: {p}")
             sys.exit(1)
         lib = load_library(p)
         before = len(merged)
@@ -105,8 +114,10 @@ def main():
             merged.append(e)
         print(f"  {p}: +{len(merged) - before} new  ({len(lib)} in file)")
 
-    # Preserve the (δ,Δ,b) grid metadata from the first shard so the merged
-    # library's stored pair/b-value axes match the concatenated vectors.
+    # Preserve the (δ,Δ,b) grid metadata and v5 uncertainty contract from the
+    # first shard.  load_library carries the per-entry diagnostic arrays, so
+    # _save_library concatenates them in exactly the same entry order as
+    # vectors.
     meta = first_meta
     columns = _columns_from_meta(meta)
     cfg = SimConfig(h_ms=(meta.get("h_ms") or 1.0))

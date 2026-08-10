@@ -135,6 +135,12 @@ class ReducedResult:
     pp_values: list[float] = field(default_factory=list)
     analytic_kio_eq5_values: list[float] = field(default_factory=list)
     geometry_stats: list[dict] = field(default_factory=list)
+    # One real/imaginary mean vector per independently constructed ensemble,
+    # in ensemble-index order.  These are kept only while an entry is being
+    # assembled into the v5 library diagnostics; the production artifact does
+    # not store them for every column.
+    ensemble_cos_means: list[np.ndarray] = field(default_factory=list)
+    ensemble_sin_means: list[np.ndarray] = field(default_factory=list)
 
     @property
     def n_eff(self) -> int:
@@ -704,6 +710,8 @@ def _walk_and_reduce_one_ensemble(
         occupancy_counts=occupancy, pp_values=[float(pp)],
         analytic_kio_eq5_values=[pp_to_kio_eq5(pp, ens.mean_AV, cfg)] if not ens.is_free_water else [0.0],
         geometry_stats=[ens.geometry.to_dict()],
+        ensemble_cos_means=[cos_total / float(3 * total)],
+        ensemble_sin_means=[sin_total / float(3 * total)],
     )
 
 
@@ -724,6 +732,12 @@ def _merge_results(results: Sequence[ReducedResult]) -> ReducedResult:
         merged.pp_values.extend(result.pp_values)
         merged.analytic_kio_eq5_values.extend(result.analytic_kio_eq5_values)
         merged.geometry_stats.extend(result.geometry_stats)
+        # ``results`` is ordered by ensemble_index in
+        # run_simulation_multi_kio_reduced.  Do not sort, aggregate, or
+        # otherwise reorder these arrays: v5 uses this order as the
+        # common-random-number partner identity across library entries.
+        merged.ensemble_cos_means.extend(result.ensemble_cos_means)
+        merged.ensemble_sin_means.extend(result.ensemble_sin_means)
     return merged
 
 

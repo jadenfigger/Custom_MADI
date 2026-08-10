@@ -52,9 +52,25 @@ import numpy as np
 
 from collections import defaultdict
 
-from .config       import SimConfig, DELTA_SMALL, DELTAS_BIG, BVALS_UNIQUE
+from .config       import (
+    SimConfig, DELTA_SMALL, DELTAS_BIG, BVALS_UNIQUE,
+    ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS,
+    ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2,
+)
 from . import signal as sig
 from . import fitters_gpu
+
+
+MADI_LIBRARY_SCHEMA_V5 = "madi-library-v5"
+MADI_LIBRARY_SCHEMA_V4 = "madi-library-v4"
+MADI_LIBRARY_ENTRY_SCHEMA_V5 = "madi-library-entry-v5"
+
+# The on-disk diagnostic column order is intentionally independent of a
+# caller's main storage-grid order: declared pair-major, then b-major.
+ENSEMBLE_MEAN_SUBSET_N_COLUMNS = (
+    len(ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS)
+    * len(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +83,12 @@ class LibraryEntry:
     rho:    float
     V:      float
     vector: np.ndarray   # flat S[δ,Δ,b].ravel() — pair-major then b
+    # v5 per-column Monte-Carlo diagnostics.  They remain optional so v4 and
+    # legacy artifacts continue to load, but every new builder-produced
+    # artifact supplies all three.
+    signal_imag: np.ndarray | None = None
+    signal_variance: np.ndarray | None = None
+    ensemble_means_subset: np.ndarray | None = None
     # Everything below is optional so legacy files and small test fixtures
     # remain readable.  New builds always populate these fields.
     vi: float | None = None
@@ -287,6 +309,135 @@ def _summarise_realised_geometry(per_ensemble: list[dict], cfg: SimConfig) -> di
     }
 
 
+def ensemble_mean_subset_column_indices(columns: "sig.ColumnGrid") -> np.ndarray:
+    """Return full-vector indices for the declared v5 covariance subset.
+
+    The returned indices are in the immutable schema order: the eight
+    declared ``(delta, Delta)`` pairs in
+    ``ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS``, each crossed with the complete
+    declared 25-value b grid.  A v5 builder must have every one of these
+    columns; accepting a partial diagnostic subset would make covariance
+    comparisons across artifacts ambiguous.
+    """
+    expected_b = np.asarray(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, dtype=float)
+    actual_b = np.asarray(columns.b_values, dtype=float)
+    if actual_b.shape != expected_b.shape or not np.array_equal(actual_b, expected_b):
+        raise ValueError(
+            "madi-library-v5 requires the declared 25-point b grid for the "
+            "per-ensemble covariance diagnostic subset"
+        )
+
+    pair_to_index = {
+        (float(delta), float(Delta)): index
+        for index, (delta, Delta) in enumerate(columns.delta_pairs)
+    }
+    if len(pair_to_index) != len(columns.delta_pairs):
+        raise ValueError("main storage grid contains duplicate (delta, Delta) pairs")
+    missing = [pair for pair in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS
+               if pair not in pair_to_index]
+    if missing:
+        raise ValueError(
+            "madi-library-v5 main storage grid omits declared ensemble-mean "
+            f"diagnostic pairs: {missing!r}"
+        )
+
+    return np.asarray([
+        pair_to_index[pair] * columns.n_b + b_index
+        for pair in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS
+        for b_index in range(columns.n_b)
+    ], dtype=np.int64)
+
+
+def _v5_diagnostics_from_result(
+    result: dict,
+    columns: "sig.ColumnGrid",
+    cfg: SimConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Derive the three v5 diagnostic payloads from one reduced entry.
+
+    ``signal_variance`` is deliberately a sample variance across independent
+    ensemble means, not a pooled walker/axis variance.  The three axes from
+    one 3-D walk and all walkers in one geometry are correlated at the level
+    relevant to the Fisher correction, so pooling them would understate the
+    uncertainty that this field exists to preserve.
+    """
+    ensemble_real = result.get("ensemble_S")
+    ensemble_imag = result.get("ensemble_S_imag")
+    if ensemble_real is None or ensemble_imag is None:
+        raise RuntimeError("v5 library build requires per-ensemble reduced signals")
+    ensemble_real = np.asarray(ensemble_real, dtype=np.float64)
+    ensemble_imag = np.asarray(ensemble_imag, dtype=np.float64)
+    expected_shape = (int(cfg.n_ensembles), columns.n_pairs, columns.n_b)
+    if ensemble_real.shape != expected_shape or ensemble_imag.shape != expected_shape:
+        raise RuntimeError(
+            "per-ensemble reduced signal shape does not match the configured "
+            f"ensemble/grid contract: got real={ensemble_real.shape}, "
+            f"imag={ensemble_imag.shape}, expected={expected_shape}"
+        )
+    if not (np.all(np.isfinite(ensemble_real)) and np.all(np.isfinite(ensemble_imag))):
+        raise RuntimeError("per-ensemble reduced signals contain non-finite values")
+    if int(cfg.n_ensembles) < 2:
+        raise ValueError("madi-library-v5 requires at least two ensembles for sample variance")
+
+    # W1: the collapsed imaginary signal already accumulated by the reducer.
+    signal_imag = np.asarray(result["S_imag"], dtype=np.float64).reshape(
+        columns.n_pairs, columns.n_b,
+    )
+    # W2: sample variance (ddof=1) of independently constructed ensemble
+    # means.  The analysis consumer converts it to SE via sqrt(s^2 / n).
+    signal_variance = np.var(ensemble_real, axis=0, ddof=1)
+    if np.any(signal_variance < 0.0):
+        raise RuntimeError("between-ensemble sample variance became negative")
+
+    # W3: retain only the declared small subset, preserving e=0..E-1 as axis
+    # zero within each entry.  The artifact adds an entry axis around this.
+    subset_indices = ensemble_mean_subset_column_indices(columns)
+    ensemble_subset = ensemble_real.reshape(int(cfg.n_ensembles), -1)[:, subset_indices]
+
+    # The artifact intentionally does not retain a full imaginary variance
+    # array.  Calculate the exact ensemble-level Student statistic while the
+    # means are available and retain only its per-entry maximum in metadata;
+    # this lets the validator test the stored S_imag symmetry check without
+    # adding another full signal matrix.
+    imag_mean = np.mean(ensemble_imag, axis=0)
+    imag_se = np.std(ensemble_imag, axis=0, ddof=1) / np.sqrt(cfg.n_ensembles)
+    abs_z = np.zeros_like(imag_mean)
+    positive_se = imag_se > 0.0
+    abs_z[positive_se] = np.abs(imag_mean[positive_se] / imag_se[positive_se])
+    zero_se_nonzero = (~positive_se) & (np.abs(imag_mean) > 0.0)
+    abs_z[zero_se_nonzero] = np.inf
+    max_flat = int(np.argmax(abs_z))
+    max_pair_index, max_b_index = np.unravel_index(max_flat, abs_z.shape)
+    imaginary_check = {
+        "method": (
+            "absolute Student statistic of the mean of independent "
+            "per-ensemble imaginary signals (ddof=1)"
+        ),
+        "n_ensembles": int(cfg.n_ensembles),
+        "degrees_of_freedom": int(cfg.n_ensembles - 1),
+        "max_abs_standardized_deviation": float(abs_z.flat[max_flat]),
+        "max_column": {
+            "delta_ms": float(columns.delta_pairs[max_pair_index][0]),
+            "Delta_ms": float(columns.delta_pairs[max_pair_index][1]),
+            "b_s_mm2": float(columns.b_values[max_b_index]),
+        },
+        # Retaining the value and SE at the maximizing column lets the
+        # artifact validator tie this compact standardized check back to the
+        # stored float32 signal_imag array without storing all ensemble-level
+        # imaginary means.
+        "mean_imaginary_signal": float(imag_mean.flat[max_flat]),
+        "standard_error": float(imag_se.flat[max_flat]),
+        "zero_standard_error_nonzero_count": int(np.count_nonzero(zero_se_nonzero)),
+    }
+
+    return (
+        np.asarray(signal_imag, dtype=np.float32).ravel(),
+        np.asarray(signal_variance, dtype=np.float32).ravel(),
+        np.asarray(ensemble_subset, dtype=np.float32),
+        imaginary_check,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core builder: works on an explicit list of (kio, rho, V) triplets
 # ---------------------------------------------------------------------------
@@ -316,6 +467,11 @@ def build_library_from_triplets(
     """
     if cfg is None:
         cfg = SimConfig()
+    if int(cfg.n_ensembles) < 2:
+        raise ValueError(
+            "madi-library-v5 requires at least two independently constructed "
+            "ensembles so that per-column sample variance is defined"
+        )
 
     if existing_library is not None:
         library = list(existing_library)
@@ -325,6 +481,19 @@ def build_library_from_triplets(
     else:
         library = []
         done = set()
+
+    if library:
+        diagnostics_present = [
+            entry.signal_imag is not None
+            and entry.signal_variance is not None
+            and entry.ensemble_means_subset is not None
+            for entry in library
+        ]
+        if not all(diagnostics_present):
+            raise ValueError(
+                "cannot append v5 entries to a pre-v5 library: the existing "
+                "artifact lacks required Monte-Carlo diagnostic arrays"
+            )
 
     valid = _filter_valid(triplets, vi_min=vi_min, vi_max=vi_max)
     new_triplets = [t for t in valid if _entry_key(*t) not in done]
@@ -341,7 +510,10 @@ def build_library_from_triplets(
         if verbose:
             print("  Nothing new to compute!")
         if save_path:
-            _save_library(library, save_path, cfg=cfg, grid_metadata=grid_metadata)
+            _save_library(
+                library, save_path, cfg=cfg, grid_metadata=grid_metadata,
+                build_seed=seed,
+            )
         return library
 
     columns = sig.build_columns(cfg)
@@ -391,12 +563,15 @@ def build_library_from_triplets(
         for kio in kios_for_group:
             result = results[kio]
             vec = sig.signals_to_flat(result)
+            signal_imag, signal_variance, ensemble_subset, imaginary_check = (
+                _v5_diagnostics_from_result(result, columns, cfg)
+            )
             summary = _summarise_realised_geometry(result["geometry_stats"], cfg)
             is_free = rho == 0.0 and V == 0.0
             nominal_key = _entry_key(kio, rho, V)
             weight = None if entry_weights is None else entry_weights.get(nominal_key)
             entry_metadata = {
-                "schema": "madi-library-entry-v4",
+                "schema": MADI_LIBRARY_ENTRY_SCHEMA_V5,
                 "nominal": {"kio": float(kio), "rho": float(rho), "V": float(V)},
                 "realised_geometry": summary,
                 "per_ensemble_geometry": result["geometry_stats"],
@@ -416,6 +591,7 @@ def build_library_from_triplets(
                     "occupancy_fraction": np.asarray(result["occupancy_fraction"]).tolist(),
                 },
                 "weight": None if weight is None else float(weight),
+                "imaginary_signal_check": imaginary_check,
             }
             library.append(LibraryEntry(
                 # k_io is undefined for the free-water atom; preserve NaN
@@ -424,6 +600,9 @@ def build_library_from_triplets(
                 rho=(0.0 if is_free else summary["rho_per_uL"]),
                 V=(0.0 if is_free else summary["mean_volume_pL"]),
                 vector=vec,
+                signal_imag=signal_imag,
+                signal_variance=signal_variance,
+                ensemble_means_subset=ensemble_subset,
                 vi=(0.0 if is_free else summary["vi"]),
                 weight=None if weight is None else float(weight),
                 kio_nominal=float(kio),
@@ -447,7 +626,7 @@ def build_library_from_triplets(
         # against SLURM preemption / walltime kills.
         if save_path:
             _save_library(library, save_path, cfg=cfg, columns=columns,
-                          grid_metadata=grid_metadata)
+                          grid_metadata=grid_metadata, build_seed=seed)
 
     elapsed = time.time() - t0
     if verbose:
@@ -456,7 +635,7 @@ def build_library_from_triplets(
 
     if save_path:
         _save_library(library, save_path, cfg=cfg, columns=columns,
-                      grid_metadata=grid_metadata)
+                      grid_metadata=grid_metadata, build_seed=seed)
         if verbose:
             print(f"Saved to {save_path}")
 
@@ -503,10 +682,15 @@ def _json_default(value):
     raise TypeError(f"cannot JSON-serialise {type(value)!r}")
 
 
-def _cfg_metadata(cfg: SimConfig) -> dict:
+def _cfg_metadata(
+    cfg: SimConfig,
+    *,
+    schema: str = MADI_LIBRARY_SCHEMA_V5,
+    build_seed: int | None = None,
+) -> dict:
     """Library-embedded physics/build configuration, with no hidden defaults."""
-    return {
-        "schema": "madi-library-v4",
+    metadata = {
+        "schema": schema,
         "D0_um2_ms": cfg.D0,
         "ts_ms": cfg.ts,
         "T_max_ms": cfg.T_max_ms,
@@ -532,6 +716,7 @@ def _cfg_metadata(cfg: SimConfig) -> dict:
         "geometry_vi_tolerance": cfg.geometry_vi_tolerance,
         "walkers_per_ensemble": cfg.n_walkers,
         "ensembles_per_entry": cfg.n_ensembles,
+        "build_seed": None if build_seed is None else int(build_seed),
         "phase_model": cfg.phase_model,
         "checkpoint_h_ms": cfg.h_ms,
         "common_random_numbers": "base_seed + ensemble_index; shared across rho,V,kio",
@@ -542,13 +727,131 @@ def _cfg_metadata(cfg: SimConfig) -> dict:
         "kio_label": "MADI I Eq. 5 with governing-process untrimmed arithmetic <A/V>",
         "residence_time_measurement": "intentionally absent: SI §S.IV states k_io != 1/<tau_i>",
     }
+    if schema == MADI_LIBRARY_SCHEMA_V5:
+        metadata["uncertainty"] = {
+            "signal_imag": {
+                "array": "signal_imag",
+                "dtype": "float32",
+                "shape": ["entry", "column"],
+                "definition": "collapsed mean(sin(phase)) over all axis-walks",
+            },
+            "between_ensemble_variance": {
+                "array": "signal_variance",
+                "dtype": "float32",
+                "shape": ["entry", "column"],
+                "definition": (
+                    "sample variance (ddof=1) of per-ensemble mean real signals; "
+                    "consumer SE is sqrt(signal_variance / n_ensembles)"
+                ),
+                "n_ensembles": int(cfg.n_ensembles),
+            },
+            "ensemble_means_subset": {
+                "array": "ensemble_means_subset",
+                "dtype": "float32",
+                "shape": ["entry", "ensemble_index", "declared_column"],
+                "declared_delta_Delta_pairs_ms": [
+                    [float(delta), float(Delta)]
+                    for delta, Delta in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS
+                ],
+                "declared_b_values_s_mm2": (
+                    np.asarray(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, dtype=float).tolist()
+                ),
+                "column_order": "pair-major, then b-major within each pair",
+            },
+            "ensemble_index_ordering_contract": {
+                "axis_position_in_ensemble_means_subset": 1,
+                "index_values": "0..n_ensembles-1",
+                "same_order_across_entries": True,
+                "independent_of": ["rho", "V", "k_io"],
+                "walk_seed_formula": (
+                    "(build_seed + 104729 * ensemble_index) mod 2^31"
+                ),
+                "geometry_seed_formula": (
+                    "(build_seed + 97003 * ensemble_index) mod 2^31"
+                ),
+                "purpose": (
+                    "ensemble index e is the common-random-number partner "
+                    "across entries"
+                ),
+            },
+        }
+    return metadata
+
+
+def _v5_entry_arrays(
+    lib: list[LibraryEntry],
+    n_columns: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Validate and stack the v5 diagnostic arrays, if every entry has them."""
+    presence = [
+        entry.signal_imag is not None
+        and entry.signal_variance is not None
+        and entry.ensemble_means_subset is not None
+        for entry in lib
+    ]
+    if not any(presence):
+        return None
+    if not all(presence):
+        raise ValueError(
+            "library mixes entries with and without v5 Monte-Carlo diagnostics"
+        )
+
+    imag_rows: list[np.ndarray] = []
+    variance_rows: list[np.ndarray] = []
+    subset_rows: list[np.ndarray] = []
+    n_ensembles: int | None = None
+    for entry_index, entry in enumerate(lib):
+        assert entry.signal_imag is not None
+        assert entry.signal_variance is not None
+        assert entry.ensemble_means_subset is not None
+        imag = np.asarray(entry.signal_imag)
+        variance = np.asarray(entry.signal_variance)
+        subset = np.asarray(entry.ensemble_means_subset)
+        if imag.shape != (n_columns,):
+            raise ValueError(
+                f"entry {entry_index} signal_imag shape {imag.shape} != ({n_columns},)"
+            )
+        if variance.shape != (n_columns,):
+            raise ValueError(
+                f"entry {entry_index} signal_variance shape {variance.shape} != ({n_columns},)"
+            )
+        if subset.ndim != 2 or subset.shape[1] != ENSEMBLE_MEAN_SUBSET_N_COLUMNS:
+            raise ValueError(
+                f"entry {entry_index} ensemble_means_subset shape {subset.shape} != "
+                f"(n_ensembles, {ENSEMBLE_MEAN_SUBSET_N_COLUMNS})"
+            )
+        if n_ensembles is None:
+            n_ensembles = int(subset.shape[0])
+        elif subset.shape[0] != n_ensembles:
+            raise ValueError("v5 entries disagree on the number of ensembles")
+        if n_ensembles < 2:
+            raise ValueError("v5 diagnostic arrays require at least two ensembles")
+        if not (np.all(np.isfinite(imag)) and np.all(np.isfinite(variance))
+                and np.all(np.isfinite(subset))):
+            raise ValueError(f"entry {entry_index} has non-finite v5 diagnostic values")
+        if np.any(variance < 0.0):
+            raise ValueError(f"entry {entry_index} has negative between-ensemble variance")
+        imag_rows.append(np.asarray(imag, dtype=np.float32))
+        variance_rows.append(np.asarray(variance, dtype=np.float32))
+        subset_rows.append(np.asarray(subset, dtype=np.float32))
+
+    signal_imag = np.stack(imag_rows, axis=0)
+    signal_variance = np.stack(variance_rows, axis=0)
+    ensemble_means_subset = np.stack(subset_rows, axis=0)
+    if not (np.all(np.isfinite(signal_imag)) and np.all(np.isfinite(signal_variance))
+            and np.all(np.isfinite(ensemble_means_subset))):
+        raise ValueError("float32 conversion made v5 diagnostic values non-finite")
+    if np.any(signal_variance < 0.0):
+        raise ValueError("float32 conversion made between-ensemble variance negative")
+    return signal_imag, signal_variance, ensemble_means_subset
 
 
 def _save_library(lib: list[LibraryEntry], path: str,
                   cfg: SimConfig | None = None,
                   columns: "sig.ColumnGrid | None" = None,
                   grid_metadata: Optional[dict] = None,
-                  build_metadata: Optional[dict] = None):
+                  build_metadata: Optional[dict] = None,
+                  build_seed: int | None = None):
     """Persist library + (δ,Δ,b) grid metadata to npz.
 
     Stores:
@@ -557,11 +860,18 @@ def _save_library(lib: list[LibraryEntry], path: str,
         b_values                 — (n_b,) b-values [s/mm²]
         n_b                      — number of b-values (for reshaping)
         h_ms                     — Y(t) storage stride the pairs were built on
+        signal_imag              — v5 collapsed imaginary signal, float32
+        signal_variance          — v5 between-ensemble sample variance, float32
+        ensemble_means_subset    — v5 [entry, ensemble, 200] diagnostic, float32
     """
     if cfg is None:
         cfg = SimConfig()
     if columns is None:
         columns = sig.build_columns(cfg)
+
+    n_columns = int(columns.n_pairs * columns.n_b)
+    v5_arrays = _v5_entry_arrays(lib, n_columns)
+    library_schema = MADI_LIBRARY_SCHEMA_V5 if v5_arrays is not None else MADI_LIBRARY_SCHEMA_V4
 
     kios = np.array([e.kio for e in lib], dtype=float)
     rhos = np.array([e.rho for e in lib], dtype=float)
@@ -592,15 +902,20 @@ def _save_library(lib: list[LibraryEntry], path: str,
     pair_Deltas = np.array([D for d, D in columns.delta_pairs], dtype=float)
     embedded_build_metadata = (
         dict(build_metadata) if build_metadata is not None
-        else {**_cfg_metadata(cfg), "grid": grid_metadata or {}}
+        else {**_cfg_metadata(cfg, schema=library_schema, build_seed=build_seed), "grid": grid_metadata or {}}
     )
+    if embedded_build_metadata.get("schema") != library_schema:
+        raise ValueError(
+            "library-schema mismatch between entries and build metadata: "
+            f"entries imply {library_schema!r}, metadata has "
+            f"{embedded_build_metadata.get('schema')!r}"
+        )
     # A caller preserving existing build metadata (the shard merger) may
     # still explicitly replace just its grid section.
     if grid_metadata is not None:
         embedded_build_metadata["grid"] = grid_metadata
-    np.savez(
-        path,
-        library_schema=np.array("madi-library-v4"),
+    payload = dict(
+        library_schema=np.array(library_schema),
         kios=kios, rhos=rhos, Vs=Vs, vis=vis, vectors=vecs,
         nominal_kios=nominal_kios, nominal_rhos=nominal_rhos, nominal_Vs=nominal_Vs,
         weights=weights, has_weights=np.array(bool(np.all(np.isfinite(weights)))),
@@ -614,6 +929,24 @@ def _save_library(lib: list[LibraryEntry], path: str,
         n_b=np.array(columns.n_b),
         h_ms=np.array(float(cfg.h_ms)),
     )
+    if v5_arrays is not None:
+        signal_imag, signal_variance, ensemble_means_subset = v5_arrays
+        payload.update(
+            signal_imag=signal_imag,
+            signal_variance=signal_variance,
+            ensemble_means_subset=ensemble_means_subset,
+            ensemble_subset_pair_deltas=np.asarray(
+                [delta for delta, _ in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS], dtype=float,
+            ),
+            ensemble_subset_pair_Deltas=np.asarray(
+                [Delta for _, Delta in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS], dtype=float,
+            ),
+            ensemble_subset_b_values=np.asarray(
+                ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, dtype=float,
+            ),
+            ensemble_subset_n_b=np.array(len(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2)),
+        )
+    np.savez(path, **payload)
 
 
 def load_library(path: str) -> list[LibraryEntry]:
@@ -640,6 +973,19 @@ def load_library(path: str) -> list[LibraryEntry]:
     kio_eq5 = optional('kio_analytic_eq5', np.full(n, np.nan))
     free = optional('is_free_water', np.zeros(n, dtype=bool))
     entry_json = optional('entry_metadata_json', np.asarray(["{}"] * n))
+    signal_imag = optional('signal_imag', None)
+    signal_variance = optional('signal_variance', None)
+    ensemble_means_subset = optional('ensemble_means_subset', None)
+    diagnostic_arrays = (signal_imag, signal_variance, ensemble_means_subset)
+    if any(value is not None for value in diagnostic_arrays) and not all(
+        value is not None for value in diagnostic_arrays
+    ):
+        raise ValueError(f"{path}: incomplete v5 Monte-Carlo diagnostic arrays")
+    if signal_imag is not None and (
+        signal_imag.shape[0] != n or signal_variance.shape[0] != n
+        or ensemble_means_subset.shape[0] != n
+    ):
+        raise ValueError(f"{path}: v5 Monte-Carlo diagnostic entry axis has wrong length")
     lib = []
     for i in range(n):
         try:
@@ -653,6 +999,11 @@ def load_library(path: str) -> list[LibraryEntry]:
             rho=float(rhos[i]),
             V=float(Vs[i]),
             vector=vectors[i],
+            signal_imag=None if signal_imag is None else signal_imag[i],
+            signal_variance=None if signal_variance is None else signal_variance[i],
+            ensemble_means_subset=(
+                None if ensemble_means_subset is None else ensemble_means_subset[i]
+            ),
             vi=vi,
             weight=weight,
             kio_nominal=float(nominal_kios[i]),
@@ -704,6 +1055,25 @@ def load_library_meta(path: str) -> dict:
                              if 'b_values' in data.files else None)
         meta['h_ms'] = float(data['h_ms']) if 'h_ms' in data.files else None
         meta['has_free_water'] = bool(np.any(data['is_free_water'])) if 'is_free_water' in data.files else False
+        diagnostic_names = {
+            'signal_imag', 'signal_variance', 'ensemble_means_subset',
+            'ensemble_subset_pair_deltas', 'ensemble_subset_pair_Deltas',
+            'ensemble_subset_b_values', 'ensemble_subset_n_b',
+        }
+        meta['has_v5_diagnostics'] = diagnostic_names.issubset(set(data.files))
+        if meta['has_v5_diagnostics']:
+            meta['signal_imag_shape'] = tuple(data['signal_imag'].shape)
+            meta['signal_variance_shape'] = tuple(data['signal_variance'].shape)
+            meta['ensemble_means_subset_shape'] = tuple(data['ensemble_means_subset'].shape)
+            subset_delta = np.asarray(data['ensemble_subset_pair_deltas'], dtype=float)
+            subset_Delta = np.asarray(data['ensemble_subset_pair_Deltas'], dtype=float)
+            meta['ensemble_subset_delta_pairs'] = list(zip(
+                subset_delta.tolist(), subset_Delta.tolist(),
+            ))
+            meta['ensemble_subset_b_values'] = list(np.asarray(
+                data['ensemble_subset_b_values'], dtype=float,
+            ))
+            meta['ensemble_subset_n_b'] = int(data['ensemble_subset_n_b'])
         return meta
 
     # ---- Legacy fixed-δ format: synthesize an equivalent delta_pairs ----
@@ -723,6 +1093,7 @@ def load_library_meta(path: str) -> dict:
     meta['b_values'] = b_values
     meta['small_delta'] = small_delta   # kept for legacy call sites
     meta['h_ms'] = None
+    meta['has_v5_diagnostics'] = False
     return meta
 
 

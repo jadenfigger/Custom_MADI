@@ -4,7 +4,7 @@ analyze_identifiability.py — Cramer-Rao / Fisher Information analysis of
 MADI acquisition identifiability
 ====================================================================
 
-Quantifies how well a given (Delta, b) acquisition can identify the MADI
+Quantifies how well a given (delta, Delta, b) acquisition can identify the MADI
 parameters (kio, rho, V), using the library itself (finite differences
 across neighbouring grid points -- see madi/identifiability.py for the
 method and its caveats). The headline diagnostic is the rho-V correlation:
@@ -60,42 +60,47 @@ def _parse_b_list(s):
     return [float(x) for x in s.split(",") if x.strip()]
 
 
-def build_fit_pairs(acq_type, lib_deltas, lib_b_values, b_subset=None, pairs_str=None):
-    """Build the (Delta, b) column list for one acquisition.
+def build_fit_triples(acq_type, lib_delta_pairs, lib_b_values, b_subset=None, triples_str=None):
+    """Build the ``(delta, Delta, b)`` column list for one acquisition.
 
     acq_type : 'current' | 'subset_b' | 'custom'
-      current  -> every (Delta, b) the library has (all deltas x all b).
-      subset_b -> every library Delta, but only b in b_subset.
-      custom   -> explicit 'Delta:b,Delta:b,...' pairs from pairs_str.
+      current  -> every stored (delta, Delta) pair crossed with every b.
+      subset_b -> every stored timing pair, but only b in b_subset.
+      custom   -> explicit 'delta/Delta:b,delta/Delta:b,...' triples.
     """
     if acq_type == "current":
-        return [(d, b) for d in lib_deltas for b in lib_b_values]
+        return [(delta, Delta, b)
+                for delta, Delta in lib_delta_pairs for b in lib_b_values]
 
     if acq_type == "subset_b":
         if not b_subset:
             raise ValueError("--acquisition subset_b requires --b-subset")
-        return [(d, b) for d in lib_deltas for b in lib_b_values
+        return [(delta, Delta, b)
+                for delta, Delta in lib_delta_pairs for b in lib_b_values
                 if any(abs(b - k) < 1e-6 for k in b_subset)]
 
     if acq_type == "custom":
-        if not pairs_str:
-            raise ValueError("--acquisition custom requires --pairs 'D:b,D:b,...'")
-        pairs = []
-        for tok in pairs_str.split(","):
-            d_s, b_s = tok.split(":")
-            pairs.append((float(d_s), float(b_s)))
-        return pairs
+        if not triples_str:
+            raise ValueError(
+                "--acquisition custom requires --pairs 'delta/Delta:b,delta/Delta:b,...'"
+            )
+        triples = []
+        for tok in triples_str.split(","):
+            timing_s, b_s = tok.split(":")
+            delta_s, Delta_s = timing_s.split(";") if ";" in timing_s else timing_s.split("/")
+            triples.append((float(delta_s), float(Delta_s), float(b_s)))
+        return triples
 
     raise ValueError(f"Unknown acquisition type '{acq_type}'")
 
 
-def parse_compare_spec(spec, lib_deltas, lib_b_values):
-    """Parse one '--compare' token into (label, fit_pairs).
+def parse_compare_spec(spec, lib_delta_pairs, lib_b_values):
+    """Parse one '--compare' token into (label, fit_triples).
 
     Accepted forms:
         current
         subset_b:500,1000,1500
-        custom:50:500,50:1000,50:1500
+        custom:5/15:500,5/15:1000
         mylabel=subset_b:500,1000,1500        (explicit label)
     """
     if "=" in spec:
@@ -109,17 +114,17 @@ def parse_compare_spec(spec, lib_deltas, lib_b_values):
         acq_type, params = rest.split(":", 1)
 
     if acq_type == "current":
-        fit_pairs = build_fit_pairs("current", lib_deltas, lib_b_values)
+        fit_triples = build_fit_triples("current", lib_delta_pairs, lib_b_values)
     elif acq_type == "subset_b":
-        fit_pairs = build_fit_pairs("subset_b", lib_deltas, lib_b_values,
-                                     b_subset=_parse_b_list(params))
+        fit_triples = build_fit_triples("subset_b", lib_delta_pairs, lib_b_values,
+                                        b_subset=_parse_b_list(params))
     elif acq_type == "custom":
-        fit_pairs = build_fit_pairs("custom", lib_deltas, lib_b_values,
-                                     pairs_str=params)
+        fit_triples = build_fit_triples("custom", lib_delta_pairs, lib_b_values,
+                                        triples_str=params)
     else:
         raise ValueError(f"Unrecognized --compare spec '{spec}'")
 
-    return label, fit_pairs
+    return label, fit_triples
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +292,7 @@ def main():
                          "placeholder default). Ignored if "
                          "--sigma-m-pershell is given.")
     ap.add_argument("--sigma-m-pershell", type=str, default=None,
-                    help="Comma list of per-(Delta,b)-column noise stds, "
+                    help="Comma list of per-(delta,Delta,b)-column noise stds, "
                          "same length and order as the resolved acquisition "
                          "columns. Only usable for a single (non --compare) "
                          "acquisition.")
@@ -298,8 +303,8 @@ def main():
                     help="Comma list of b-values [s/mm^2] for "
                          "--acquisition subset_b (e.g. 500,1000,1500).")
     ap.add_argument("--pairs", type=str, default=None,
-                    help="Explicit 'Delta:b,Delta:b,...' pairs for "
-                         "--acquisition custom.")
+                    help="Explicit 'delta/Delta:b,delta/Delta:b,...' triples "
+                         "for --acquisition custom.")
 
     ap.add_argument("--compare", type=str, nargs="+", default=None,
                     help="Run several acquisitions and additionally produce "
@@ -337,7 +342,7 @@ def main():
 
     library = load_library(args.library)
     meta = load_library_meta(args.library)
-    lib_deltas = meta["deltas"]
+    lib_delta_pairs = meta["delta_pairs"]
     lib_b_values = meta["b_values"]
     n_b = meta["n_b"]
     if lib_b_values is None:
@@ -346,7 +351,7 @@ def main():
               "analysis.")
         return
 
-    print(f"  {len(library)} entries, deltas={lib_deltas}, "
+    print(f"  {len(library)} entries, delta_pairs={lib_delta_pairs}, "
           f"b_values={lib_b_values}")
 
     # Finite-difference derivatives depend only on the library grid, not on
@@ -365,15 +370,15 @@ def main():
             print("  Note: --sigma-m-pershell is ignored in --compare mode; "
                   f"using scalar --sigma-m={args.sigma_m} for all "
                   "acquisitions.")
-        specs = [parse_compare_spec(s, lib_deltas, lib_b_values)
+        specs = [parse_compare_spec(s, lib_delta_pairs, lib_b_values)
                  for s in args.compare]
     else:
-        fit_pairs = build_fit_pairs(
-            args.acquisition, lib_deltas, lib_b_values,
+        fit_triples = build_fit_triples(
+            args.acquisition, lib_delta_pairs, lib_b_values,
             b_subset=(_parse_b_list(args.b_subset) if args.b_subset else None),
-            pairs_str=args.pairs,
+            triples_str=args.pairs,
         )
-        specs = [(args.acquisition, fit_pairs)]
+        specs = [(args.acquisition, fit_triples)]
 
     # ------------------------------------------------------------------
     # Run each acquisition
@@ -381,27 +386,27 @@ def main():
     all_summaries = {}
     all_rows = {}
 
-    for label, fit_pairs in specs:
+    for label, fit_triples in specs:
         print("\n" + "-" * 70)
-        print(f"Acquisition: {label}  ({len(fit_pairs)} (Delta,b) columns)")
+        print(f"Acquisition: {label}  ({len(fit_triples)} (delta,Delta,b) columns)")
         print("-" * 70)
-        for d, b in fit_pairs:
-            print(f"    Delta={d:g} ms, b={b:g} s/mm^2")
+        for delta, Delta, b in fit_triples:
+            print(f"    delta={delta:g} ms, Delta={Delta:g} ms, b={b:g} s/mm^2")
 
         if args.sigma_m_pershell is not None and len(specs) == 1:
             sigma_m = np.array(_parse_b_list(args.sigma_m_pershell))
-            if sigma_m.size != len(fit_pairs):
+            if sigma_m.size != len(fit_triples):
                 print(f"ERROR: --sigma-m-pershell has {sigma_m.size} values "
-                      f"but this acquisition has {len(fit_pairs)} columns.")
+                      f"but this acquisition has {len(fit_triples)} columns.")
                 return
             print(f"  sigma_m: per-shell {sigma_m.tolist()}")
         else:
             sigma_m = args.sigma_m
             print(f"  sigma_m: {sigma_m} (scalar, applied to every "
-                  f"(Delta,b) column)")
+                  f"(delta,Delta,b) column)")
 
         result = analyze_library(
-            library, lib_deltas, lib_b_values, n_b, fit_pairs, sigma_m,
+            library, lib_delta_pairs, lib_b_values, n_b, fit_triples, sigma_m,
             degenerate_corr_threshold=args.degenerate_threshold,
             derivatives=derivatives,
         )
@@ -471,11 +476,11 @@ def main():
                   f"  degenerate_frac={s['degenerate_fraction']*100:.1f}%")
 
         # ---- Monotonicity sanity check ----------------------------------
-        # Fewer (Delta,b) columns should never IMPROVE (decrease) the
+        # Fewer (delta,Delta,b) columns should never IMPROVE (decrease) the
         # median CRLBs. Compare the acquisition with the most columns
         # against the one with the fewest as a simple check.
         by_ncols = sorted(all_summaries.items(),
-                          key=lambda kv: len(kv[1]["fit_pairs"]))
+                          key=lambda kv: len(kv[1]["fit_triples"]))
         fewest_label, fewest_summary = by_ncols[0]
         most_label, most_summary = by_ncols[-1]
         if fewest_label != most_label:
@@ -484,14 +489,14 @@ def main():
             ok_V = (fewest_summary["CRLB_V"]["median"]
                     >= most_summary["CRLB_V"]["median"])
             status = "PASS" if (ok_rho and ok_V) else "FAIL"
-            print(f"\n  Monotonicity check ({status}): fewer (Delta,b) "
+            print(f"\n  Monotonicity check ({status}): fewer (delta,Delta,b) "
                   f"columns should not lower the CRLBs.")
             print(f"    fewest columns = '{fewest_label}' "
-                  f"({len(fewest_summary['fit_pairs'])} cols): "
+                  f"({len(fewest_summary['fit_triples'])} cols): "
                   f"CRLB(rho)={fewest_summary['CRLB_rho']['median']:.4g}, "
                   f"CRLB(V)={fewest_summary['CRLB_V']['median']:.4g}")
             print(f"    most columns   = '{most_label}' "
-                  f"({len(most_summary['fit_pairs'])} cols): "
+                  f"({len(most_summary['fit_triples'])} cols): "
                   f"CRLB(rho)={most_summary['CRLB_rho']['median']:.4g}, "
                   f"CRLB(V)={most_summary['CRLB_V']['median']:.4g}")
             if status == "FAIL":

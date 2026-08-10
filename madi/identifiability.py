@@ -10,7 +10,7 @@ acquisition -- e.g. if dS/drho and dS/dV point in nearly the same direction
 in measurement space, no amount of matching cleverness can separate rho
 from V; the acquisition itself doesn't carry the information.  The Fisher
 Information Matrix (FIM) makes this precise and lets us compare candidate
-acquisitions (different (Delta, b) subsets) without re-running the fitter.
+acquisitions (different (delta, Delta, b) subsets) without re-running the fitter.
 
 CRITICAL CAVEAT -- READ THIS BEFORE TRUSTING A NUMBER
 -------------------------------------------------------
@@ -35,7 +35,7 @@ nearest-neighbour) is neither continuous nor unbiased.  Two consequences:
 
 A future "universal"/spectral library (storing an underlying diffusion
 spectrum per entry from which S(b) can be reconstructed analytically for
-any (Delta, b)) would allow exact autodiff CRLBs. This module is the
+any (delta, Delta, b)) would allow exact autodiff CRLBs. This module is the
 finite-difference stand-in until that exists.
 """
 
@@ -48,7 +48,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .library import LibraryEntry, _pair_indices
+from .library import LibraryEntry, resolve_grid_columns
 
 
 PARAM_NAMES = ("kio", "rho", "V")
@@ -244,7 +244,7 @@ def compute_fim(
     Parameters
     ----------
     d_kio, d_rho, d_V : full-length (n_deltas*n_b,) derivative vectors.
-    col_idx : (n_feat,) int array selecting which (Delta, b) columns of the
+    col_idx : (n_feat,) int array selecting which (delta, Delta, b) columns of the
         full vector belong to the acquisition being analyzed -- this is
         where "which measurements do I have" enters the calculation.
     sigma_m : float or (n_feat,) array. Per-measurement noise std on the
@@ -263,7 +263,7 @@ def compute_fim(
     if sigma_m.size != D.shape[1]:
         raise ValueError(
             f"sigma_m has {sigma_m.size} entries but acquisition has "
-            f"{D.shape[1]} (Delta,b) columns.")
+            f"{D.shape[1]} (delta,Delta,b) columns.")
     Dw = D / sigma_m[None, :]
     return Dw @ Dw.T
 
@@ -338,16 +338,21 @@ def crlb_diagnostics(
 # ---------------------------------------------------------------------------
 
 def resolve_acquisition_columns(
-    fit_pairs: Sequence[Tuple[float, float]],
-    lib_deltas: Sequence[float],
+    fit_triples: Sequence[Tuple[float, float, float]],
+    lib_delta_pairs: Sequence[Tuple[float, float]],
     lib_b_values: Sequence[float],
     n_b: int,
 ) -> np.ndarray:
-    """Column indices into a flat library vector for the requested (Delta, b)
-    pairs -- thin wrapper around ``madi.library._pair_indices`` so that
-    adding a new Delta later is a one-line change to ``fit_pairs``.
+    """Resolve requested ``(delta, Delta, b)`` triples to stored columns.
+
+    This is deliberately a thin wrapper around the production grid resolver,
+    so identifiability uses the exact same nearest-column / tolerance contract
+    as fitting.  A universal-library column cannot be identified by
+    ``(Delta, b)`` alone because several stored delta values may share Delta.
     """
-    return _pair_indices(fit_pairs, lib_deltas, lib_b_values, n_b)
+    return resolve_grid_columns(
+        fit_triples, lib_delta_pairs, lib_b_values, n_b,
+    )[0]
 
 
 # ---------------------------------------------------------------------------
@@ -370,30 +375,32 @@ class IdentifiabilityResult:
 
 def analyze_library(
     library: List[LibraryEntry],
-    lib_deltas: Sequence[float],
+    lib_delta_pairs: Sequence[Tuple[float, float]],
     lib_b_values: Sequence[float],
     n_b: int,
-    fit_pairs: Sequence[Tuple[float, float]],
+    fit_triples: Sequence[Tuple[float, float, float]],
     sigma_m,
     degenerate_corr_threshold: float = 0.9,
     derivatives: Optional[List[EntryDerivatives]] = None,
 ) -> IdentifiabilityResult:
     """Run the full FIM/CRLB analysis over every library entry for one
-    acquisition (a choice of (Delta, b) columns, ``fit_pairs``).
+    acquisition (a choice of ``(delta, Delta, b)`` columns, ``fit_triples``).
 
     Parameters
     ----------
-    sigma_m : float or (len(fit_pairs),) array-like.
+    sigma_m : float or (len(fit_triples),) array-like.
     derivatives : precomputed ``compute_finite_diff_derivatives(library)``
         output, if the caller wants to reuse it across multiple acquisition
         comparisons (avoids recomputing the same finite differences).
     """
-    col_idx = resolve_acquisition_columns(fit_pairs, lib_deltas, lib_b_values, n_b)
+    col_idx = resolve_acquisition_columns(
+        fit_triples, lib_delta_pairs, lib_b_values, n_b,
+    )
     sigma_arr = np.atleast_1d(np.asarray(sigma_m, dtype=float))
-    if sigma_arr.size not in (1, len(fit_pairs)):
+    if sigma_arr.size not in (1, len(fit_triples)):
         raise ValueError(
-            f"sigma_m must be scalar or length {len(fit_pairs)} "
-            f"(one per (Delta,b) in fit_pairs); got length {sigma_arr.size}.")
+            f"sigma_m must be scalar or length {len(fit_triples)} "
+            f"(one per (delta,Delta,b) in fit_triples); got length {sigma_arr.size}.")
 
     if derivatives is None:
         derivatives = compute_finite_diff_derivatives(library)
@@ -467,7 +474,7 @@ def analyze_library(
         n_skipped_isolated=n_skipped,
         n_nonpsd=n_nonpsd,
         sigma_m=(float(sigma_arr[0]) if sigma_arr.size == 1 else sigma_arr.tolist()),
-        fit_pairs=[list(p) for p in fit_pairs],
+        fit_triples=[list(p) for p in fit_triples],
         CRLB_kio=_med_iqr(crlb_kio),
         CRLB_rho=_med_iqr(crlb_rho),
         CRLB_V=_med_iqr(crlb_V),

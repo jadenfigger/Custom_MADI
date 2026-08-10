@@ -10,7 +10,7 @@ the result.
 Example
 -------
 PYTHONPATH=. python -m scripts.validate_remediation_pilot \
-  --shards libraries/madi_remediation_pilot.shard*.npz \
+  --shards libraries/madi_v5_remediation_pilot.shard*.npz \
   --output logs/remediation_pilot_validation.json
 """
 
@@ -24,8 +24,23 @@ import re
 from typing import Iterable
 
 import numpy as np
+from scipy.stats import t as student_t
 
-from madi.library import LibraryEntry, _entry_key, load_library, load_library_meta, make_remediation_log_grid
+from madi.config import (
+    ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2,
+    ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS,
+    valid_delta_pairs,
+)
+from madi.library import (
+    LibraryEntry,
+    MADI_LIBRARY_SCHEMA_V5,
+    _entry_key,
+    ensemble_mean_subset_column_indices,
+    load_library,
+    load_library_meta,
+    make_remediation_log_grid,
+)
+from madi.signal import ColumnGrid
 
 
 PILOT_N_SHARDS = 4
@@ -38,8 +53,27 @@ PILOT_V_MIN = 0.01
 PILOT_V_MAX = 200.0
 PILOT_VI_MIN = 0.40
 PILOT_VI_MAX = 0.99
-PILOT_PAIRS = [(7.0, 25.0), (7.0, 50.0), (20.0, 25.0), (20.0, 50.0)]
-PILOT_B_VALUES = [0.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0]
+PILOT_N_ENSEMBLES = 8
+PILOT_SMALL_DELTAS = [5.0, 7.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0]
+PILOT_BIG_DELTAS = [15.0, 25.0, 30.0, 36.0, 40.0, 50.0, 60.0, 80.0]
+PILOT_PAIRS = valid_delta_pairs(PILOT_SMALL_DELTAS, PILOT_BIG_DELTAS)
+PILOT_B_VALUES = list(np.asarray(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, dtype=float))
+PILOT_IMAGINARY_FAMILYWISE_ALPHA = 0.01
+
+
+def _columns_from_meta(meta: dict) -> ColumnGrid:
+    """Minimal ColumnGrid used only to map the declared subset to vectors."""
+    empty_int = np.empty(0, dtype=np.int32)
+    return ColumnGrid(
+        delta_pairs=list(meta["delta_pairs"]),
+        b_values=np.asarray(meta["b_values"], dtype=float),
+        j_delta=empty_int,
+        j_Delta=empty_int,
+        j_sum=empty_int,
+        phase_coef=np.empty(0, dtype=np.float64),
+        n_pairs=len(meta["delta_pairs"]),
+        n_b=int(meta["n_b"]),
+    )
 
 
 def _pilot_triplets_and_weights() -> tuple[list[tuple[float, float, float]], dict]:
@@ -97,6 +131,13 @@ def _metadata_errors(meta: dict, path: Path) -> list[str]:
     build = meta.get("build_metadata") or {}
     if meta.get("format") != "v2":
         errors.append(f"{path}: expected v2 library format, got {meta.get('format')!r}")
+    if meta.get("library_schema") != MADI_LIBRARY_SCHEMA_V5:
+        errors.append(
+            f"{path}: expected {MADI_LIBRARY_SCHEMA_V5!r}, got "
+            f"{meta.get('library_schema')!r}"
+        )
+    if build.get("schema") != MADI_LIBRARY_SCHEMA_V5:
+        errors.append(f"{path}: build metadata does not record the v5 schema")
     if meta.get("has_weights") is not True:
         errors.append(f"{path}: pilot must declare complete per-entry quadrature weights")
     if meta.get("delta_pairs") != PILOT_PAIRS:
@@ -111,8 +152,11 @@ def _metadata_errors(meta: dict, path: Path) -> list[str]:
         errors.append(f"{path}: pilot must use SI fatal-escape boundary mode")
     if float(build.get("T_max_ms", np.nan)) != 128.0:
         errors.append(f"{path}: pilot must use T_max_ms=128")
-    if int(build.get("walkers_per_ensemble", -1)) != 512 or int(build.get("ensembles_per_entry", -1)) != 1:
-        errors.append(f"{path}: pilot must use 512 walkers and one ensemble")
+    if (int(build.get("walkers_per_ensemble", -1)) != 512
+            or int(build.get("ensembles_per_entry", -1)) != PILOT_N_ENSEMBLES):
+        errors.append(
+            f"{path}: pilot must use 512 walkers and {PILOT_N_ENSEMBLES} ensembles"
+        )
     if "full-facet" not in str(build.get("classifier", "")) or "Eq. S2" not in str(build.get("classifier", "")):
         errors.append(f"{path}: missing full-facet SI Eq. S2 classifier provenance")
     reference = build.get("geometry_reference") or {}
@@ -124,7 +168,108 @@ def _metadata_errors(meta: dict, path: Path) -> list[str]:
     transform = grid.get("coordinate_transform") or {}
     if transform != {"rho": "uniform_log", "V": "uniform_log", "kio": "piecewise_uniform_linear"}:
         errors.append(f"{path}: missing or incompatible weighted log-grid provenance")
+    uncertainty = build.get("uncertainty") or {}
+    variance = uncertainty.get("between_ensemble_variance") or {}
+    subset = uncertainty.get("ensemble_means_subset") or {}
+    contract = uncertainty.get("ensemble_index_ordering_contract") or {}
+    if (variance.get("array") != "signal_variance"
+            or variance.get("definition", "").find("sample variance") < 0
+            or int(variance.get("n_ensembles", -1)) != PILOT_N_ENSEMBLES):
+        errors.append(f"{path}: missing v5 between-ensemble-variance contract")
+    declared_pairs = [list(pair) for pair in ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS]
+    declared_b = list(np.asarray(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, dtype=float))
+    if (subset.get("array") != "ensemble_means_subset"
+            or subset.get("declared_delta_Delta_pairs_ms") != declared_pairs
+            or subset.get("declared_b_values_s_mm2") != declared_b
+            or subset.get("column_order") != "pair-major, then b-major within each pair"):
+        errors.append(f"{path}: missing or incompatible declared ensemble-mean subset metadata")
+    if (contract.get("axis_position_in_ensemble_means_subset") != 1
+            or contract.get("index_values") != "0..n_ensembles-1"
+            or contract.get("same_order_across_entries") is not True
+            or contract.get("independent_of") != ["rho", "V", "k_io"]
+            or contract.get("walk_seed_formula")
+            != "(build_seed + 104729 * ensemble_index) mod 2^31"):
+        errors.append(f"{path}: missing v5 ensemble-index CRN ordering contract")
     return errors
+
+
+def _v5_diagnostic_errors(path: Path, columns, n_entries: int) -> tuple[list[str], dict]:
+    """Validate the new column-level v5 payload directly from the NPZ file."""
+    errors: list[str] = []
+    n_columns = int(columns.n_pairs * columns.n_b)
+    subset_columns = ensemble_mean_subset_column_indices(columns)
+    expected_subset_shape = (
+        n_entries,
+        PILOT_N_ENSEMBLES,
+        len(ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS)
+        * len(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2),
+    )
+    diagnostics = {
+        "expected_signal_shape": [n_entries, n_columns],
+        "expected_subset_shape": list(expected_subset_shape),
+        "max_subset_mean_abs_error": None,
+    }
+    required = {
+        "signal_imag",
+        "signal_variance",
+        "ensemble_means_subset",
+        "ensemble_subset_pair_deltas",
+        "ensemble_subset_pair_Deltas",
+        "ensemble_subset_b_values",
+        "ensemble_subset_n_b",
+    }
+    with np.load(path, allow_pickle=False) as data:
+        missing = sorted(required.difference(data.files))
+        if missing:
+            return [f"{path}: missing v5 arrays {missing}"], diagnostics
+
+        signal_imag = data["signal_imag"]
+        signal_variance = data["signal_variance"]
+        ensemble_subset = data["ensemble_means_subset"]
+        vectors = data["vectors"]
+        for name, value, expected_shape in (
+            ("signal_imag", signal_imag, (n_entries, n_columns)),
+            ("signal_variance", signal_variance, (n_entries, n_columns)),
+            ("ensemble_means_subset", ensemble_subset, expected_subset_shape),
+        ):
+            if value.dtype != np.dtype(np.float32):
+                errors.append(f"{path}: {name} dtype {value.dtype} is not float32")
+            if value.shape != expected_shape:
+                errors.append(
+                    f"{path}: {name} shape {value.shape} != expected {expected_shape}"
+                )
+            if not np.all(np.isfinite(value)):
+                errors.append(f"{path}: {name} contains non-finite values")
+        if np.any(signal_variance < 0.0):
+            errors.append(f"{path}: signal_variance contains negative values")
+
+        actual_pairs = list(zip(
+            np.asarray(data["ensemble_subset_pair_deltas"], dtype=float).tolist(),
+            np.asarray(data["ensemble_subset_pair_Deltas"], dtype=float).tolist(),
+        ))
+        actual_b = list(np.asarray(data["ensemble_subset_b_values"], dtype=float))
+        actual_n_b = int(data["ensemble_subset_n_b"])
+        if actual_pairs != list(ENSEMBLE_MEAN_SUBSET_DELTA_PAIRS_MS):
+            errors.append(f"{path}: ensemble subset timing pairs differ from the declared eight pairs")
+        if (actual_b != list(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2)
+                or actual_n_b != len(ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2)):
+            errors.append(f"{path}: ensemble subset b-values differ from the declared 25 values")
+
+        if (vectors.shape != (n_entries, n_columns)
+                or ensemble_subset.shape != expected_subset_shape):
+            errors.append(f"{path}: cannot cross-check subset means because signal shapes are invalid")
+        else:
+            subset_mean = np.mean(ensemble_subset, axis=1, dtype=np.float64)
+            main_subset = np.asarray(vectors[:, subset_columns], dtype=np.float64)
+            difference = np.abs(subset_mean - main_subset)
+            max_error = float(np.max(difference)) if difference.size else 0.0
+            diagnostics["max_subset_mean_abs_error"] = max_error
+            if not np.allclose(subset_mean, main_subset, rtol=2.0e-6, atol=2.0e-6):
+                errors.append(
+                    f"{path}: means over ensemble_means_subset do not reproduce "
+                    "the main stored signal within float32 tolerance"
+                )
+    return errors, diagnostics
 
 
 def validate(paths: list[Path]) -> dict:
@@ -135,6 +280,7 @@ def validate(paths: list[Path]) -> dict:
     all_entries: list[LibraryEntry] = []
     expected_counts: dict[int, int] = {}
     per_shard: list[dict] = []
+    imaginary_standardized_deviations: list[float] = []
 
     for path in paths:
         if not path.is_file():
@@ -158,6 +304,15 @@ def validate(paths: list[Path]) -> dict:
         shard_errors = _metadata_errors(meta, path)
         errors.extend(shard_errors)
         entries = load_library(str(path))
+        try:
+            diagnostic_errors, diagnostic_report = _v5_diagnostic_errors(
+                path, _columns_from_meta(meta), len(entries),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            diagnostic_errors = [f"{path}: cannot validate v5 diagnostics: {exc}"]
+            diagnostic_report = {"max_subset_mean_abs_error": None}
+        shard_errors.extend(diagnostic_errors)
+        errors.extend(diagnostic_errors)
         geometry_tolerance = float(
             (meta.get("build_metadata") or {}).get("geometry_vi_tolerance", np.nan)
         )
@@ -196,6 +351,7 @@ def validate(paths: list[Path]) -> dict:
         per_shard.append({
             "path": str(path), "shard_id": shard_id, "entries": len(entries),
             "expected_entries": len(expected_keys), "errors": shard_errors,
+            "v5_diagnostics": diagnostic_report,
         })
 
     all_keys = [_entry_nominal_key(entry) for entry in all_entries]
@@ -220,7 +376,10 @@ def validate(paths: list[Path]) -> dict:
     for entry in all_entries:
         vector = np.asarray(entry.vector, dtype=np.float64)
         if vector.size != len(PILOT_PAIRS) * len(PILOT_B_VALUES):
-            errors.append(f"entry {_entry_nominal_key(entry)} has vector length {vector.size}, expected 24")
+            errors.append(
+                f"entry {_entry_nominal_key(entry)} has vector length {vector.size}, "
+                f"expected {len(PILOT_PAIRS) * len(PILOT_B_VALUES)}"
+            )
         elif not np.array_equal(vector.reshape(len(PILOT_PAIRS), len(PILOT_B_VALUES))[:, 0], np.ones(len(PILOT_PAIRS))):
             errors.append(f"entry {_entry_nominal_key(entry)} does not have exact S(b=0)=1")
         nonfinite_signal_count += int(np.count_nonzero(~np.isfinite(vector)))
@@ -229,6 +388,48 @@ def validate(paths: list[Path]) -> dict:
             min_signal = min(min_signal, float(np.min(vector)))
         if entry.weight is None or not np.isfinite(entry.weight) or entry.weight <= 0.0:
             errors.append(f"entry {_entry_nominal_key(entry)} has no positive finite quadrature weight")
+        imaginary_check = entry.metadata.get("imaginary_signal_check") or {}
+        standardized = imaginary_check.get("max_abs_standardized_deviation")
+        max_column = imaginary_check.get("max_column") or {}
+        imag_mean = imaginary_check.get("mean_imaginary_signal")
+        imag_se = imaginary_check.get("standard_error")
+        try:
+            pair_index = list(PILOT_PAIRS).index((
+                float(max_column["delta_ms"]), float(max_column["Delta_ms"]),
+            ))
+            b_index = PILOT_B_VALUES.index(float(max_column["b_s_mm2"]))
+            stored_imaginary = np.asarray(entry.signal_imag, dtype=np.float64).reshape(
+                len(PILOT_PAIRS), len(PILOT_B_VALUES),
+            )[pair_index, b_index]
+        except (KeyError, TypeError, ValueError, AttributeError):
+            stored_imaginary = np.nan
+        if (imaginary_check.get("n_ensembles") != PILOT_N_ENSEMBLES
+                or imaginary_check.get("degrees_of_freedom") != PILOT_N_ENSEMBLES - 1
+                or imaginary_check.get("zero_standard_error_nonzero_count") != 0
+                or standardized is None or not np.isfinite(float(standardized))
+                or imag_mean is None or imag_se is None
+                or not (np.isfinite(float(imag_mean)) and np.isfinite(float(imag_se)))
+                or not np.isfinite(stored_imaginary)):
+            errors.append(
+                f"entry {_entry_nominal_key(entry)} lacks a finite v5 imaginary-signal "
+                "standardization record"
+            )
+        else:
+            if float(imag_se) == 0.0:
+                expected_t = 0.0 if float(imag_mean) == 0.0 else float("inf")
+            else:
+                expected_t = abs(float(imag_mean) / float(imag_se))
+            if not np.isclose(float(standardized), expected_t, rtol=2.0e-6, atol=2.0e-6):
+                errors.append(
+                    f"entry {_entry_nominal_key(entry)} has an inconsistent imaginary "
+                    "standardization record"
+                )
+            if not np.isclose(stored_imaginary, float(imag_mean), rtol=2.0e-6, atol=2.0e-6):
+                errors.append(
+                    f"entry {_entry_nominal_key(entry)} has an imaginary standardization "
+                    "record that does not match signal_imag"
+                )
+            imaginary_standardized_deviations.append(float(standardized))
         if entry.is_free_water:
             if not (np.isnan(entry.kio) and entry.rho == 0.0 and entry.V == 0.0):
                 errors.append("free-water atom has invalid physical labels")
@@ -266,6 +467,29 @@ def validate(paths: list[Path]) -> dict:
             "report them to the P2 trust-floor check rather than treating a low-MC pilot as production evidence"
         )
 
+    imaginary_max_abs_standardized_deviation = None
+    imaginary_threshold = None
+    if len(imaginary_standardized_deviations) != len(all_entries):
+        errors.append("not every pilot entry has a usable imaginary-signal standardization")
+    elif all_entries:
+        imaginary_max_abs_standardized_deviation = float(max(imaginary_standardized_deviations))
+        n_imaginary_tests = len(all_entries) * len(PILOT_PAIRS) * len(PILOT_B_VALUES)
+        # Per-column statistics are Student-t values based on E independent
+        # ensemble means.  Bonferroni is deliberately conservative here: the
+        # pilot asks whether a gross symmetry violation is visible, not for a
+        # finely powered discovery claim across highly correlated columns.
+        imaginary_threshold = float(student_t.ppf(
+            1.0 - PILOT_IMAGINARY_FAMILYWISE_ALPHA / (2.0 * n_imaginary_tests),
+            df=PILOT_N_ENSEMBLES - 1,
+        ))
+        if imaginary_max_abs_standardized_deviation > imaginary_threshold:
+            errors.append(
+                "stored imaginary signal is inconsistent with zero at the "
+                "pilot ensemble sample size after the declared family-wise check: "
+                f"max |t|={imaginary_max_abs_standardized_deviation:.6g} > "
+                f"{imaginary_threshold:.6g}"
+            )
+
     min_pairwise_l2 = float("inf")
     exact_duplicate_vectors = 0
     if len(all_entries) > 1:
@@ -278,7 +502,7 @@ def validate(paths: list[Path]) -> dict:
             errors.append(f"found {exact_duplicate_vectors} exact vector ties across distinct pilot labels")
 
     return {
-        "schema": "madi-remediation-pilot-validation-v1",
+        "schema": "madi-remediation-pilot-validation-v2",
         "tier": "A",
         "pass": not errors,
         "errors": errors,
@@ -293,6 +517,9 @@ def validate(paths: list[Path]) -> dict:
         "minimum_signal": None if not np.isfinite(min_signal) else min_signal,
         "minimum_pairwise_l2": None if not np.isfinite(min_pairwise_l2) else min_pairwise_l2,
         "exact_duplicate_vectors": exact_duplicate_vectors,
+        "imaginary_max_abs_standardized_deviation": imaginary_max_abs_standardized_deviation,
+        "imaginary_familywise_threshold": imaginary_threshold,
+        "imaginary_familywise_alpha": PILOT_IMAGINARY_FAMILYWISE_ALPHA,
     }
 
 
