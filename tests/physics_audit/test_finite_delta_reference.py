@@ -1,8 +1,10 @@
-"""Reduced direct simulation demonstrating the finite-lobe reference mismatch.
+"""Tier-A finite-gradient reference checks independent of tissue geometry.
 
-This is intentionally not a replacement for a 12-million-walk production
-regression.  It holds trajectories fixed and evaluates two phase definitions,
-so a significant difference cannot be attributed to differing random walks.
+Free Gaussian water is the decisive analytic limit for the finite-lobe
+moment: for every rectangular PGSE timing, it must give
+``S = exp(-b D0)`` when ``b`` includes the ``delta/3`` term.  A second test
+uses a deterministic microsecond random stream to ensure Y(t) is integrated
+at the walker timestep, not reconstructed from one-millisecond positions.
 """
 
 from __future__ import annotations
@@ -10,92 +12,88 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from madi.config import GAMMA_RAD
-from madi.ensemble import create_ensemble
+from madi.config import GAMMA_RAD, SimConfig
+from madi.ensemble import create_dummy_ensemble
 from madi.signal import G_from_b
-from madi.walker_gpu import kio_to_pp
-
-from .test_geometry_diagnostics import _geometry_cfg, _membrane_count, _require_geometry
+from madi.walker_gpu import WalkRandomStream, run_walk_Y
 
 
-def _same_paths_finite_and_narrow_signal(
-    *,
-    delta_ms: float,
-    Delta_ms: float,
-    b_values: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Mirror the CPU transition rule and evaluate both phase conventions."""
-    cfg = _require_geometry()
-    # This has target v_i=0.70, comfortably inside the lookup table range.
-    ens = create_ensemble(700_000.0, 1.0, cfg, seed=818, verify_vi=False)
-    pp = kio_to_pp(20.0, ens.mean_AV, cfg)
-    rng = np.random.default_rng(819)
-    n = cfg.n_walkers
-    position = rng.uniform(cfg.buffer, cfg.L - cfg.buffer, size=(n, 3))
-    initial_x = position[:, 0].copy()
-    cell, inside = ens.classify_cpu(position)
-    frozen = np.zeros(n, dtype=bool)
-    m1 = np.zeros(n)
-    m2 = np.zeros(n)
-    t_d_step = int(round((Delta_ms - delta_ms / 3.0) / cfg.ts))
-    x_t_d = None
-    end_step = int(round((Delta_ms + delta_ms) / cfg.ts))
-
-    for step in range(end_step):
-        active = ~frozen
-        old = position.copy()
-        proposal = position + rng.normal(0.0, cfg.sigma, size=position.shape)
-        escaped = active & ((proposal < 0.0).any(axis=1) | (proposal >= cfg.L).any(axis=1))
-        frozen |= escaped
-        proposal[escaped] = position[escaped]
-        active = ~frozen
-        new_cell, new_inside = ens.classify_cpu(proposal)
-        crossing = active & (_membrane_count(cell, inside, new_cell, new_inside) > 0)
-        if crossing.any() and pp < 1.0:
-            m = _membrane_count(cell, inside, new_cell, new_inside)
-            rejected = np.flatnonzero(crossing)[rng.uniform(size=int(crossing.sum())) >= pp ** m[crossing]]
-            proposal[rejected] = position[rejected]
-            new_cell[rejected] = cell[rejected]
-            new_inside[rejected] = inside[rejected]
-        position = proposal
-        cell[active] = new_cell[active]
-        inside[active] = new_inside[active]
-
-        t0 = step * cfg.ts
-        if t0 < delta_ms:
-            m1[active] += 0.5 * (old[active, 0] + position[active, 0]) * cfg.ts
-        if Delta_ms <= t0 < Delta_ms + delta_ms:
-            m2[active] += 0.5 * (old[active, 0] + position[active, 0]) * cfg.ts
-        if step + 1 == t_d_step:
-            x_t_d = position[:, 0].copy()
-
-    assert x_t_d is not None
-    keep = ~frozen
-    finite, narrow = [], []
-    for b in b_values:
-        gradient = G_from_b(float(b), delta_ms, Delta_ms)
-        finite_phase = GAMMA_RAD * gradient * (m1[keep] - m2[keep]) * 1e-9
-        q = GAMMA_RAD * gradient * (delta_ms * 1e-3)
-        narrow_phase = q * (x_t_d[keep] - initial_x[keep]) * 1e-6
-        finite.append(np.cos(finite_phase).mean())
-        narrow.append(np.cos(narrow_phase).mean())
-    return np.asarray(finite), np.asarray(narrow), int(keep.sum())
+pytestmark = pytest.mark.tier_a
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("delta_ms,Delta_ms", [(20.0, 50.0), (7.0, 25.0)])
-def test_finite_lobe_and_narrow_pulse_signals_differ_on_identical_paths(
-    delta_ms: float, Delta_ms: float
-) -> None:
-    _require_geometry()
-    finite, narrow, n_kept = _same_paths_finite_and_narrow_signal(
-        delta_ms=delta_ms,
-        Delta_ms=Delta_ms,
-        b_values=np.asarray([1_000.0, 2_000.0, 6_000.0]),
+def _finite_signal(Y: np.ndarray, cfg: SimConfig, delta_ms: float,
+                   Delta_ms: float, b_s_mm2: float) -> tuple[float, float]:
+    jd = int(round(delta_ms / cfg.h_ms))
+    jD = int(round(Delta_ms / cfg.h_ms))
+    js = int(round((delta_ms + Delta_ms) / cfg.h_ms))
+    dM = Y[:, jd, :] + Y[:, jD, :] - Y[:, js, :]
+    phase = GAMMA_RAD * G_from_b(b_s_mm2, delta_ms, Delta_ms) * dM * 1.0e-9
+    samples = np.cos(phase).ravel()
+    return float(np.mean(samples)), float(np.std(samples, ddof=1) / np.sqrt(samples.size))
+
+
+def test_free_water_finite_lobe_matches_stejskal_tanner_across_timings() -> None:
+    timings = [
+        (1.0, 20.0), (2.0, 20.0), (4.0, 20.0), (5.0, 20.0),
+        (6.0, 20.0), (8.0, 20.0), (10.0, 20.0), (12.0, 20.0),
+        (7.0, 25.0), (20.0, 50.0),
+    ]
+    cfg = SimConfig(
+        # Production free water also uses SI Eq. S8; a hand-sized 200-um
+        # diagnostic box is too small for a 70-ms source-domain walk.
+        L=None, n_walkers=512, n_ensembles=1, T_max_ms=70.0,
+        small_deltas=sorted({delta for delta, _ in timings}),
+        big_deltas=sorted({Delta for _, Delta in timings}),
+        b_values=[0.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0],
     )
-    assert n_kept > 0
-    relative = np.abs(finite - narrow) / np.maximum(np.abs(narrow), 1e-12)
-    # This is a difference detector, not a target-value assertion.  A future
-    # narrow-pulse reference implementation should make this test intentionally
-    # fail and should be accompanied by a revised reference comparison.
-    assert relative.max() > 0.05, (finite, narrow, relative, n_kept)
+    ensemble = create_dummy_ensemble(cfg)
+    Y, escaped = run_walk_Y(ensemble, 0.0, cfg, pp=0.0, seed=20_260_901,
+                             verbose=False, use_gpu=False)
+    assert escaped == 0
+    for delta, Delta in timings:
+        for b in cfg.b_values:
+            observed, mc_se = _finite_signal(Y, cfg, delta, Delta, b)
+            expected = float(np.exp(-float(b) * cfg.D0 * 1.0e-3))
+            # This is an absolute Monte-Carlo bound.  At b=6000 the analytic
+            # signal is ~1.5e-8, so relative error would be meaningless.
+            assert abs(observed - expected) <= 5.0 * mc_se + 0.012, (
+                delta, Delta, b, observed, expected, mc_se,
+            )
+
+
+def test_Y_is_microsecond_trapezoid_integral_not_millisecond_reconstruction() -> None:
+    cfg = SimConfig(
+        L=200.0, n_walkers=1, n_ensembles=1, T_max_ms=2.0, h_ms=1.0,
+        small_deltas=[1.0], big_deltas=[1.0, 2.0], b_values=[0.0, 1000.0],
+    )
+    steps = cfg.n_steps
+    initial = np.array([[100.0, 100.0, 100.0]])
+    t = np.arange(steps, dtype=float) * cfg.ts
+    increments = np.zeros((steps, 1, 3), dtype=float)
+    # Nonlinear deterministic motion makes a coarse 1-ms trapezoid visibly
+    # wrong; all coordinates remain comfortably inside the finite SI box.
+    increments[:, 0, 0] = 4.0e-3 + 2.0e-3 * np.sin(2.0 * np.pi * t / 0.37)
+    increments[:, 0, 1] = -1.0e-3 + 1.0e-3 * np.cos(2.0 * np.pi * t / 0.23)
+    stream = WalkRandomStream(
+        initial_positions=initial,
+        increments=increments,
+        acceptance_uniforms=np.zeros((steps, 1), dtype=float),
+    )
+    Y, escaped = run_walk_Y(
+        create_dummy_ensemble(cfg), 0.0, cfg, pp=0.0, seed=0,
+        verbose=False, random_stream=stream, use_gpu=False,
+    )
+    assert escaped == 0
+
+    position = initial[0].copy()
+    previous = position - cfg.L / 2.0
+    integral = np.zeros(3, dtype=float)
+    expected = [np.zeros(3, dtype=float)]
+    for step, increment in enumerate(increments[:, 0, :], start=1):
+        position += increment
+        current = position - cfg.L / 2.0
+        integral += 0.5 * (previous + current) * cfg.ts
+        previous = current
+        if step % cfg.steps_per_h == 0:
+            expected.append(integral.copy())
+    assert np.array_equal(Y[0], np.asarray(expected))

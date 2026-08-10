@@ -1,0 +1,19 @@
+=====================================================================
+Loaded: mamba 2.6.2
+
+Usage example:
+$ mamba create -n myenv -c conda-forge python=3 <package_name>
+$ source activate myenv
+
+Only run "pip install" after activating an environment.
+Running pip without activating an environment is known to cause issues.
+
+To list available environments:
+$ mamba info --envs
+
+More info: docs.rc.asu.edu/python
+
+=====================================================================
+     
+/home/jfigger/.conda/envs/madiEnv/lib/python3.11/site-packages/numba/cuda/dispatcher.py:536: NumbaPerformanceWarning: Grid size 1 will likely result in GPU under-utilization due to low occupancy.
+  warn(NumbaPerformanceWarning(msg))

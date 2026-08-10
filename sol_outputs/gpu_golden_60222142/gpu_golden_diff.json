@@ -1,0 +1,86 @@
+{
+  "atol": 5e-12,
+  "case": {
+    "V_realised_pL": 0.9713842951456311,
+    "V_requested_pL": 0.9,
+    "alpha_star_um": 0.17918391610563794,
+    "geometry": {
+      "alpha_star_um": 0.17918391610563794,
+      "annulus_max_um": 0.17918391610563794,
+      "annulus_mean_um": 0.17918391610563802,
+      "annulus_min_um": 0.17918391610563794,
+      "annulus_q05_um": 0.17918391610563794,
+      "annulus_q50_um": 0.17918391610563794,
+      "annulus_q95_um": 0.17918391610563794,
+      "annulus_std_um": 8.367390153346051e-17,
+      "mean_A_over_V_se_um_inv": 0.01998732854145429,
+      "mean_A_over_V_um_inv": 0.6035594103217556,
+      "mean_area_se_um2": 25.245154620567348,
+      "mean_area_um2": 605.8264522957029,
+      "mean_volume_pL": 0.9713842951456311,
+      "mean_volume_um3": 971.3842951456311,
+      "n_geometry_cells": 20,
+      "n_primary_cells": 103,
+      "n_vi_validation_points": 20000,
+      "rho_per_uL": 931351.2731481482,
+      "sampled_mean_volume_se_um3": 74.7616368644288,
+      "sampled_mean_volume_um3": 1045.97105617079,
+      "vi": 0.9047,
+      "vi_se": 0.002076269611587089
+    },
+    "geometry_seed": 20260811,
+    "mean_A_over_V_um_inv": 0.6035594103217556,
+    "n_escaped": 0,
+    "pp": 0.02,
+    "rho_realised_per_uL": 931351.2731481482,
+    "rho_requested_per_uL": 1000000.0,
+    "schema": "madi-cpu-gpu-golden-v1",
+    "stream_seed": 20260812,
+    "vi_realised": 0.9047
+  },
+  "comparisons": {
+    "Y": {
+      "allclose": true,
+      "max_abs": 4.973799150320701e-14,
+      "max_rel": 1.6338792676116797e-14,
+      "shape": [
+        64,
+        5,
+        3
+      ]
+    },
+    "escaped_equal": true,
+    "metrics": {
+      "allclose": true,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "shape": [
+        64,
+        7
+      ]
+    },
+    "occupancy_fraction": {
+      "allclose": true,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "shape": [
+        5
+      ]
+    },
+    "start_survivor_fraction": {
+      "allclose": true,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "shape": [
+        5
+      ]
+    }
+  },
+  "cuda_available": true,
+  "golden": "tests/physics_audit/data/cpu_gpu_golden_v1.npz",
+  "golden_sha256": "226946adb85b8e3ff77ccc065d77b35bb77e6aa341b1f83d431c4b774e2826e0",
+  "n_escaped_gpu": 0,
+  "pass": true,
+  "rtol": 5e-11,
+  "schema": "madi-cpu-gpu-golden-report-v1"
+}

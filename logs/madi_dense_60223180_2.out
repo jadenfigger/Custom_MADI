@@ -1,0 +1,30 @@
+/home/jfigger/.conda/envs/madiEnv/bin/python
+imports OK
+CUDA: True
+GPU: NVIDIA A100-SXM4-80GB MIG 2g.20gb
+============================================================
+Building MADI library
+============================================================
+
+  Mode: weighted remediation log grid
+  cellular triplets: 24
+  rho: 10,000 .. 10,000,000 cells/uL (8 uniform-log nodes)
+  V:   0.01 .. 200 pL (12 uniform-log nodes)
+  vi:  0.400 .. 0.990 (diagonal mask)
+  kio: [0.0, 20.0, 130.0] s^-1
+  free water: one explicit discrete atom
+
+  Sharding: 2/4; 6 triplets -> libraries/madi_remediation_pilot.shard002.npz
+  Requested: 6 triplets
+  vi filter: keeping 0.40 <= vi <= 0.99
+  Skipped: 0 (outside vi range) + 0 (already exist)
+  New to compute: 6
+  (δ,Δ,b) grid: 4 pairs × 6 b-values = 24 columns/entry
+  Grouped into 2 unique (ρ,V) pairs (ensembles reused across kio values)
+  [(ρ,V)=(1389k, 0.37)] 3 kio values → ['0', '20', '130']
+    → 3 entries in 110.4s (36.8s/entry)  [3/6 done]
+  [(ρ,V)=(27k, 33.04)] 3 kio values → ['0', '20', '130']
+    → 3 entries in 52.9s (17.6s/entry)  [6/6 done]
+
+Library: 6 entries total (6 new in 163s)
+Saved to libraries/madi_remediation_pilot.shard002.npz

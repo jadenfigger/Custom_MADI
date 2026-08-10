@@ -1,0 +1,53 @@
+{
+  "cellular_entries": 24,
+  "errors": [],
+  "exact_duplicate_vectors": 0,
+  "expected_shard_counts": {
+    "0": 7,
+    "1": 6,
+    "2": 6,
+    "3": 6
+  },
+  "free_water_entries": 1,
+  "minimum_pairwise_l2": 0.06695283457968167,
+  "minimum_signal": -0.035268407501117156,
+  "negative_signal_count": 50,
+  "nonfinite_signal_count": 0,
+  "pass": true,
+  "per_shard": [
+    {
+      "entries": 7,
+      "errors": [],
+      "expected_entries": 7,
+      "path": "libraries/madi_remediation_pilot.shard000.npz",
+      "shard_id": 0
+    },
+    {
+      "entries": 6,
+      "errors": [],
+      "expected_entries": 6,
+      "path": "libraries/madi_remediation_pilot.shard001.npz",
+      "shard_id": 1
+    },
+    {
+      "entries": 6,
+      "errors": [],
+      "expected_entries": 6,
+      "path": "libraries/madi_remediation_pilot.shard002.npz",
+      "shard_id": 2
+    },
+    {
+      "entries": 6,
+      "errors": [],
+      "expected_entries": 6,
+      "path": "libraries/madi_remediation_pilot.shard003.npz",
+      "shard_id": 3
+    }
+  ],
+  "schema": "madi-remediation-pilot-validation-v1",
+  "tier": "A",
+  "total_entries": 25,
+  "warnings": [
+    "pilot contains 50 negative low-signal samples (minimum -0.0352684); report them to the P2 trust-floor check rather than treating a low-MC pilot as production evidence"
+  ]
+}
