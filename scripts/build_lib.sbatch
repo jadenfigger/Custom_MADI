@@ -15,7 +15,8 @@
 #SBATCH --export=NONE
 
 # This is the single Sol launcher for production, the P0-D golden check, the
-# v5 pilot build, and the post-production restricted replicate.  The 24-hour
+# v5 pilot build, the pre-launch stencil probe, and the post-production
+# restricted replicate.  The 24-hour
 # production default stays on public/public.  For the sub-four-hour golden and
 # pilot jobs, override it at submission with ``--partition=htc --qos=public``
 # and request at least 24G host memory.
@@ -130,6 +131,35 @@ case "${MODE}" in
       --geometry-reference data/geometry_reference_si_kappa_0p9.npz
     ;;
 
+  stencil-probe)
+    N_SHARDS="${2:-4}"
+    if (( TASK_ID < 0 || TASK_ID >= N_SHARDS )); then
+      echo "stencil-probe task ${TASK_ID} is outside [0, ${N_SHARDS})" >&2
+      exit 2
+    fi
+    # A pre-launch, production-Monte-Carlo restricted cross.  Its declaration
+    # is resolved against the unchanged P0 64 x 64 masked grid by fit_data,
+    # so neither coordinates nor quadrature weights can be altered here.  It
+    # is intentionally distinct from the production artifact and W4.
+    python -m scripts.validate_v5_stencil_probe \
+      --declaration data/madi_v5_stencil_probe_entry_subset.json
+    if [[ $? -ne 0 ]]; then
+      echo "ERROR: stencil-probe declaration did not validate against the canonical P0 grid." >&2
+      exit 2
+    fi
+    python -m scripts.fit_data \
+      --build-library \
+      --lib-preset dense \
+      --library libraries/madi_v5_stencil_probe.npz \
+      --shard-id "${TASK_ID}" \
+      --n-shards "${N_SHARDS}" \
+      --seed 20260803 \
+      --vi-min 0.4 \
+      --vi-max 0.99 \
+      --remediation-entry-subset data/madi_v5_stencil_probe_entry_subset.json \
+      --geometry-reference data/geometry_reference_si_kappa_0p9.npz
+    ;;
+
   replicate)
     N_SHARDS="${2:-8}"
     if (( TASK_ID < 0 || TASK_ID >= N_SHARDS )); then
@@ -159,7 +189,7 @@ case "${MODE}" in
     ;;
 
   *)
-    echo "Pass positional mode golden, pilot, production, or replicate; got ${MODE}." >&2
+    echo "Pass positional mode golden, pilot, production, stencil-probe, or replicate; got ${MODE}." >&2
     exit 2
     ;;
 esac

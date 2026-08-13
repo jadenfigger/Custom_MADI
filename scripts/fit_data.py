@@ -455,7 +455,7 @@ def load_remediation_entry_subset(
     path: str,
     canonical_triplets: list[tuple[float, float, float]],
 ) -> tuple[list[tuple[float, float, float]], dict]:
-    """Resolve the declared v5 replicate subset against the full P0 grid.
+    """Resolve a declared v5 restricted subset against the full P0 grid.
 
     A restricted build must not accept arbitrary coordinates: each declared
     pair/k_io combination is checked against the canonical weighted
@@ -468,7 +468,11 @@ def load_remediation_entry_subset(
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read remediation entry subset {path!r}: {exc}") from exc
 
-    if declaration.get("schema") != "madi-replicate-entry-subset-v1":
+    supported_schemas = {
+        "madi-replicate-entry-subset-v1",
+        "madi-v5-stencil-probe-entry-subset-v1",
+    }
+    if declaration.get("schema") not in supported_schemas:
         raise ValueError("unsupported remediation entry-subset schema")
     pairs = declaration.get("cellular_pairs")
     kios = declaration.get("kio_values_s_inv")
@@ -1488,8 +1492,8 @@ def main():
                          "nodes, including zero; intended for pilot builds.")
     ap.add_argument("--remediation-entry-subset", type=str, default=None,
                     help="[dense remediation grid] JSON declaration of a restricted, "
-                         "canonical-entry build (used only for the independent-seed "
-                         "v5 replicate validation job).")
+                         "canonical-entry build (for a separately declared v5 "
+                         "diagnostic or replicate job).")
     ap.add_argument("--sim-walkers", type=int, default=None,
                     help="Override walkers per ensemble for this build (pilot only).")
     ap.add_argument("--sim-ensembles", type=int, default=None,
@@ -1897,7 +1901,7 @@ def main():
             print("  free water: one explicit discrete atom")
             if args.remediation_entry_subset is not None:
                 subset = build_grid_metadata["restricted_entry_subset"]
-                print(f"  restricted replicate subset: {subset['cellular_entries']} cellular "
+                print(f"  restricted declared subset: {subset['cellular_entries']} cellular "
                       f"+ {subset['total_entries'] - subset['cellular_entries']} free-water entries")
 
             if args.shard_id is not None:

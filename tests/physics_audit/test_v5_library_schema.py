@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from madi import signal as sig
 from madi.config import ENSEMBLE_MEAN_SUBSET_B_VALUES_S_MM2, SimConfig
@@ -20,6 +22,7 @@ from madi.library import (
 )
 from madi.walker_gpu import ReducedResult, _merge_results
 from scripts.fit_data import load_remediation_entry_subset
+from scripts.validate_v5_stencil_probe import load_probe_definition
 from scripts.validate_remediation_pilot import PILOT_BIG_DELTAS, PILOT_SMALL_DELTAS
 
 
@@ -100,6 +103,32 @@ def test_declared_replicate_subset_resolves_to_exactly_190_canonical_entries() -
     assert sum(rho > 0.0 for _, rho, _ in selected) == 189
     assert provenance["cellular_entries"] == 189
     assert provenance["total_entries"] == 190
+
+
+def test_declared_stencil_probe_resolves_to_exactly_39_canonical_entries() -> None:
+    definition = load_probe_definition("data/madi_v5_stencil_probe_entry_subset.json")
+    canonical, _ = make_remediation_log_grid().triplets_and_weights()
+    selected, provenance = load_remediation_entry_subset(
+        "data/madi_v5_stencil_probe_entry_subset.json", canonical,
+    )
+    assert definition.center == (21, 41)
+    assert len(definition.pairs) == 13
+    assert definition.expected_cellular_entries == 39
+    assert len(selected) == 39
+    assert sum(rho > 0.0 for _, rho, _ in selected) == 39
+    assert provenance["cellular_entries"] == 39
+    assert provenance["total_entries"] == 39
+
+
+def test_restricted_subset_launcher_rejects_noncanonical_probe_coordinate(tmp_path) -> None:
+    source = ROOT / "data" / "madi_v5_stencil_probe_entry_subset.json"
+    declaration = json.loads(source.read_text(encoding="utf-8"))
+    declaration["cellular_pairs"][0]["rho"] = 64_495.0
+    malformed = tmp_path / "malformed_probe.json"
+    malformed.write_text(json.dumps(declaration), encoding="utf-8")
+    canonical, _ = make_remediation_log_grid().triplets_and_weights()
+    with pytest.raises(ValueError, match="not a retained canonical"):
+        load_remediation_entry_subset(str(malformed), canonical)
 
 
 def test_shard_merger_rejects_mixed_build_seeds_for_v5_crn_contract(tmp_path) -> None:
