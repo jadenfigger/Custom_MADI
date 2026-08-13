@@ -45,8 +45,8 @@ The node nearest the geometric centre of the mask is `(rho_index, V_index) =
 
 The two lines share their centre, so there are 13 retained `(rho,V)` pairs.
 Crossing them with the three production `k_io` nodes yields exactly 39 cellular
-entries and no free-water atom. Four round-robin shards therefore contain 12,
-9, 9, and 9 entries respectively.
+entries and no free-water atom. The resource-efficient Sol run below assigns
+one `(rho,V)` group (its three `k_io` entries) to each of 13 shards.
 
 The analysis uses these declared canonical indices to define rho/V adjacency.
 This is intentional: v5 `rhos` and `Vs` are finite-geometry realized summary
@@ -66,12 +66,30 @@ geometry reference. It has no timing or b override, so it stores the full
 production 1,245 timing-pair x 25 b-value grid plus the unchanged 200-column
 v5 diagnostic subset.
 
-The estimated single-task duration is about 6.4 hours for 39 entries, which
-exceeds `htc`'s four-hour limit. This runbook chooses four `public/public`
-tasks rather than `htc`: that preserves the existing production launcher
-request of one GPU, 16 CPU cores, and 64 GiB host memory while keeping the
-largest 12-entry shard comfortably below the four-hour estimate. No production
-array, W4 array, merge, or overwrite is included.
+The probe uses a 20-GiB A100 MIG slice on `htc`, not a full A100. The dominant
+CUDA buffer is `100,000 x 129 x 3` float64 values, or about 0.29 GiB; the
+remaining walker buffers and one active geometry are far below the 20-GiB
+device limit. A 10-GiB slice would also fit the memory footprint, but has less
+compute capacity and no useful safety advantage for this long-running probe.
+
+MIG slices have less compute capacity than a full A100, so simply swapping the
+old four 12-entry tasks to a slice could exceed the `htc` four-hour limit.
+Thirteen one-geometry-group tasks preserve the identical 39-entry experiment
+while keeping each task short enough for backfill. The `%1` throttle deliberately
+allows only one 20-GiB slice at a time: the peak allocation is one GPU, two CPU
+cores, and 8 GiB host RAM. This improves scheduling eligibility at the cost of
+longer total elapsed time. The pilot's peak host RAM was 1.17 GiB and its CPU
+use was approximately one core; 8 GiB and two cores retain a conservative
+margin for the 40-ensemble/full-column probe. No production array, W4 array,
+merge, or overwrite is included.
+
+The CPU fallback is deliberately not selected. The accepted Sol full-facet
+golden check already reproduced the CPU reference trajectory and occupancy to
+the recorded float64 tolerance, so a new parity campaign is unnecessary.
+However, this probe would require about `13 x 3 x 40 x 100,000 x 128,000 =
+1.9968e13` CPU walker microsteps. Its CPU path also invokes the exact
+full-facet classifier at each step, making it unsuitable for this
+production-Monte-Carlo probe.
 
 ## 1. Sol pre-flight commands
 
@@ -98,34 +116,33 @@ myquota
 ```
 
 Stop if the pull is not a fast-forward, the geometry checksum does not print
-`OK`, the declaration hash cannot be written, or quota is inadequate for four
+`OK`, the declaration hash cannot be written, or quota is inadequate for thirteen
 full-column shards and their simultaneous diagnostic output. Do not repair a
 dirty checkout with reset or checkout commands.
 
-## 2. Submit the four-task restricted probe
+## 2. Submit the MIG-slice restricted probe
 
 ```bash
 cd /scratch/jfigger/madi/Custom_MADI
 sbatch --job-name=madi_v5_stencil_probe \
   --output=logs/madi_v5_stencil_probe_%A_%a.out \
   --error=logs/madi_v5_stencil_probe_%A_%a.err \
-  --partition=public --qos=public --array=0-3 \
-  --time=0-04:00:00 --cpus-per-task=16 --mem=64G -G 1 \
-  scripts/build_lib.sbatch stencil-probe 4
+  --partition=htc --qos=public --array=0-12%1 \
+  --time=0-04:00:00 --cpus-per-task=2 --mem=8G -G a100.20gb:1 \
+  scripts/build_lib.sbatch stencil-probe 13
 ```
 
-The launcher writes only these distinct files:
+The launcher writes these 13 distinct files:
 
 ```text
 libraries/madi_v5_stencil_probe.shard000.npz
-libraries/madi_v5_stencil_probe.shard001.npz
-libraries/madi_v5_stencil_probe.shard002.npz
-libraries/madi_v5_stencil_probe.shard003.npz
+...
+libraries/madi_v5_stencil_probe.shard012.npz
 ```
 
 ## 3. Completion, hashes, and artifact validation
 
-Wait until the four tasks are complete with zero exit status. These commands
+Wait until all 13 tasks are complete with zero exit status. These commands
 avoid an unknown job-id placeholder by querying the explicit job name.
 
 ```bash
@@ -133,11 +150,7 @@ cd /scratch/jfigger/madi/Custom_MADI
 squeue -u jfigger -n madi_v5_stencil_probe
 sacct -u jfigger --name=madi_v5_stencil_probe \
   --format=JobID,JobName%32,State,ExitCode,Elapsed,MaxRSS
-sha256sum \
-  libraries/madi_v5_stencil_probe.shard000.npz \
-  libraries/madi_v5_stencil_probe.shard001.npz \
-  libraries/madi_v5_stencil_probe.shard002.npz \
-  libraries/madi_v5_stencil_probe.shard003.npz \
+sha256sum libraries/madi_v5_stencil_probe.shard0{00..12}.npz \
   > logs/madi_v5_stencil_probe_shards.sha256
 cat logs/madi_v5_stencil_probe_definition.sha256
 cat logs/madi_v5_stencil_probe_shards.sha256
@@ -147,12 +160,9 @@ which python
 python -m scripts.validate_v5_stencil_probe \
   --declaration data/madi_v5_stencil_probe_entry_subset.json
 python analysis/v5_stencil_probe.py \
-  libraries/madi_v5_stencil_probe.shard000.npz \
-  libraries/madi_v5_stencil_probe.shard001.npz \
-  libraries/madi_v5_stencil_probe.shard002.npz \
-  libraries/madi_v5_stencil_probe.shard003.npz \
+  libraries/madi_v5_stencil_probe.shard0{00..12}.npz \
   --declaration data/madi_v5_stencil_probe_entry_subset.json \
-  --expected-shards 4 \
+  --expected-shards 13 \
   --output-dir docs/figures/v5_stencil_probe \
   --report docs/v5_stencil_probe.md
 ```
@@ -167,7 +177,7 @@ groups.
 On success it writes the per-axis correlation histograms, direct observed SE
 versus b/timing, beta-versus-stencil figure, reallocation table, full CSVs, and
 a JSON summary under `docs/figures/v5_stencil_probe/`. It then replaces this
-pre-launch record with the final validation report. Retain all four shards,
+pre-launch record with the final validation report. Retain all 13 shards,
 hash files, Slurm logs, CSVs, JSON, figures, and generated report before any
 GO decision. Do not launch production or W4 merely because this probe
 completed.
