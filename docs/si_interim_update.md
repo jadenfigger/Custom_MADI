@@ -1,7 +1,7 @@
 # MADI I SI interim remediation update
 
 Date: 2026-08-03.  Source read in full:
-[nbm4781-sup-0001](papers/nbm4781-sup-0001-supporting%20information.docx).
+[MADI I Supporting Information](https://doi.org/10.1002/nbm.4781).
 
 This update supersedes the earlier remediation direction only where the SI is
 explicit.  P1 remains paused.  The initially discovered S7a/S13--S14 conflict

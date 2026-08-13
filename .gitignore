@@ -4,11 +4,33 @@ data/*
 !data/geometry_reference_si_kappa_0p9.npz
 !data/geometry_reference_si_kappa_0p9.npz.sha256
 !data/madi_v5_replicate_entry_subset.json
-figures/
-error_landscape_3d_out/
-out_singleshell/
+!data/madi_v5_stencil_probe_entry_subset.json
+
+# Runtime products, temporary analysis results, and machine-local settings do
+# not belong in the source repository.  Keep validation records in docs/, not
+# their generated logs or numerical outputs.
+.claude/
+.vscode/
+logs/
+sol_outputs/
+libraries/
 __pycache__/
+*.py[cod]
+analysis_dense*/
+madi_analysis/
+madi_dense.npz
+madi_library*.npz
+madi_output*/
+out_*/
+error_landscape_3d_out/
+error_landscape_out/
+decay_curves.png
+
+# Publisher copies and local spreadsheets are referenced from documentation,
+# but are not project source and should be retrieved from their primary hosts.
+docs/papers/
+docs/Literature_Parameter_Values.xlsx
+figures/
 *.nii
 *.nii.gz
 *.npz
-!data/geometry_reference_si_kappa_0p9.npz

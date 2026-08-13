@@ -8,9 +8,9 @@ supporting information.
 
 Primary sources:
 
-- MADI I Supporting Information, [nbm4781-sup-0001](papers/nbm4781-sup-0001-supporting%20information.docx), especially §§S.I--S.IV and Eqs. S7a--S14.
-- Springer *et al.*, MADI I, *NMR in Biomedicine* 36:e4781 (2023), especially §§2--3 and Eqs. 3--5.
-- Springer *et al.*, MADI II, *NMR in Biomedicine* 36:e4782 (2023), especially §4.4.1.
+- MADI I [Supporting Information](https://doi.org/10.1002/nbm.4781), especially §§S.I--S.IV and Eqs. S7a--S14.
+- Springer *et al.*, [MADI I](https://doi.org/10.1002/nbm.4781), *NMR in Biomedicine* 36:e4781 (2023), especially §§2--3 and Eqs. 3--5.
+- Springer *et al.*, [MADI II](https://doi.org/10.1002/nbm.4782), *NMR in Biomedicine* 36:e4782 (2023), especially §4.4.1.
 
 ## Finite rectangular gradient lobes
 
