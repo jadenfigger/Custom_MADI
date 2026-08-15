@@ -51,7 +51,10 @@ esac
 
 OUTPUT_DIR="sol_outputs/v5_runtime_benchmark_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
 mkdir -p "${OUTPUT_DIR}"
-python analysis/v5_runtime_benchmark.py \
+# Module execution keeps the repository root (which contains ``madi/``) on
+# sys.path.  Running ``analysis/v5_runtime_benchmark.py`` directly instead
+# makes ``analysis/`` the import root and fails before the benchmark starts.
+python -m analysis.v5_runtime_benchmark \
   --case "${BENCHMARK_CASE}" \
   --output-dir "${OUTPUT_DIR}" \
   --geometry-reference data/geometry_reference_si_kappa_0p9.npz \
