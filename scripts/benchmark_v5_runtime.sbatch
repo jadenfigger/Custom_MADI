@@ -2,7 +2,7 @@
 #SBATCH --job-name=madi_v5_runtime
 #SBATCH -p public
 #SBATCH -q public
-#SBATCH --array=0-3%2
+#SBATCH --array=0-3
 #SBATCH -N 1
 #SBATCH -c 2
 #SBATCH -G a100:1
