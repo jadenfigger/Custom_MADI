@@ -4,7 +4,9 @@
 This script is deliberately read-only.  It turns the retained stencil-probe
 per-column table and the diagnostic-only runtime benchmark records into a
 machine-readable summary for ``docs/v5_runtime_regression.md`` once the Sol
-benchmark has returned.  It does not create or inspect a library artifact.
+benchmark has returned.  More than one result directory is accepted so a
+successful C1/C3 task can be retained when a different array task needs a
+diagnostic-only rerun.  It does not create or inspect a library artifact.
 """
 
 from __future__ import annotations
@@ -100,25 +102,38 @@ def beta_summary(path: Path) -> dict[str, Any]:
     }
 
 
-def _load_benchmarks(directory: Path) -> dict[str, dict[str, Any]]:
+def _load_benchmarks(directories: list[Path]) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
-    for path in sorted(directory.glob("v5_runtime_benchmark_*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("schema") != "madi-v5-runtime-benchmark-v1":
-            raise ValueError(f"unexpected benchmark schema in {path}: {data.get('schema')!r}")
-        case = data.get("case")
-        if not isinstance(case, str):
-            raise ValueError(f"benchmark {path} has no case name")
-        output[case] = data
+    origins: dict[str, Path] = {}
+    for directory in directories:
+        for path in sorted(directory.glob("v5_runtime_benchmark_*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("schema") != "madi-v5-runtime-benchmark-v1":
+                raise ValueError(f"unexpected benchmark schema in {path}: {data.get('schema')!r}")
+            case = data.get("case")
+            if not isinstance(case, str):
+                raise ValueError(f"benchmark {path} has no case name")
+            if case in output:
+                raise ValueError(
+                    f"duplicate benchmark case {case!r}: {origins[case]} and {path}; "
+                    "choose one deliberately rather than silently mixing runs"
+                )
+            output[case] = data
+            origins[case] = path
     return output
 
 
-def runtime_summary(directory: Path) -> dict[str, Any]:
-    benchmarks = _load_benchmarks(directory)
+def runtime_summary(directories: list[Path]) -> dict[str, Any]:
+    benchmarks = _load_benchmarks(directories)
     required = {"center-c1", "center-c3", "rho-low", "rho-high"}
     missing = sorted(required.difference(benchmarks))
     if missing:
-        return {"status": "incomplete", "directory": str(directory), "missing_cases": missing, "available_cases": sorted(benchmarks)}
+        return {
+            "status": "incomplete",
+            "directories": [str(path) for path in directories],
+            "missing_cases": missing,
+            "available_cases": sorted(benchmarks),
+        }
 
     c1 = benchmarks["center-c1"]
     c3 = benchmarks["center-c3"]
@@ -154,7 +169,7 @@ def runtime_summary(directory: Path) -> dict[str, Any]:
 
     return {
         "status": "complete",
-        "directory": str(directory),
+        "directories": [str(path) for path in directories],
         "center_gpu": c1["gpu"],
         "C1_seconds": C1,
         "C3_seconds": C3,
@@ -175,13 +190,17 @@ def runtime_summary(directory: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--beta-csv", type=Path, default=DEFAULT_BETA_CSV)
-    parser.add_argument("--benchmark-dir", type=Path, required=True)
+    parser.add_argument(
+        "--benchmark-dir", type=Path, nargs="+", required=True,
+        help="one or more benchmark output directories; each case may appear exactly once",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not args.beta_csv.is_file():
         raise FileNotFoundError(args.beta_csv)
-    if not args.benchmark_dir.is_dir():
-        raise NotADirectoryError(args.benchmark_dir)
+    for directory in args.benchmark_dir:
+        if not directory.is_dir():
+            raise NotADirectoryError(directory)
     payload = {
         "schema": "madi-v5-runtime-regression-summary-v1",
         "beta": beta_summary(args.beta_csv),
