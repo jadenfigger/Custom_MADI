@@ -11,10 +11,10 @@ production-grid derivative.
 Example
 -------
 python analysis/v5_stencil_probe.py \
-  libraries/madi_v5_stencil_probe.shard000.npz \
-  libraries/madi_v5_stencil_probe.shard001.npz \
-  libraries/madi_v5_stencil_probe.shard002.npz \
-  libraries/madi_v5_stencil_probe.shard003.npz \
+  libraries/madi_v5_stencil_probe.shard*.npz \
+  --expected-shards 11 \
+  --declared-shards 13 \
+  --allow-missing-shards 8 11 \
   --output-dir docs/figures/v5_stencil_probe \
   --report docs/v5_stencil_probe.md
 """
@@ -86,9 +86,67 @@ def _expected_triplets(definition: ProbeDefinition) -> dict[tuple[float, float, 
     return expected
 
 
+def declared_missing_shard_coverage(
+    definition: ProbeDefinition,
+    declared_shards: int,
+    missing_shards: tuple[int, ...],
+) -> dict[str, Any]:
+    """Resolve an explicitly allowed partial artifact to canonical triplets.
+
+    The production launcher assigns *complete* ``(rho, V)`` groups in
+    increasing ``rho*V`` order, round-robin over ``n_shards``.  Resolving the
+    allowed absence here makes a partial analysis fail closed: any coordinate
+    other than the declared timed-out groups still aborts validation.
+    """
+    if declared_shards < 1:
+        raise DiagnosticError("--declared-shards must be positive")
+    if len(set(missing_shards)) != len(missing_shards):
+        raise DiagnosticError("--allow-missing-shards must not contain duplicate shard ids")
+    invalid = [shard for shard in missing_shards if shard < 0 or shard >= declared_shards]
+    if invalid:
+        raise DiagnosticError(
+            f"--allow-missing-shards contains ids outside [0, {declared_shards}): {invalid!r}"
+        )
+
+    ordered_pairs = sorted(
+        definition.pairs,
+        key=lambda pair: float(definition.rhos[pair[0]]) * float(definition.Vs[pair[1]]),
+    )
+    pair_by_shard: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for position, pair in enumerate(ordered_pairs):
+        pair_by_shard[position % declared_shards].append(pair)
+
+    missing_pairs: list[dict[str, Any]] = []
+    missing_keys: set[tuple[float, float, float]] = set()
+    for shard in missing_shards:
+        assigned = pair_by_shard[shard]
+        if not assigned:
+            raise DiagnosticError(
+                f"--allow-missing-shards includes shard {shard}, which has no declared (rho, V) group"
+            )
+        for i, j in assigned:
+            missing_pairs.append({
+                "shard": int(shard),
+                "rho_index": int(i),
+                "V_index": int(j),
+                "rho": float(definition.rhos[i]),
+                "V": float(definition.Vs[j]),
+                "vi": float(definition.rhos[i] * definition.Vs[j] * 1e-6),
+            })
+            for kio in definition.kio_values:
+                missing_keys.add(_entry_key(kio, float(definition.rhos[i]), float(definition.Vs[j])))
+    return {
+        "declared_shards": int(declared_shards),
+        "allowed_missing_shards": [int(shard) for shard in missing_shards],
+        "missing_pairs": missing_pairs,
+        "allowed_missing_triplet_keys": missing_keys,
+    }
+
+
 def validate_probe_artifact(
     artifact: Artifact,
     definition: ProbeDefinition,
+    allowed_partial: dict[str, Any],
 ) -> tuple[dict[tuple[int, int, float], int], dict[str, Any]]:
     """Map stored entries to the declared canonical cross and abort on drift."""
     arrays = artifact.arrays
@@ -144,9 +202,12 @@ def validate_probe_artifact(
     free = np.asarray(arrays["is_free_water"], dtype=bool)
     if np.any(free):
         raise DiagnosticError("ABORT: stencil probe unexpectedly contains a free-water entry")
-    if len(free) != len(expected):
+    allowed_missing = allowed_partial["allowed_missing_triplet_keys"]
+    expected_present_entries = len(expected) - len(allowed_missing)
+    if len(free) != expected_present_entries:
         raise DiagnosticError(
-            f"ABORT: stencil probe has {len(free)} entries, expected exactly {len(expected)} declared entries"
+            f"ABORT: stencil probe has {len(free)} entries, expected {expected_present_entries} after the "
+            f"explicitly allowed missing shards (full declaration has {len(expected)} entries)"
         )
 
     entry_indices: dict[tuple[int, int, float], int] = {}
@@ -186,16 +247,29 @@ def validate_probe_artifact(
         realized_rho_ratio.append(float(arrays["rhos"][index]) / expected_rho)
         realized_V_ratio.append(float(arrays["Vs"][index]) / expected_V)
 
-    missing = sorted(set(expected).difference(seen))
-    if missing:
-        raise DiagnosticError(f"ABORT: artifact is missing declared canonical probe entries: {missing!r}")
+    missing = set(expected).difference(seen)
+    unexpected_missing = sorted(missing.difference(allowed_missing))
+    unexpectedly_present = sorted(allowed_missing.intersection(seen))
+    if unexpected_missing or unexpectedly_present:
+        raise DiagnosticError(
+            "ABORT: partial artifact does not match the explicitly allowed timed-out shard coverage: "
+            f"unexpected_missing={unexpected_missing!r}, unexpectedly_present={unexpectedly_present!r}"
+        )
 
     group_records = []
+    present_pairs: list[tuple[int, int]] = []
     for i, j in definition.pairs:
-        members = [
-            (kio, entry_indices[(i, j, kio)])
-            for kio in definition.kio_values
-        ]
+        member_keys = [(i, j, kio) for kio in definition.kio_values]
+        available = [key in entry_indices for key in member_keys]
+        if any(available) and not all(available):
+            raise DiagnosticError(
+                "ABORT: a retained (rho, V) group has only a subset of its k_io entries; "
+                f"partial analysis requires complete groups, got canonical indices {(i, j)!r}"
+            )
+        if not any(available):
+            continue
+        members = [(kio, entry_indices[(i, j, kio)]) for kio in definition.kio_values]
+        present_pairs.append((i, j))
         group_records.append({
             "context": (float(definition.rhos[i]), float(definition.Vs[j])),
             "members": members,
@@ -204,8 +278,8 @@ def validate_probe_artifact(
     geometry = geometry_reuse_summary(artifact, group_records)
     if (
         not geometry.get("available")
-        or geometry.get("groups_with_multiple_kio") != len(definition.pairs)
-        or geometry.get("groups_with_identical_per_ensemble_geometry") != len(definition.pairs)
+        or geometry.get("groups_with_multiple_kio") != len(present_pairs)
+        or geometry.get("groups_with_identical_per_ensemble_geometry") != len(present_pairs)
         or geometry.get("groups_with_mismatched_per_ensemble_geometry", 0) != 0
         or geometry.get("groups_missing_geometry_metadata", 0) != 0
     ):
@@ -222,14 +296,27 @@ def validate_probe_artifact(
             "validated above, define the one-axis derivative topology."
         ),
     }
-    return entry_indices, {"geometry_reuse": geometry, "realized_labels": realized_summary}
+    return entry_indices, {
+        "geometry_reuse": geometry,
+        "realized_labels": realized_summary,
+        "partial_coverage": {
+            "is_partial": bool(allowed_missing),
+            "declared_pairs": len(definition.pairs),
+            "available_pairs": len(present_pairs),
+            "declared_triplets": len(expected),
+            "available_triplets": len(seen),
+            "missing_pairs": allowed_partial["missing_pairs"],
+            "declared_shards": allowed_partial["declared_shards"],
+            "allowed_missing_shards": allowed_partial["allowed_missing_shards"],
+        },
+    }
 
 
 def declared_topology(
     definition: ProbeDefinition,
     entry_indices: dict[tuple[int, int, float], int],
-) -> tuple[dict[str, list[NeighborPair]], dict[str, Any]]:
-    """Construct immediate neighbours and central stencils from declared indices."""
+) -> tuple[dict[str, list[NeighborPair]], dict[str, dict[int, list[dict[str, Any]]]], dict[str, Any]]:
+    """Construct only intact declared neighbours/stencils, recording omissions."""
     selection = definition.declaration["selection"]
     i0, j0 = definition.center
     rho_line = [int(value) for value in selection["rho_line_indices"]]
@@ -238,67 +325,127 @@ def declared_topology(
     stencils: dict[str, dict[int, list[dict[str, Any]]]] = {
         "rho": defaultdict(list), "V": defaultdict(list), "k_io": defaultdict(list),
     }
+    coverage: dict[str, dict[str, Any]] = {
+        axis: {
+            "declared_immediate_pairs": 0,
+            "available_immediate_pairs": 0,
+            "missing_immediate_pairs": [],
+            "declared_stencils": defaultdict(int),
+            "available_stencils": defaultdict(int),
+            "missing_stencils": defaultdict(list),
+        }
+        for axis in AXES
+    }
+
+    def has_entries(keys: list[tuple[int, int, float]]) -> bool:
+        return all(key in entry_indices for key in keys)
+
+    def record_neighbor(axis: str, keys: list[tuple[int, int, float]], pair: NeighborPair) -> None:
+        coverage[axis]["declared_immediate_pairs"] += 1
+        if has_entries(keys):
+            neighbors[axis].append(pair)
+            coverage[axis]["available_immediate_pairs"] += 1
+        else:
+            coverage[axis]["missing_immediate_pairs"].append({
+                "context": list(pair.context),
+                "left_value": pair.left_value,
+                "right_value": pair.right_value,
+            })
+
+    def record_stencil(axis: str, width: int, keys: list[tuple[int, int, float]], record: dict[str, Any]) -> None:
+        coverage[axis]["declared_stencils"][width] += 1
+        if has_entries(keys):
+            stencils[axis][width].append(record)
+            coverage[axis]["available_stencils"][width] += 1
+        else:
+            coverage[axis]["missing_stencils"][width].append({
+                "context": list(record["context"]),
+                "left_index": keys[0][:2],
+                "center_index": keys[1][:2],
+                "right_index": keys[2][:2],
+            })
 
     for kio in definition.kio_values:
         for left_i, right_i in zip(rho_line[:-1], rho_line[1:]):
-            neighbors["rho"].append(NeighborPair(
+            pair = NeighborPair(
                 axis="rho",
-                left_index=entry_indices[(left_i, j0, kio)],
-                right_index=entry_indices[(right_i, j0, kio)],
+                left_index=entry_indices.get((left_i, j0, kio), -1),
+                right_index=entry_indices.get((right_i, j0, kio), -1),
                 left_value=float(definition.rhos[left_i]),
                 right_value=float(definition.rhos[right_i]),
                 context=(float(kio), float(definition.Vs[j0])),
-            ))
+            )
+            record_neighbor("rho", [(left_i, j0, kio), (right_i, j0, kio)], pair)
         for width in selection["supported_half_widths"]["rho"]:
             width = int(width)
-            stencils["rho"][width].append({
-                "left_index": entry_indices[(i0 - width, j0, kio)],
-                "center_index": entry_indices[(i0, j0, kio)],
-                "right_index": entry_indices[(i0 + width, j0, kio)],
+            keys = [(i0 - width, j0, kio), (i0, j0, kio), (i0 + width, j0, kio)]
+            record = {
+                "left_index": entry_indices.get(keys[0], -1),
+                "center_index": entry_indices.get(keys[1], -1),
+                "right_index": entry_indices.get(keys[2], -1),
                 "context": (float(kio), float(definition.Vs[j0])),
                 "width": width,
                 "h1": definition.rho_step,
-            })
+            }
+            record_stencil("rho", width, keys, record)
 
         for left_j, right_j in zip(V_line[:-1], V_line[1:]):
-            neighbors["V"].append(NeighborPair(
+            pair = NeighborPair(
                 axis="V",
-                left_index=entry_indices[(i0, left_j, kio)],
-                right_index=entry_indices[(i0, right_j, kio)],
+                left_index=entry_indices.get((i0, left_j, kio), -1),
+                right_index=entry_indices.get((i0, right_j, kio), -1),
                 left_value=float(definition.Vs[left_j]),
                 right_value=float(definition.Vs[right_j]),
                 context=(float(kio), float(definition.rhos[i0])),
-            ))
+            )
+            record_neighbor("V", [(i0, left_j, kio), (i0, right_j, kio)], pair)
         for width in selection["supported_half_widths"]["V"]:
             width = int(width)
-            stencils["V"][width].append({
-                "left_index": entry_indices[(i0, j0 - width, kio)],
-                "center_index": entry_indices[(i0, j0, kio)],
-                "right_index": entry_indices[(i0, j0 + width, kio)],
+            keys = [(i0, j0 - width, kio), (i0, j0, kio), (i0, j0 + width, kio)]
+            record = {
+                "left_index": entry_indices.get(keys[0], -1),
+                "center_index": entry_indices.get(keys[1], -1),
+                "right_index": entry_indices.get(keys[2], -1),
                 "context": (float(kio), float(definition.rhos[i0])),
                 "width": width,
                 "h1": definition.V_step,
-            })
+            }
+            record_stencil("V", width, keys, record)
 
     for i, j in definition.pairs:
         for left_kio, right_kio in zip(definition.kio_values[:-1], definition.kio_values[1:]):
-            neighbors["k_io"].append(NeighborPair(
+            pair = NeighborPair(
                 axis="k_io",
-                left_index=entry_indices[(i, j, left_kio)],
-                right_index=entry_indices[(i, j, right_kio)],
+                left_index=entry_indices.get((i, j, left_kio), -1),
+                right_index=entry_indices.get((i, j, right_kio), -1),
                 left_value=float(left_kio),
                 right_value=float(right_kio),
                 context=(float(definition.rhos[i]), float(definition.Vs[j])),
-            ))
-        stencils["k_io"][1].append({
-            "left_index": entry_indices[(i, j, definition.kio_values[0])],
-            "center_index": entry_indices[(i, j, definition.kio_values[1])],
-            "right_index": entry_indices[(i, j, definition.kio_values[2])],
+            )
+            record_neighbor("k_io", [(i, j, left_kio), (i, j, right_kio)], pair)
+        keys = [(i, j, kio) for kio in definition.kio_values]
+        record = {
+            "left_index": entry_indices.get(keys[0], -1),
+            "center_index": entry_indices.get(keys[1], -1),
+            "right_index": entry_indices.get(keys[2], -1),
             "context": (float(definition.rhos[i]), float(definition.Vs[j])),
             "width": 1,
             "h1": 1.0,
-        })
-    return neighbors, {axis: dict(widths) for axis, widths in stencils.items()}
+        }
+        record_stencil("k_io", 1, keys, record)
+
+    serializable_coverage = {
+        axis: {
+            **{key: value for key, value in values.items() if key not in {
+                "declared_stencils", "available_stencils", "missing_stencils",
+            }},
+            "declared_stencils": {str(width): count for width, count in values["declared_stencils"].items()},
+            "available_stencils": {str(width): count for width, count in values["available_stencils"].items()},
+            "missing_stencils": {str(width): rows for width, rows in values["missing_stencils"].items()},
+        }
+        for axis, values in coverage.items()
+    }
+    return neighbors, {axis: dict(widths) for axis, widths in stencils.items()}, serializable_coverage
 
 
 def paired_ensemble_bootstrap(
@@ -920,7 +1067,14 @@ def _relative_link(target: Path, report_path: Path) -> str:
     return os.path.relpath(target, start=report_path.parent).replace(os.sep, "/")
 
 
-def _verdict(kio_result: dict[str, Any]) -> tuple[str, str]:
+def _verdict(kio_result: dict[str, Any], partial: bool) -> tuple[str, str]:
+    if partial:
+        return (
+            "INVESTIGATE — partial stencil probe cannot close the pre-launch decision",
+            "The available groups can test their intact CRN pairs and stencils, but the timed-out groups "
+            "remove required immediate V/rho comparisons. No production configuration change or unconditional "
+            "GO decision is supported by this incomplete cross.",
+        )
     status = kio_result["support_for_path_divergence_prediction"]
     if status == "supported":
         return (
@@ -968,11 +1122,32 @@ def _write_report(
     reallocation: dict[str, Any],
     figures: dict[str, Path],
 ) -> None:
-    verdict, verdict_reason = _verdict(kio_result)
+    partial_coverage = topology_provenance["partial_coverage"]
+    topology_coverage = topology_provenance["topology"]
+    verdict, verdict_reason = _verdict(kio_result, partial_coverage["is_partial"])
     i0, j0 = definition.center
     rho_log10_step = definition.rho_step / math.log(10.0)
     V_log10_step = definition.V_step / math.log(10.0)
     lines: list[str] = []
+    reproduction_lines = [
+        "```bash",
+        "python analysis/v5_stencil_probe.py \\",
+        "  libraries/madi_v5_stencil_probe.shard*.npz \\",
+        "  --declaration data/madi_v5_stencil_probe_entry_subset.json \\",
+        f"  --expected-shards {len(artifact.paths)} \\",
+        f"  --declared-shards {partial_coverage['declared_shards']} \\",
+    ]
+    if partial_coverage["is_partial"]:
+        reproduction_lines.append(
+            "  --allow-missing-shards "
+            + " ".join(str(shard) for shard in partial_coverage["allowed_missing_shards"])
+            + " \\")
+    reproduction_lines.extend([
+        "  --output-dir docs/figures/v5_stencil_probe \\",
+        "  --report docs/v5_stencil_probe.md",
+        "```",
+        "",
+    ])
     lines.extend([
         "# v5 production-grid stencil probe",
         "",
@@ -984,16 +1159,56 @@ def _write_report(
         "",
         "## Probe geometry and contract checks",
         "",
-        f"The declaration contains {len(definition.pairs)} retained `(rho, V)` pairs crossed with `{list(definition.kio_values)}` s^-1: exactly {definition.expected_cellular_entries} cellular entries and no free-water atom.",
+        f"The declaration contains {len(definition.pairs)} retained `(rho, V)` pairs crossed with `{list(definition.kio_values)}` s^-1: exactly {definition.expected_cellular_entries} cellular entries and no free-water atom. This analysis received {partial_coverage['available_pairs']} complete `(rho,V)` groups / {partial_coverage['available_triplets']} triplets.",
         "",
-        f"Its centre is canonical indices `({i0}, {j0})`, `rho={definition.rhos[i0]:.9g}` cells/uL, `V={definition.Vs[j0]:.9g}` pL, and `v_i={definition.rhos[i0] * definition.Vs[j0] * 1e-6:.9g}`. The rho line supports `k=1,2,3,4`; the V line supports `k=1,2`; and `k_io={19,20,21}` supports its linear `k=1` central difference.",
+        f"Its centre is canonical indices `({i0}, {j0})`, `rho={definition.rhos[i0]:.9g}` cells/uL, `V={definition.Vs[j0]:.9g}` pL, and `v_i={definition.rhos[i0] * definition.Vs[j0] * 1e-6:.9g}`. The declared rho line supports `k=1,2,3,4`; the declared V line supports `k=1,2`; and `k_io={19,20,21}` supports its linear `k=1` central difference.",
         "",
         f"The canonical code-derived spacings are `ln(rho[i+1]/rho[i])={definition.rho_step:.12g}` (`{rho_log10_step:.12g}` decades) and `ln(V[j+1]/V[j])={definition.V_step:.12g}` (`{V_log10_step:.12g}` decades). `madi/config.py` supplies the timing/physics defaults, while the rho/V production generator is `madi.library.make_remediation_log_grid()`. These values differ slightly from the prompt's quoted decade values `0.047648` and `0.068259`; the canonical 64-node `geomspace` formulas were used rather than silently rounding either value.",
         "",
         f"All v5 checks passed before correlations were calculated: metadata records the ensemble-index CRN contract, the 40 x 100,000 production settings and full storage grid, variance reconstruction had maximum absolute error `{artifact.variance_check['max_abs_error']:.3g}`, and the subset mean reconstructed the main signal with maximum absolute error `{artifact.mean_check['max_abs_error']:.3g}`.",
         "",
-        f"All {topology_provenance['geometry_reuse']['groups_with_multiple_kio']} fixed-nominal `(rho,V)` k_io groups have identical `per_ensemble_geometry` metadata. Stored `rhos`/`Vs` are retained as realized finite-geometry provenance, not used as literal adjacency keys: their realized/nominal ratio summaries are rho median `{topology_provenance['realized_labels']['rho_realized_over_nominal']['median']:.6g}` and V median `{topology_provenance['realized_labels']['V_realized_over_nominal']['median']:.6g}`.",
+        f"All {topology_provenance['geometry_reuse']['groups_with_multiple_kio']} available fixed-nominal `(rho,V)` k_io groups have identical `per_ensemble_geometry` metadata. Stored `rhos`/`Vs` are retained as realized finite-geometry provenance, not used as literal adjacency keys: their realized/nominal ratio summaries are rho median `{topology_provenance['realized_labels']['rho_realized_over_nominal']['median']:.6g}` and V median `{topology_provenance['realized_labels']['V_realized_over_nominal']['median']:.6g}`.",
         "",
+    ])
+    if partial_coverage["is_partial"]:
+        lines.extend([
+            "### Partial-artifact coverage",
+            "",
+            "Only the following declared complete geometry groups are absent; no coordinate has been inferred, interpolated, or substituted:",
+            "",
+            "| Timed-out shard | rho index | V index | rho (cells/uL) | V (pL) | v_i |",
+            "|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in partial_coverage["missing_pairs"]:
+            lines.append(
+                f"| {row['shard']} | {row['rho_index']} | {row['V_index']} | {row['rho']:.9g} | "
+                f"{row['V']:.9g} | {row['vi']:.6g} |"
+            )
+        lines.extend([
+            "",
+            "Available versus declared topology: "
+            + "; ".join(
+                f"`{axis}` immediate pairs {topology_coverage[axis]['available_immediate_pairs']}/"
+                f"{topology_coverage[axis]['declared_immediate_pairs']}"
+                for axis in AXES
+            ) + ".",
+            "",
+            "Available versus declared central-stencil contexts: "
+            + "; ".join(
+                f"`{axis}` "
+                + ", ".join(
+                    f"k={width}: {topology_coverage[axis]['available_stencils'].get(str(width), 0)}/"
+                    f"{topology_coverage[axis]['declared_stencils'].get(str(width), 0)}"
+                    for width in sorted(
+                        set(topology_coverage[axis]['declared_stencils'])
+                        | set(topology_coverage[axis]['available_stencils'])
+                    )
+                )
+                for axis in AXES
+            ) + ".",
+            "",
+        ])
+    lines.extend([
         "## CRN correlations at production spacing",
         "",
         "Every listed pair preserves the shared ensemble index. The bootstrap resamples those aligned indices across all pair-column values, so it describes finite-ensemble uncertainty conditional on this one declared cross; it does not treat the 200 columns as 200 independent tissue realizations.",
@@ -1103,16 +1318,8 @@ def _write_report(
         "",
         "## Reproduction",
         "",
-        "```bash",
-        "python analysis/v5_stencil_probe.py \\",
-        "  libraries/madi_v5_stencil_probe.shard*.npz \\",
-        "  --declaration data/madi_v5_stencil_probe_entry_subset.json \\",
-        f"  --expected-shards {len(artifact.paths)} \\",
-        "  --output-dir docs/figures/v5_stencil_probe \\",
-        "  --report docs/v5_stencil_probe.md",
-        "```",
-        "",
     ])
+    lines.extend(reproduction_lines)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1127,23 +1334,39 @@ def _json_default(value: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("artifact", nargs="+", help="four completed probe shards, glob, or containing directory")
+    parser.add_argument("artifact", nargs="+", help="one or more completed probe shards, a glob, or a containing directory")
     parser.add_argument(
         "--declaration", default="data/madi_v5_stencil_probe_entry_subset.json",
         help="declared production-grid stencil cross",
     )
-    parser.add_argument("--expected-shards", type=int, default=4)
+    parser.add_argument("--expected-shards", type=int, default=13)
+    parser.add_argument(
+        "--declared-shards", type=int, default=13,
+        help="original launcher shard count used to resolve --allow-missing-shards",
+    )
+    parser.add_argument(
+        "--allow-missing-shards", type=int, nargs="*", default=(),
+        help="explicitly allow only these timed-out original shard ids; all other absent triplets abort",
+    )
     parser.add_argument("--output-dir", default="docs/figures/v5_stencil_probe")
     parser.add_argument("--report", default="docs/v5_stencil_probe.md")
     parser.add_argument("--bootstrap-replicates", type=int, default=DEFAULT_BOOTSTRAP_REPLICATES)
     args = parser.parse_args(argv)
     if args.bootstrap_replicates < 200:
         parser.error("--bootstrap-replicates must be at least 200")
+    if args.expected_shards < 1:
+        parser.error("--expected-shards must be positive")
     try:
         definition = load_probe_definition(args.declaration)
+        allowed_partial = declared_missing_shard_coverage(
+            definition, args.declared_shards, tuple(args.allow_missing_shards),
+        )
         artifact = load_artifact(_expand_paths(args.artifact), args.expected_shards)
-        entry_indices, topology_provenance = validate_probe_artifact(artifact, definition)
-        neighbors, stencils = declared_topology(definition, entry_indices)
+        entry_indices, topology_provenance = validate_probe_artifact(
+            artifact, definition, allowed_partial,
+        )
+        neighbors, stencils, topology = declared_topology(definition, entry_indices)
+        topology_provenance["topology"] = topology
         correlations = compute_probe_correlations(artifact, neighbors, args.bootstrap_replicates)
         kio_result = kio_path_divergence_result(artifact, correlations)
         observed = observed_standard_errors(artifact)
@@ -1205,7 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "complete",
         "report": str(report_path),
         "output_dir": str(output_dir),
-        "verdict": _verdict(kio_result)[0],
+        "verdict": _verdict(kio_result, topology_provenance["partial_coverage"]["is_partial"])[0],
     }, indent=2))
     return 0
 
