@@ -52,7 +52,7 @@ module load mamba/latest
 ```
 If the env will use a GPU and you want to verify CUDA works in the same session, request a GPU instead:
 ```bash
-interactive -p general -q public -G a100:1 -c 8 --mem=32G -t 0-02:00
+interactive -p public -q public -G -c 2 --mem=24G -t 0-02:00
 module load mamba/latest
 ```
 (The `general` partition auto-remaps to `public/public` right now and will be removed entirely after the next maintenance — `-p public -q public` is the future-proof form.)
@@ -336,7 +336,7 @@ ls ~/.local/lib 2>/dev/null
 We want a GPU on this session because we're going to verify that Numba can see CUDA before submitting the array. The `general` partition still auto-remaps but `public` is future-proof.
 
 ```bash
-interactive -p public -q public -G a100:1 -c 8 --mem=32G -t 0-02:00
+interactive -p public -q public -G a100:1 -c 8 --mem=24G -t 0-02:00
 ```
 
 Wait until your prompt switches from `login0X` to a compute node name (e.g., `cg012`). If it doesn't allocate within a minute or two, you can check the queue with `squeue -u $USER` from another shell, or downgrade to `interactive -p htc -c 8 -t 0-01:00` (no GPU — you just won't be able to run the CUDA verification step on the same node).
@@ -346,15 +346,7 @@ Wait until your prompt switches from `login0X` to a compute node name (e.g., `cg
 ```bash
 module load mamba/latest
 
-mamba create -y -n madiEnv -c conda-forge \
-    python=3.11 \
-    numpy=1.26 \
-    scipy \
-    matplotlib \
-    nibabel \
-    numba \
-    cudatoolkit=11.8 \
-    tqdm
+mamba create -y -n madiEnv -c conda-forge python=3.11 numpy=1.26 scipy matplotlib nibabel numba cudatoolkit=11.8 tqdm
 
 source activate madiEnv
 ```

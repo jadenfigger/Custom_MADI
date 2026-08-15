@@ -12,6 +12,19 @@ remains `public/public` because its wall time is one day.
 
 The Sol repository path below is `/scratch/jfigger/madi/Custom_MADI`.
 
+## Current v5 pilot status — 2026-08-11
+
+The one-ensemble pilot described below is a historical v4 execution record.
+It is retained because it certified the then-current geometry/provenance path,
+but it cannot validate the v5 between-ensemble variance or covariance-subset
+storage schema.  Do **not** rerun its section 2 command as the current
+production gate.
+
+The accepted v5 pilot record is
+[`p0_v5_pilot_validation.md`](p0_v5_pilot_validation.md).  The only current
+pilot build and validation commands are in
+[`v5_pilot_runbook.md`](v5_pilot_runbook.md).
+
 ## Execution record — 2026-08-03
 
 - `gpu_golden_60169767` and `gpu_golden_60222142` are retired cache-era runs:
@@ -85,7 +98,12 @@ Any nonzero job exit, missing JSON, a false `pass`, an escape, or a hash
 mismatch is a failure.  Do not submit the pilot in that case; return the four
 files above for diagnosis.
 
-## 2. Tier C — restricted pilot library
+## 2. Tier C — restricted pilot library (historic v4 configuration)
+
+> **Historical only.** This one-ensemble, 24-column pilot was superseded by
+> the v5 8-ensemble, 1,500-column pilot documented in
+> [`v5_pilot_runbook.md`](v5_pilot_runbook.md).  Retain these details only to
+> interpret the 2026-08-03 artifacts and their validation record.
 
 Run this only after the golden check passes and the reference SHA check above
 matches.  Submit exactly:

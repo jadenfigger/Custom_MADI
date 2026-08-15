@@ -1,183 +1,124 @@
 # v5 production-grid stencil probe
 
-## Current status and verdict
+## Verdict
 
-**INVESTIGATE — no production launch and no configuration change is authorized
-yet.** This record prepares the pre-launch restricted probe required by the
-v5 pilot CRN diagnostic. The probe artifact does not exist in this checkout,
-so no CRN, beta, noise, or reallocation result is reported here. The completed
-artifact analysis command below regenerates this file with the final result
-and a GO / GO-WITH-CHANGE / INVESTIGATE verdict.
+**GO — retain 40 ensembles × 100,000 walkers.** The production-step k_io result is decisively above the pilot correlation range, while the single-configuration probe does not identify evidence strong enough to justify an allocation change.
 
-This probe is distinct from both the production library and the post-production
-W4 independent-seed replicate. It must not overwrite either.
+This report was generated from the restricted production-Monte-Carlo cross. It neither launches nor modifies the production build, W4, simulator, geometry code, library schema, or fitters.
 
-## Declared production-grid cross
+## Probe geometry and contract checks
 
-[`data/madi_v5_stencil_probe_entry_subset.json`](../data/madi_v5_stencil_probe_entry_subset.json)
-is a declared, canonical-grid-restricted entry set. The launcher resolves
-every coordinate against `make_remediation_log_grid()` before it builds any GPU
-entry, so a typo or out-of-grid coordinate aborts rather than changing the
-production quadrature or simulator behavior.
+The declaration contains 13 retained `(rho, V)` pairs crossed with `[19.0, 20.0, 21.0]` s^-1: exactly 39 cellular entries and no free-water atom. This analysis received 13 complete `(rho,V)` groups / 39 triplets.
 
-The source grid has 64 nodes in each log coordinate. `madi/config.py` supplies
-the timing/physics defaults; the actual rho/V production-grid generator is
-`madi.library.make_remediation_log_grid()`. Its exact code-derived steps are
+Its centre is canonical indices `(21, 41)`, `rho=100000` cells/uL, `V=6.29626521` pL, and `v_i=0.629626521`. The declared rho line supports `k=1,2,3,4`; the declared V line supports `k=1,2`; and `k_io=(19, 20, 21)` supports its linear `k=1` central difference.
 
-- `ln(rho[i+1]/rho[i]) = 0.10964690919019218`, or
-  `0.0476190476190474` decades;
-- `ln(V[j+1]/V[j]) = 0.15719821511962115`, or
-  `0.0682703173914918` decades.
+The canonical code-derived spacings are `ln(rho[i+1]/rho[i])=0.10964690919` (`0.047619047619` decades) and `ln(V[j+1]/V[j])=0.15719821512` (`0.0682703173915` decades). `madi/config.py` supplies the timing/physics defaults, while the rho/V production generator is `madi.library.make_remediation_log_grid()`. These values differ slightly from the prompt's quoted decade values `0.047648` and `0.068259`; the canonical 64-node `geomspace` formulas were used rather than silently rounding either value.
 
-Those differ slightly from the prompt's quoted `0.047648` and `0.068259`
-decades. The declaration and analysis use the canonical `geomspace` values,
-rather than silently choosing a rounded alternative.
+All v5 checks passed before correlations were calculated: metadata records the ensemble-index CRN contract, the 40 x 100,000 production settings and full storage grid, variance reconstruction had maximum absolute error `2.83e-11`, and the subset mean reconstructed the main signal with maximum absolute error `6.6e-09`.
 
-The node nearest the geometric centre of the mask is `(rho_index, V_index) =
-(21, 41)`: `rho = 100,000` cells/uL, `V = 6.2962652107424715` pL, and
-`v_i = 0.6296265210742472`. The retained cross is:
+All 13 available fixed-nominal `(rho,V)` k_io groups have identical `per_ensemble_geometry` metadata. Stored `rhos`/`Vs` are retained as realized finite-geometry provenance, not used as literal adjacency keys: their realized/nominal ratio summaries are rho median `0.998285` and V median `1.00172`.
 
-| Line | Canonical nodes | Supported central half-widths |
-|---|---|---|
-| rho at `V_index=41` | `rho_index=17..25` | `k=1,2,3,4` |
-| V at `rho_index=21` | `V_index=39..43` | `k=1,2` |
-| k_io at every cross pair | `19,20,21` s^-1 | `k=1` |
+## CRN correlations at production spacing
 
-The two lines share their centre, so there are 13 retained `(rho,V)` pairs.
-Crossing them with the three production `k_io` nodes yields exactly 39 cellular
-entries and no free-water atom. The resource-efficient Sol run below assigns
-one `(rho,V)` group (its three `k_io` entries) to each of 13 shards.
+Every listed pair preserves the shared ensemble index. The bootstrap resamples those aligned indices across all pair-column values, so it describes finite-ensemble uncertainty conditional on this one declared cross; it does not treat the 200 columns as 200 independent tissue realizations.
 
-The analysis uses these declared canonical indices to define rho/V adjacency.
-This is intentional: v5 `rhos` and `Vs` are finite-geometry realized summary
-labels, not requested controls. Requiring literal equality of realized labels
-would again erase every intended one-axis rho/V line. Those realized values are
-still checked and reported as provenance; all stored `nominal_*` labels must
-match the declaration exactly.
+| Axis | Immediate pairs | Median r | IQR | Paired-ensemble bootstrap 95% CI | Undefined 0/0 values |
+|---|---:|---:|---:|---:|---:|
+| `rho` | 24 | 0.361 | 0.237 to 0.493 | 0.324 to 0.421 | 192 |
+| `V` | 12 | 0.506 | 0.361 to 0.637 | 0.477 to 0.547 | 96 |
+| `k_io` | 26 | 0.961 | 0.939 to 0.976 | 0.960 to 0.965 | 208 |
 
-## Build settings
+![Per-axis CRN correlation histograms.](figures/v5_stencil_probe/crn_correlation_histograms.png)
 
-The `stencil-probe` launcher mode in
-[`scripts/build_lib.sbatch`](../scripts/build_lib.sbatch) uses the unchanged
-dense production preset: 100,000 walkers x 40 ensembles x 3 harvested axes,
-128 ms at 1 us, finite-lobe phase, kappa 0.90, SI fatal escape, full-facet SI
-Eq. S2 classifier, production seed `20260803`, and the certified 5-million-cell
-geometry reference. It has no timing or b override, so it stores the full
-production 1,245 timing-pair x 25 b-value grid plus the unchanged 200-column
-v5 diagnostic subset.
+For the 1 s^-1 `k_io` transitions, the path-divergence heuristic gives `N_div=T Δk_io=0.128` and trajectory survival `exp(-N_div)=0.880`. The result is evaluated against the pilot aggregate median 0.313 and pilot IQR upper endpoint 0.571; it is not a claim that the signal correlation itself must equal 0.880.
 
-The probe uses a 20-GiB A100 MIG slice on `htc`, not a full A100. The dominant
-CUDA buffer is `100,000 x 129 x 3` float64 values, or about 0.29 GiB; the
-remaining walker buffers and one active geometry are far below the 20-GiB
-device limit. A 10-GiB slice would also fit the memory footprint, but has less
-compute capacity and no useful safety advantage for this long-running probe.
+| Transition (s^-1) | Neighbor pairs | N_div | exp(-N_div) | Median r | IQR |
+|---|---:|---:|---:|---:|---:|
+| 19 → 20 | 13 | 0.128 | 0.880 | 0.961 | 0.938 to 0.977 |
+| 20 → 21 | 13 | 0.128 | 0.880 | 0.96 | 0.94 to 0.976 |
 
-MIG slices have less compute capacity than a full A100, so simply swapping the
-old four 12-entry tasks to a slice could exceed the `htc` four-hour limit.
-Thirteen one-geometry-group tasks preserve the identical 39-entry experiment
-while keeping each task short enough for backfill. The `%1` throttle deliberately
-allows only one 20-GiB slice at a time: the peak allocation is one GPU, two CPU
-cores, and 8 GiB host RAM. This improves scheduling eligibility at the cost of
-longer total elapsed time. The pilot's peak host RAM was 1.17 GiB and its CPU
-use was approximately one core; 8 GiB and two cores retain a conservative
-margin for the 40-ensemble/full-column probe. No production array, W4 array,
-merge, or overwrite is included.
+The path-divergence prediction status is **supported** under the predeclared bootstrap rule: The production-step result is called support only when its paired-bootstrap 95% lower bound exceeds the pilot IQR upper endpoint 0.571; it is called not supported when its upper bound is at or below the pilot median 0.313. Intermediate results are inconclusive. This is not a test that signal-level r must equal exp(-N_div); exp(-N_div) is a trajectory-survival heuristic.
 
-The CPU fallback is deliberately not selected. The accepted Sol full-facet
-golden check already reproduced the CPU reference trajectory and occupancy to
-the recorded float64 tolerance, so a new parity campaign is unnecessary.
-However, this probe would require about `13 x 3 x 40 x 100,000 x 128,000 =
-1.9968e13` CPU walker microsteps. Its CPU path also invokes the exact
-full-facet classifier at each step, making it unsuitable for this
-production-Monte-Carlo probe.
+## Directly observed noise
 
-## 1. Sol pre-flight commands
+The primary noise result is the directly observed per-entry SE `sqrt(signal_variance / 40)`, shown by timing and b below. A signal-independent `1/sqrt(3 E Nw)` line is intentionally not used as a decomposition reference: it assumes `Var(cos phi)=1`, which fails at low b.
 
-Run these exact commands from the Sol login node. Do not activate Mamba on the
-login node; the batch launcher has `#SBATCH --export=NONE` and performs the
-required `module load mamba/latest` / `source activate madiEnv` sequence inside
-the allocated job.
+Across all cellular entry-columns with `b>0`, observed SE has median `0.00022`, IQR `0.000198` to `0.000248`, and is `1.09×` the pilot's projected median `0.000202`. This comparison is descriptive, not a clean geometry/walker split.
 
-```bash
-cd /scratch/jfigger/madi/Custom_MADI
-git status --short
-git fetch origin
-git pull --ff-only origin main
-git log -1 --oneline
-git rev-parse HEAD
-grep -n 'stencil-probe' scripts/build_lib.sbatch
-grep -n 'madi-v5-stencil-probe-entry-subset-v1' scripts/fit_data.py
-grep -n 'expected_cellular_entries' data/madi_v5_stencil_probe_entry_subset.json
-cd data
-sha256sum -c geometry_reference_si_kappa_0p9.npz.sha256
-cd ..
-sha256sum data/madi_v5_stencil_probe_entry_subset.json > logs/madi_v5_stencil_probe_definition.sha256
-myquota
-```
+![Observed production-probe SE by b and timing.](figures/v5_stencil_probe/observed_se_by_b_and_timing.png)
 
-Stop if the pull is not a fast-forward, the geometry checksum does not print
-`OK`, the declaration hash cannot be written, or quota is inadequate for thirteen
-full-column shards and their simultaneous diagnostic output. Do not repair a
-dirty checkout with reset or checkout commands.
+The v5 stored arrays do not contain per-walker second moments or independently re-used geometries, so they cannot separate geometry-realization noise from within-walker three-axis correlation. The post-production W4 independent-seed replicate is the experiment that would distinguish those causes; it is not launched or assumed here.
 
-## 2. Submit the MIG-slice restricted probe
+## Derivative magnitudes and beta
+
+For each declared central stencil, `J_hat=(S(+k)-S(-k))/(2 k h1)` and `Var(J_hat)=[Var(S+)+Var(S-)-2 Cov(S+,S-)]/(2 k h1)^2`, with endpoint covariance calculated from matched ensemble indices and divided by 40 for covariance of entry means. `h1` is the exact canonical natural-log step for rho/V and 1 s^-1 for k_io. `beta=Var(J_hat)/J_hat^2` is retained as undefined for deterministic `0/0` columns and infinite if a zero derivative retains variance; no columns are filtered away.
+
+| Axis | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|
+| `rho` | 0.00681 [0.000603, 0.09] (finite 576/600; ∞ 0; undefined 24) | 0.00201 [0.000241, 0.0157] (finite 576/600; ∞ 0; undefined 24) | 0.000998 [9.71e-05, 0.00747] (finite 576/600; ∞ 0; undefined 24) | 0.000355 [4.51e-05, 0.00209] (finite 576/600; ∞ 0; undefined 24) |
+| `V` | 0.148 [0.0209, 0.716] (finite 576/600; ∞ 0; undefined 24) | 0.0724 [0.0039, 0.524] (finite 576/600; ∞ 0; undefined 24) | N/A | N/A |
+| `k_io` | 0.00694 [0.000774, 0.0307] (finite 2496/2600; ∞ 0; undefined 104) | N/A | N/A | N/A |
+
+Fisher information is quadratic in the derivative: `E[J_hat^2]=J^2+Var(J_hat)`. Thus leaving this uncorrected inflates a Fisher diagonal by `1+beta` and deflates the corresponding CRLB by `sqrt(1+beta)`.
+
+![Finite beta distributions versus stencil width.](figures/v5_stencil_probe/beta_vs_stencil_width.png)
+
+The largest finite beta values and their absolute-derivative percentile are listed below. A low derivative percentile means the column is weakly informative for that axis under comparable noise; this report cannot know a downstream Fisher weighting or exclusion policy, so it does not claim which columns a fitter will ultimately use.
+
+| Axis / k | δ, Δ, b | beta | |J| percentile | Lowest derivative quartile? |
+|---|---|---:|---:|---|
+| `rho` / 1 | (7, 25, 10500) | 1.65e+03 | 0.042 | yes |
+| `rho` / 1 | (5, 15, 5000) | 703 | 0.045 | yes |
+| `rho` / 1 | (7, 25, 9500) | 690 | 0.043 | yes |
+| `rho` / 2 | (5, 15, 9000) | 5.47e+03 | 0.042 | yes |
+| `rho` / 2 | (5, 15, 9500) | 182 | 0.043 | yes |
+| `rho` / 2 | (5, 15, 10000) | 115 | 0.045 | yes |
+| `rho` / 3 | (5, 15, 12000) | 0.631 | 0.042 | yes |
+| `rho` / 3 | (5, 15, 12000) | 0.493 | 0.043 | yes |
+| `rho` / 3 | (5, 15, 12000) | 0.458 | 0.045 | yes |
+| `rho` / 4 | (5, 15, 12000) | 0.0881 | 0.042 | yes |
+| `rho` / 4 | (5, 15, 11500) | 0.0706 | 0.047 | yes |
+| `rho` / 4 | (5, 15, 12000) | 0.0668 | 0.043 | yes |
+| `V` / 1 | (15, 40, 11000) | 6.99e+03 | 0.042 | yes |
+| `V` / 1 | (25, 60, 11000) | 6.67e+03 | 0.043 | yes |
+| `V` / 1 | (25, 60, 11500) | 3.61e+03 | 0.045 | yes |
+| `V` / 2 | (20, 50, 6500) | 2.55e+05 | 0.042 | yes |
+| `V` / 2 | (20, 50, 7000) | 3.25e+03 | 0.043 | yes |
+| `V` / 2 | (15, 40, 7000) | 1.63e+03 | 0.045 | yes |
+| `k_io` / 1 | (5, 15, 10500) | 8.13e+03 | 0.040 | yes |
+| `k_io` / 1 | (5, 15, 11000) | 59.6 | 0.041 | yes |
+| `k_io` / 1 | (5, 15, 10000) | 39.3 | 0.041 | yes |
+
+## Fixed-cost ensemble/walker reallocation
+
+A single 40 × 100,000 configuration cannot identify the independent-walker versus ensemble-correlated share of the paired endpoint-difference variance. At a new configuration, those extrema scale as `(40×100,000)/(E×Nw)` and `40/E`, respectively. The table therefore gives a range, not a fitted point prediction. At fixed total cost, the independent extreme is invariant and the correlated extreme improves monotonically with more ensembles; no defensible interior optimum can be identified from this artifact alone.
+
+| Configuration | Axis-walks | Variance-scale envelope | Finite rho beta median envelope | Finite rho beta P05–P95 envelope |
+|---|---:|---:|---:|---:|
+| 20 x 200,000 | 12,000,000 | 1–2 | 0.00681–0.0136 | [4.55e-05–2.23] to [9.11e-05–4.45] |
+| 40 x 100,000 (current) | 12,000,000 | 1–1 | 0.00681–0.00681 | [4.55e-05–2.23] to [4.55e-05–2.23] |
+| 60 x 66,667 | 12,000,060 | 0.667–1 | 0.00454–0.00681 | [3.04e-05–1.48] to [4.55e-05–2.23] |
+| 80 x 50,000 | 12,000,000 | 0.5–1 | 0.00341–0.00681 | [2.28e-05–1.11] to [4.55e-05–2.23] |
+| 100 x 40,000 | 12,000,000 | 0.4–1 | 0.00272–0.00681 | [1.82e-05–0.89] to [4.55e-05–2.23] |
+
+![Fixed-cost rho-beta reallocation bounds.](figures/v5_stencil_probe/ensemble_walker_reallocation_table.png)
+
+The literal 20 × 600,000 through 100 × 120,000 request is not a fixed 12-million-axis-walk allocation: every row costs 36 million axis-walks. It is retained in `rho_beta_reallocation_bounds.csv` as a separately labelled three-times-budget sensitivity sweep, not used to recommend a production configuration.
+
+No `GO-WITH-CHANGE` recommendation is made from a one-configuration envelope. A configuration change would require a new validation cycle and an identifiable component decomposition; absent that evidence, the current 40 × 100,000 specification is retained.
+
+## Limitations
+
+This is one deliberately chosen cross, not a measurement over the full masked grid. The CRN bootstrap is conditional on its 40 ensembles and correlated diagnostic columns. Beta is strongly structured and can diverge wherever the finite-difference derivative approaches zero. Reallocation bounds assume stationary derivative magnitude and component correlations while changing E/Nw; they are planning bounds, not a precision forecast. W4 remains out of scope and is required to separate geometry-realization noise from within-walker axis correlation.
+
+## Reproduction
 
 ```bash
-cd /scratch/jfigger/madi/Custom_MADI
-sbatch --job-name=madi_v5_stencil_probe \
-  --output=logs/madi_v5_stencil_probe_%A_%a.out \
-  --error=logs/madi_v5_stencil_probe_%A_%a.err \
-  --partition=htc --qos=public --array=0-12%1 \
-  --time=0-04:00:00 --cpus-per-task=2 --mem=8G -G a100.20gb:1 \
-  scripts/build_lib.sbatch stencil-probe 13
-```
-
-The launcher writes these 13 distinct files:
-
-```text
-libraries/madi_v5_stencil_probe.shard000.npz
-...
-libraries/madi_v5_stencil_probe.shard012.npz
-```
-
-## 3. Completion, hashes, and artifact validation
-
-Wait until all 13 tasks are complete with zero exit status. These commands
-avoid an unknown job-id placeholder by querying the explicit job name.
-
-```bash
-cd /scratch/jfigger/madi/Custom_MADI
-squeue -u jfigger -n madi_v5_stencil_probe
-sacct -u jfigger --name=madi_v5_stencil_probe \
-  --format=JobID,JobName%32,State,ExitCode,Elapsed,MaxRSS
-sha256sum libraries/madi_v5_stencil_probe.shard0{00..12}.npz \
-  > logs/madi_v5_stencil_probe_shards.sha256
-cat logs/madi_v5_stencil_probe_definition.sha256
-cat logs/madi_v5_stencil_probe_shards.sha256
-module load mamba/latest
-source activate madiEnv
-which python
-python -m scripts.validate_v5_stencil_probe \
-  --declaration data/madi_v5_stencil_probe_entry_subset.json
 python analysis/v5_stencil_probe.py \
-  libraries/madi_v5_stencil_probe.shard0{00..12}.npz \
+  libraries/madi_v5_stencil_probe.shard*.npz \
   --declaration data/madi_v5_stencil_probe_entry_subset.json \
   --expected-shards 13 \
+  --declared-shards 13 \
   --output-dir docs/figures/v5_stencil_probe \
   --report docs/v5_stencil_probe.md
 ```
-
-The analysis aborts before calculating a correlation if any of the following
-fails: v5 shapes/dtypes; full production storage grid; production metadata;
-ensemble-index CRN contract; variance reconstruction; subset mean
-reconstruction; exact declared nominal coordinates; or identical
-`per_ensemble_geometry` records within all 13 fixed-nominal `(rho,V)` k_io
-groups.
-
-On success it writes the per-axis correlation histograms, direct observed SE
-versus b/timing, beta-versus-stencil figure, reallocation table, full CSVs, and
-a JSON summary under `docs/figures/v5_stencil_probe/`. It then replaces this
-pre-launch record with the final validation report. Retain all 13 shards,
-hash files, Slurm logs, CSVs, JSON, figures, and generated report before any
-GO decision. Do not launch production or W4 merely because this probe
-completed.
