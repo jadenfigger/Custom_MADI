@@ -4,8 +4,8 @@
 #SBATCH -q public
 #SBATCH --array=0-368
 #SBATCH -N 1
-#SBATCH -c 2
-#SBATCH -G a100.20gb:1
+#SBATCH -c 1
+#SBATCH -G a100:1
 #SBATCH --mem=24G
 #SBATCH -t 1-00:00:00
 #SBATCH -o logs/madi_dense_%A_%a.out
@@ -17,9 +17,11 @@
 # This is the single Sol launcher for production, the P0-D golden check, the
 # v5 pilot build, the pre-launch stencil probe, and the post-production
 # restricted replicate.  The 24-hour
-# production default stays on public/public.  For the sub-four-hour golden and
-# pilot jobs, override it at submission with ``--partition=htc --qos=public``
-# and request at least 24G host memory.
+# production default stays on public/public and requests the full A100 measured
+# by cache benchmark 61533979.  A 20-GB MIG slice leaves the high-rho group
+# above the one-day limit.  For the sub-four-hour golden and pilot jobs,
+# override it at submission with ``--partition=htc --qos=public`` and request
+# at least 24G host memory.
 # Select a mode at submission time, for example:
 #   sbatch --array=0-0 scripts/build_lib.sbatch golden
 #

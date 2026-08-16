@@ -1,15 +1,16 @@
 # v5 exact-classifier cache and launch readiness
 
-## Verdict: PENDING FULL-A100 RESOURCE GATE — do not submit production
+## Verdict: GO — configuration is technically ready; submission still requires user approval
 
 The runtime diagnosis establishes that the exact full-facet classifier, not
 geometry construction or signal reduction, causes the production build cost.
 The new two-tier cache is locally equivalent to the exact classifier on the
-fixed CPU golden fixture.  The Sol GPU golden check, parameter sweep, and
-50,000-walker speed gate all passed.  One resource-planning gate remains:
-establish the cached group time on a full A100, because the high-rho group is
-too slow for the existing 24-hour layout on a 20-GB MIG slice.  No production
-or W4 job is authorized by this record.
+fixed CPU golden fixture.  The Sol GPU golden check, parameter sweep,
+50,000-walker speed gate, and full-A100 resource gate all passed.  The launch
+uses 369 monotonic-rho shards, a full A100, one CPU, and 24 GiB host memory.
+The three independent rho bands have measured twofold-margin limits of 6 h,
+11 h, and 19 h.  This record prepares commands only; submission remains the
+user's decision, and W4 remains unauthorized.
 
 ## Why the cache is safe
 
@@ -197,17 +198,35 @@ to these values.
 | High rho | **30.57 h** |
 
 The high-rho case exceeds the one-day task limit before any safety margin is
-applied.  Therefore the existing `a100.20gb:1` production request is not
+applied.  Therefore the former `a100.20gb:1` production request is not
 acceptable for the one-group-per-task, 369-shard layout.  Resharding alone
 would not reduce total compute.  Splitting a group by k_io would duplicate
-geometry and add operational complexity; it is not selected while the simpler
-full-A100 option has not yet been measured.
+geometry and add operational complexity, so it is not selected.
 
-The earlier direct exact benchmark ran on a full A100 and was substantially
-faster per walker than the MIG measurements (about 3--9x, depending on
-density and slice profile).  That is consistent with the smaller MIG compute
-partition, but it is not a substitute for a direct cached measurement.  A
-short serial full-A100 benchmark is therefore the remaining resource gate.
+### Full-A100 resource gate: array job 61533979
+
+Job 61533979 repeated the same selected 50,000-walker exact/cached comparison
+on a full NVIDIA A100-SXM4-80GB, one CPU, and 24 GiB host memory.  It passed
+the same bit-identity and zero-overflow checks as the MIG jobs.
+
+| Density | Cached one-ensemble, one-kio time | Cached 51-kio x 40-ensemble group time |
+|---|---:|---:|
+| Low rho | 3.533 s | 2.00 h |
+| Centre rho | 5.105 s | 2.89 h |
+| High rho | 16.260 s | **9.21 h** |
+
+The associated exact times were 34.825 s, 52.957 s, and 87.590 s, giving
+measured cache speedups of 9.86x, 10.37x, and 5.39x.  Each cached result was
+bit-identical to exact; full + Tier 1 + Tier 2 equalled all 6,400,050,000
+endpoint requests; and candidate-buffer overflow was zero.  The high-rho
+group is the governing case: twice 9.21 h is 18.43 h, inside a 24-hour limit.
+
+The production request is therefore a full A100 (`-G a100:1`), one CPU, and
+24 GiB host memory.  The larger GPU request is about compute partitions, not
+memory: the full-A100 test used only 188--493 MB RSS, but a 20-GB MIG slice
+was too slow at high rho.  One CPU is supported by 89--94% CPU efficiency in
+the full-A100 test; the host process uses one core while the walk runs on the
+GPU.
 
 The 369 retained `(rho,V)` pairs are now ordered by ascending rho and assigned
 one per task.  This eliminates the former `rho*V = v_i` proxy, which was
@@ -215,11 +234,25 @@ nearly constant inside the mask and did not balance the cost-driving rho
 dependence.  The exact production bands are 127 tasks (0–126), 121 tasks
 (127–247), and 121 tasks (248–368).  The free-water atom is added to task 0.
 
-The cache speed gate is complete.  Per-band wall limits and the production GRES
-will be set from the remaining full-A100 measurement, at roughly twice the
-measured worst case for each band.
+The measured per-ensemble cached times were interpolated linearly in log time
+between the production-grid anchors (rho indices 0, 21, and 63) and multiplied
+by each band's actual masked-pair count.  This is a planning estimate; the
+wall limits use twice the predicted band maximum, not the average.
 
-## Array scheduling and storage checks still required on Sol
+| Rho band / task IDs | Pairs | Predicted maximum group | Chosen limit | Estimated GPU-h in band |
+|---|---:|---:|---:|---:|
+| indices 0--21 / 0--126 | 127 | 2.89 h | 6 h | 307 |
+| indices 22--42 / 127--247 | 121 | 5.16 h | 11 h | 481 |
+| indices 43--63 / 248--368 | 121 | 9.21 h | 19 h | 858 |
+| **All cellular groups** | **369** | — | — | **~1,646** |
+
+The total is the measured cached walk-and-reduction projection before the
+small one-time geometry and archive-I/O costs.  The comparable full-A100
+exact-classifier projection is ~12,607 GPU-h, so the measured aggregate
+reduction is about 7.7x.  The limits provide modest additional rounding above
+the strict twofold margins (5.79 h, 10.33 h, and 18.43 h).
+
+## Array scheduling and storage checks
 
 Slurm supports a `%N` suffix on `--array` to limit the number of simultaneous
 array tasks; its maximum valid index is controlled by `MaxArraySize`.
@@ -230,26 +263,36 @@ documentation](https://slurm.schedmd.com/job_array.html), the
 [`sbatch --array` documentation](https://slurm.schedmd.com/sbatch.html), and
 [ASU's array examples](https://docs.rc.asu.edu/slurm-job-array-examples/).
 
-The recommended policy is three submissions—high rho first, then centre, then
-low—with a moderate array throttle such as `%24`, subject to the actual public
-QOS limits.  This changes queue behaviour only, not total GPU-hours.  A
-throttle must not be chosen blindly: the following Sol checks are a launch
-gate.
+Sol reports `MaxArraySize=50000` and `MaxJobCount=300000`. The public QOS
+permits 300,000 submitted/running jobs per user and `cpu=7500`, so all 369
+one-CPU tasks are permitted; no GPU-specific per-user cap was reported.
 
-```bash
-scontrol show config | grep -iE 'MaxArraySize|MaxJobCount'
-sacctmgr show qos public format=Name,MaxSubmitJobsPU,MaxJobsPU,MaxTRESPU
-myquota
+The selected policy is three independent, **unthrottled** submissions—high
+rho first, then centre, then low. Omitting `%N` lets Slurm start as many jobs
+as fair-share and available full A100s allow, minimizing calendar time without
+changing the ~1,646 GPU-hour allocation. A `%N` applies to each array, not to
+all three arrays together: the former `%8` commands would have permitted up
+to 24 simultaneous tasks, not eight. The largest meaningful per-array values
+are `%121`, `%121`, and `%127`; they are equivalent to no throttle because
+those are the respective array lengths. The scheduler, rather than an
+artificial cap, still determines the actual concurrency.
+
+```text
+MaxArraySize            = 50000
+MaxJobCount             = 300000
+public QOS: MaxSubmitJobsPU=300000, MaxJobsPU=300000, MaxTRESPU=cpu=7500
+scratch: 40.59 MiB used of 100.00 TiB
 ```
 
-The raw v5 matrix floor remains 9.29 GiB regardless of walker count.  Scratch
-must accommodate all 369 shards plus the merged artifact and simultaneous
-merge inputs/outputs; no sufficient quota figure has yet been recorded.
+The raw v5 matrix floor remains 9.29 GiB regardless of walker count.  Even a
+conservative 30 GiB allowance for all shards, merged output, hashes, and
+simultaneous merge inputs is negligible relative to ~100 TiB available scratch.
+File-count headroom is also ample: 422 of 20,000,000 allowed files are used.
 
-## Remaining GPU-only resource gate
+## Exact pre-flight and submission commands, only after explicit approval
 
-After the small follow-up script is committed and pulled to Sol, run these
-exact commands from the established checkout:
+First verify the exact committed code and immutable geometry input.  These
+commands do not launch a production job:
 
 ```bash
 cd /scratch/tksimmo2/madi/custom_madi
@@ -257,14 +300,55 @@ git status --short
 git pull --ff-only
 git log -1 --oneline
 sha256sum -c data/geometry_reference_si_kappa_0p9.npz.sha256
-sbatch scripts/benchmark_exact_cache_full_a100.sbatch
+python -m pytest tests/physics_audit/test_v5_production_configuration.py tests/physics_audit/test_remediation_production_sharding.py -q
 ```
 
-This is a serial, three-task, one-hour `htc` array: one exact-plus-cached
-50,000-walker ensemble at each density.  It requests one full A100 rather
-than a MIG slice, one CPU, and Sol's required 24-GiB host-memory minimum.
-The one-CPU request is supported by job 61532125, which consumed only one
-core across all tasks.  Serial submission (`%1`) caps this measurement at one
-GPU at a time.  It creates validation JSON only and does not write a library.
-The production GRES, storage headroom, per-band wall limits, exact production
-commands, and GO/NO-GO decision follow only after its outputs are reviewed.
+Only if those pass and the user explicitly elects to spend the allocation,
+submit the independent bands in this order.  Do not add a dependency; they are
+independent and a dependency would delay short work behind the high-rho band.
+
+```bash
+PROD_HIGH_JOB="$(sbatch --partition=public --qos=public --array=248-368 --time=0-19:00:00 --cpus-per-task=1 --mem=24G -G a100:1 scripts/build_lib.sbatch production 369 | awk '{print $4}')"
+printf 'High-rho job: %s\n' "${PROD_HIGH_JOB}"
+PROD_CENTRE_JOB="$(sbatch --partition=public --qos=public --array=127-247 --time=0-11:00:00 --cpus-per-task=1 --mem=24G -G a100:1 scripts/build_lib.sbatch production 369 | awk '{print $4}')"
+printf 'Centre-rho job: %s\n' "${PROD_CENTRE_JOB}"
+PROD_LOW_JOB="$(sbatch --partition=public --qos=public --array=0-126 --time=0-06:00:00 --cpus-per-task=1 --mem=24G -G a100:1 scripts/build_lib.sbatch production 369 | awk '{print $4}')"
+printf 'Low-rho job: %s\n' "${PROD_LOW_JOB}"
+squeue -j "${PROD_HIGH_JOB},${PROD_CENTRE_JOB},${PROD_LOW_JOB}"
+```
+
+The production launch must not proceed if the final commit/checksum/test
+pre-flight fails.  W4 remains unauthorized regardless of this GO verdict.
+
+## Completion and post-merge commands
+
+After all three arrays finish, check task states and scan every production log
+explicitly. Exit status alone is insufficient because the build is required
+to fail loudly on fatal escape, geometry-target, and permeation-probability
+assertions.
+
+```bash
+sacct -j "${PROD_HIGH_JOB},${PROD_CENTRE_JOB},${PROD_LOW_JOB}" --format=JobID,JobName,Elapsed,TotalCPU,ReqMem,MaxRSS,State,AllocTRES
+seff "${PROD_HIGH_JOB}_248"
+rg -n -i 'fatal.*escape|geometry.*assert|geometry.*target|p_p.*range|traceback|error:' logs/madi_dense_${PROD_HIGH_JOB}_*.out logs/madi_dense_${PROD_HIGH_JOB}_*.err logs/madi_dense_${PROD_CENTRE_JOB}_*.out logs/madi_dense_${PROD_CENTRE_JOB}_*.err logs/madi_dense_${PROD_LOW_JOB}_*.out logs/madi_dense_${PROD_LOW_JOB}_*.err
+find libraries -maxdepth 1 -type f -name 'madi_dense_universal_remediated.shard*.npz' | wc -l
+```
+
+The scan must print no matches and the count must be exactly 369. Only then
+submit the CPU-only post-processing job. It hashes all shards before merge,
+uses `--require-shards 369`, runs the merged v5 validator, and refuses to
+overwrite the current `madi_dense_universal.npz`.
+
+```bash
+PROD_POST_JOB="$(sbatch scripts/postprocess_v5_production.sbatch | awk '{print $4}')"
+printf 'Production post-processing job: %s\n' "${PROD_POST_JOB}"
+squeue -j "${PROD_POST_JOB}"
+```
+
+The post-processing script establishes the exact 369-shard coverage before it
+merges. The validator then reports the v5 schema, exact 18,820-entry grid
+coverage, diagnostic-array shape/dtype and subset reconstruction,
+imaginary-symmetry maximum Student statistic and Bonferroni threshold,
+negative-signal count/minimum, and positive-b signal-SE median/IQR. A failed
+validator is a stop: retain the new artifact and evidence, but do not replace
+the current production library.
