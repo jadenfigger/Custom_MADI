@@ -131,6 +131,55 @@ class GeometryStats:
         return out
 
 
+@dataclass(frozen=True)
+class FullFacetCache:
+    """Conservative, finite-radius cache for the exact SI Eq. S2 classifier.
+
+    ``candidate_ids`` is deliberately a *superset*, rather than a fixed-k
+    neighbour approximation.  The reference nearest seed can change after a
+    displacement, and the per-seed annulus widths are not constant.  The
+    radius therefore uses the maximum annulus width in this finite ensemble:
+
+    ``d_1(ref) + 2 max(alpha) + 2 delta_max``.
+
+    This is sufficient for every seed that could occur in the exact adaptive
+    radius query at a point no farther than ``delta_max`` from ``reference``.
+    A cache consumer must fall back to a fresh exact query outside that ball.
+    ``r_safe`` is a separately capped lower bound on the distance to the
+    nearest shifted facet of an intracellular reference point.
+    """
+
+    reference: np.ndarray
+    cell: int
+    inside: bool
+    r_safe: float
+    delta_max: float
+    candidate_ids: np.ndarray
+    candidate_overflow: bool = False
+
+
+def _facet_margins_for_ids(
+    seeds: np.ndarray,
+    point: np.ndarray,
+    nearest: int,
+    d1_sq: float,
+    ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return candidate ids (without ``nearest``) and their SI Eq. S2 margins."""
+    other = np.asarray(ids, dtype=np.int32)
+    other = other[other != int(nearest)]
+    if len(other) == 0:
+        return other, np.empty(0, dtype=np.float64)
+    seed_delta = np.asarray(seeds[other] - seeds[int(nearest)], dtype=np.float64)
+    separation = np.linalg.norm(seed_delta, axis=1)
+    if np.any(separation <= 0.0):
+        raise RuntimeError("Poisson seed realization contains coincident seeds")
+    point_delta = np.asarray(seeds[other] - point, dtype=np.float64)
+    dj_sq = np.einsum("ij,ij->i", point_delta, point_delta)
+    margins = (dj_sq - float(d1_sq)) / (2.0 * separation)
+    return other, margins
+
+
 @dataclass
 class Ensemble:
     """One finite SI-conformant contracted Poisson--Voronoi realization."""
@@ -209,6 +258,148 @@ class Ensemble:
     def classify_exact_cpu(self, positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compatibility alias: production classification is already exact."""
         return self.classify_cpu(positions)
+
+    def build_full_facet_cache_cpu(
+        self,
+        position: np.ndarray,
+        *,
+        delta_max_um: float,
+        safety_cap_um: float | None = None,
+        candidate_capacity: int | None = None,
+    ) -> FullFacetCache:
+        """Refresh an exact two-tier classifier cache at one position.
+
+        The Tier-1 radius is the smallest positive shifted-facet margin,
+        capped at ``alpha_1`` by default.  Searching to
+        ``d_1 + 2(alpha_1 + cap)`` proves that no omitted facet can reduce the
+        cap.  Tier 2 uses ``max(self.annulus)`` rather than ``alpha_1``:
+        after displacement a different nearest seed may have a larger annulus
+        width, so substituting the reference seed's annulus would not be a
+        conservative candidate-set bound.
+        """
+        if self.is_free_water:
+            return FullFacetCache(
+                reference=np.asarray(position, dtype=np.float64).copy(),
+                cell=0,
+                inside=False,
+                r_safe=0.0,
+                delta_max=float(delta_max_um),
+                candidate_ids=np.empty(0, dtype=np.int32),
+                candidate_overflow=False,
+            )
+        point = np.asarray(position, dtype=np.float64)
+        if point.shape != (3,):
+            raise ValueError("cache reference position must have shape (3,)")
+        if delta_max_um <= 0.0:
+            raise ValueError("delta_max_um must be positive")
+        if len(self.seeds) < 2:
+            raise RuntimeError("full-facet classifier requires at least two population seeds")
+
+        d1, nearest = self._tree().query(point, k=1)
+        d1 = float(d1)
+        nearest = int(nearest)
+        d1_sq = d1 * d1
+        alpha1 = float(self.annulus[nearest])
+        cap = alpha1 if safety_cap_um is None else min(alpha1, float(safety_cap_um))
+        if cap < 0.0:
+            raise ValueError("safety_cap_um must be non-negative")
+
+        exact_radius = d1 + 2.0 * alpha1
+        safe_radius = d1 + 2.0 * (alpha1 + cap)
+        # ``max(annulus)`` is a finite-ensemble upper bound for the annulus of
+        # a potentially new nearest seed.  The two displacement terms cover
+        # the old and new point distances respectively.
+        candidate_radius = d1 + 2.0 * float(np.max(self.annulus)) + 2.0 * float(delta_max_um)
+        search_radius = max(safe_radius, candidate_radius)
+        ids = np.asarray(self._tree().query_ball_point(point, search_radius), dtype=np.int32)
+        point_to_seed = self.seeds[ids] - point
+        distances_sq = np.einsum("ij,ij->i", point_to_seed, point_to_seed)
+
+        exact_ids = ids[distances_sq <= exact_radius * exact_radius]
+        _, exact_margins = _facet_margins_for_ids(
+            self.seeds, point, nearest, d1_sq, exact_ids,
+        )
+        inside = bool(np.all(exact_margins >= alpha1))
+
+        r_safe = 0.0
+        if inside and cap > 0.0:
+            safe_ids = ids[distances_sq <= safe_radius * safe_radius]
+            _, safe_margins = _facet_margins_for_ids(
+                self.seeds, point, nearest, d1_sq, safe_ids,
+            )
+            margin_to_shifted_facet = (
+                float(np.min(safe_margins - alpha1))
+                if len(safe_margins) else cap
+            )
+            # Underestimate by one ULP so strict ``displacement < r_safe``
+            # never relies on a floating-point boundary coincidence.
+            r_safe = max(0.0, float(np.nextafter(min(cap, margin_to_shifted_facet), -np.inf)))
+
+        candidate_ids = ids[distances_sq <= candidate_radius * candidate_radius]
+        overflow = candidate_capacity is not None and len(candidate_ids) > int(candidate_capacity)
+        if overflow:
+            # A bounded GPU buffer must never truncate a proven superset: a
+            # full exact refresh is the only safe response to overflow.
+            candidate_ids = np.empty(0, dtype=np.int32)
+        return FullFacetCache(
+            reference=point.copy(),
+            cell=nearest,
+            inside=inside,
+            r_safe=r_safe,
+            delta_max=float(delta_max_um),
+            candidate_ids=np.asarray(candidate_ids, dtype=np.int32),
+            candidate_overflow=bool(overflow),
+        )
+
+    def classify_from_full_facet_cache_cpu(
+        self,
+        position: np.ndarray,
+        cache: FullFacetCache,
+        *,
+        min_safe_radius_um: float,
+    ) -> tuple[int, bool, str] | None:
+        """Classify from a conservative cache, or return ``None`` to refresh.
+
+        Tier 1 tests displacement from the fixed cache reference, never the
+        individual microstep length.  Tier 2 recomputes the exact nearest and
+        shifted-facet conjunction within its proven candidate superset.
+        """
+        point = np.asarray(position, dtype=np.float64)
+        if point.shape != (3,):
+            raise ValueError("cached-classifier position must have shape (3,)")
+        displacement = float(np.linalg.norm(point - cache.reference))
+        if (cache.inside and cache.r_safe >= float(min_safe_radius_um)
+                and displacement < cache.r_safe):
+            return int(cache.cell), True, "tier1"
+        if displacement >= cache.delta_max or len(cache.candidate_ids) == 0:
+            return None
+
+        ids = np.asarray(cache.candidate_ids, dtype=np.int32)
+        point_to_seed = self.seeds[ids] - point
+        distances_sq = np.einsum("ij,ij->i", point_to_seed, point_to_seed)
+        nearest_index = int(np.argmin(distances_sq))
+        nearest = int(ids[nearest_index])
+        d1_sq = float(distances_sq[nearest_index])
+        d1 = float(np.sqrt(d1_sq))
+        alpha1 = float(self.annulus[nearest])
+        exact_ids = ids[distances_sq <= (d1 + 2.0 * alpha1) ** 2]
+        _, margins = _facet_margins_for_ids(
+            self.seeds, point, nearest, d1_sq, exact_ids,
+        )
+        return nearest, bool(np.all(margins >= alpha1)), "tier2"
+
+    def cache_contains_exact_candidates_cpu(
+        self, position: np.ndarray, cache: FullFacetCache,
+    ) -> bool:
+        """Diagnostic assertion for the Tier-2 superset proof."""
+        point = np.asarray(position, dtype=np.float64)
+        d1, nearest = self._tree().query(point, k=1)
+        exact_ids = self._tree().query_ball_point(
+            point, float(d1) + 2.0 * float(self.annulus[int(nearest)]),
+        )
+        return set(int(value) for value in exact_ids).issubset(
+            set(int(value) for value in cache.candidate_ids)
+        )
 
 
 def si_domain_side_um(rho_per_uL: float, cfg: SimConfig) -> float:

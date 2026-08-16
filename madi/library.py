@@ -716,6 +716,7 @@ def _cfg_metadata(
         "geometry_vi_tolerance": cfg.geometry_vi_tolerance,
         "walkers_per_ensemble": cfg.n_walkers,
         "ensembles_per_entry": cfg.n_ensembles,
+        "axis_walks_per_entry": 3 * int(cfg.n_walkers) * int(cfg.n_ensembles),
         "build_seed": None if build_seed is None else int(build_seed),
         "phase_model": cfg.phase_model,
         "checkpoint_h_ms": cfg.h_ms,
@@ -723,7 +724,29 @@ def _cfg_metadata(
         "classifier": (
             "exact full-facet shifted-Voronoi contraction at every endpoint; "
             "SI Eq. S2, with the provable d1+2*alpha1 adaptive KD radius bound"
+            if cfg.classifier_mode == "exact" else
+            "exact full-facet shifted-Voronoi contraction with conservative "
+            "two-tier proof cache; SI Eq. S2 fallback uses the provable "
+            "d1+2*alpha1 adaptive KD radius bound"
         ),
+        "classifier_cache": {
+            "mode": cfg.classifier_mode,
+            "equivalence_contract": (
+                "cache hits are used only after a conservative proof; all other "
+                "endpoints invoke the unchanged exact SI Eq. S2 classifier"
+            ),
+            "tier1": (
+                "cumulative displacement from a fixed reference is strictly below "
+                "a shifted-facet safety radius"
+            ),
+            "tier2": (
+                "finite candidate superset radius d1_ref + 2*max(alpha) + "
+                "2*delta_max; overflow disables the cache and falls back exact"
+            ),
+            "delta_max_um": float(cfg.classifier_cache_delta_max_um),
+            "min_safe_radius_um": float(cfg.classifier_cache_min_safe_radius_um),
+            "candidate_capacity": int(cfg.classifier_cache_candidate_capacity),
+        },
         "kio_label": "MADI I Eq. 5 with governing-process untrimmed arithmetic <A/V>",
         "residence_time_measurement": "intentionally absent: SI §S.IV states k_io != 1/<tau_i>",
     }

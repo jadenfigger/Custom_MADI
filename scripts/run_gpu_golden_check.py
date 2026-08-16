@@ -78,6 +78,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--classifier", choices=("exact", "exact_cached"), default="exact",
+        help="exact reference or conservative-cache equivalence mode",
+    )
     args = parser.parse_args()
 
     if not HAS_CUDA:
@@ -105,7 +109,7 @@ def main() -> int:
     )
     Y, n_escaped, telemetry = run_walk_Y(
         ensemble, 0.0, cfg, pp=float(case["pp"]), seed=0, verbose=False,
-        return_telemetry=True, classifier="exact", random_stream=stream,
+        return_telemetry=True, classifier=args.classifier, random_stream=stream,
         use_gpu=True,
     )
     comparisons = {
@@ -125,9 +129,11 @@ def main() -> int:
         "rtol": RTOL,
         "atol": ATOL,
         "cuda_available": bool(HAS_CUDA),
+        "classifier": args.classifier,
         "pass": passed,
         "n_escaped_gpu": int(n_escaped),
         "comparisons": comparisons,
+        "classifier_cache": telemetry.get("classifier_cache", {}),
         "case": case,
     }
     report_path = args.output_dir / "gpu_golden_diff.json"

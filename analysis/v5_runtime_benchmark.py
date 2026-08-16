@@ -416,6 +416,16 @@ def _upload_walk_inputs(ensemble: Any, cfg: SimConfig, n_walkers: int) -> dict[s
         "initial": cuda.to_device(np.zeros((1, 3), dtype=np.float64)),
         "increments": cuda.to_device(np.zeros((1, 1, 3), dtype=np.float64)),
         "uniforms": cuda.to_device(np.zeros((1, 1), dtype=np.float64)),
+        # The reference profiler keeps the cache disabled but must provide
+        # valid dummy buffers for the unified production-kernel signature.
+        "cache_ref": cuda.device_array((1, 3), dtype=np.float64),
+        "cache_cell": cuda.device_array(1, dtype=np.int32),
+        "cache_inside": cuda.device_array(1, dtype=np.int8),
+        "cache_rsafe": cuda.device_array(1, dtype=np.float64),
+        "cache_count": cuda.device_array(1, dtype=np.int32),
+        "cache_valid": cuda.device_array(1, dtype=np.int8),
+        "cache_ids": cuda.device_array((1, 2), dtype=np.int32),
+        "cache_stats": cuda.to_device(np.zeros((1, 9), dtype=np.int64)),
         "n_walkers": int(n_walkers),
         "cfg": cfg,
         "ensemble": ensemble,
@@ -449,6 +459,10 @@ def _launch_reference_walk(inputs: dict[str, Any], pp: float, seed: int) -> tupl
         np.int32(0 if ensemble.is_free_water else 1), np.float64(ensemble.L / 2.0),
         np.int32(cfg.steps_per_h), states, np.int32(0),
         inputs["initial"], inputs["increments"], inputs["uniforms"],
+        np.int32(0), np.float64(np.max(ensemble.annulus)), np.float64(1.0), np.float64(0.0),
+        inputs["cache_ref"], inputs["cache_cell"], inputs["cache_inside"],
+        inputs["cache_rsafe"], inputs["cache_count"], inputs["cache_valid"],
+        inputs["cache_ids"], inputs["cache_stats"],
         Y, inside, escaped, classifier_error,
     )
     cuda.synchronize()

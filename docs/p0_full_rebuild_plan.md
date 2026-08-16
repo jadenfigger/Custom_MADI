@@ -1,9 +1,9 @@
 # Contingent full MADI-library rebuild plan
 
 This plan is a specification only. It does not authorize a production launch.
-The P0 geometry, boundary, CPU/GPU-equivalence, grid, and pilot structural
-gates have passed; the remaining decision is whether to spend the shared Sol
-allocation on this production-scale artifact.
+The P0 geometry, boundary, grid, and pilot structural gates have passed.  The
+exact-classifier cache still requires its Sol GPU equivalence/speed gate; see
+`v5_fast_classifier_launch_readiness.md` before any submission.
 
 ## Production configuration
 
@@ -15,7 +15,7 @@ allocation on this production-scale artifact.
 | Entries | 18,819 cellular + 1 free-water atom = 18,820 |
 | Quadrature | analytic `rho*V*dlogrho*dlogV*dkio`, plus discrete free-water weight |
 | Walk | 128 ms, 1 us steps, finite-lobe phase model |
-| Monte Carlo | 100,000 walkers × 40 ensembles × 3 axes = 12,000,000 axis-walks/entry |
+| Monte Carlo | 50,000 walkers × 40 ensembles × 3 axes = 6,000,000 axis-walks/entry |
 | Stored columns | 1,245 `(delta,Delta)` pairs × 25 b values = 31,125/entry |
 | Geometry / exchange | certified 5,000,000-cell SI reference, `kappa=0.9`, full SI Eq. S2 facets, SI Eq. S8 domain, Eq. 5 untrimmed governing-process `<A/V>` |
 
@@ -32,34 +32,20 @@ decision and is not made silently here.
 
 ## Sol launch, only after explicit approval
 
-This exceeds 240 minutes, so use the `public/public` production partition,
-not `htc`. The existing launcher requests one GPU, 16 CPU cores, 64 GiB host
-memory, and a one-day wall limit; it retains `--export=NONE` and performs the
-required Mamba activation itself.
-
-```bash
-cd /scratch/jfigger/madi/Custom_MADI
-git status --short
-git log -1 --oneline
-cd data
-sha256sum -c geometry_reference_si_kappa_0p9.npz.sha256
-cd ..
-
-sbatch --partition=public --qos=public --array=0-127 \
-  --time=1-00:00:00 --cpus-per-task=16 --mem=64G -G 1 \
-  scripts/build_lib.sbatch production 128
-```
-
-There are 128 shards. Round-robin assignment over 369 geometry groups gives
-two or three `(rho,V)` groups per shard, or approximately 102--153 cellular
-entries per shard (plus the free-water atom on shard 0).
+The revised layout has 369 shards: exactly one cellular `(rho,V)` group per
+task, ordered monotonically by rho, with the free-water atom on shard 0.  The
+array is split into three independent rho bands (task ranges 0--126,
+127--247, and 248--368) so their wall-time requests can be truthful.  The
+band limits and submission commands are intentionally not set until the
+measured GPU fast-path speed is available.  Resharding changes queue and
+wall-time behaviour, not the total allocation consumed.
 
 ## Before declaring success
 
 1. Slurm must report every array task `COMPLETED`, with no escape error,
    geometry-target assertion, or failed p_p range assertion in any log.
 2. Exactly `madi_dense_universal_remediated.shard000.npz` through
-   `shard127.npz` must exist. Do not overwrite the current production library.
+   `shard368.npz` must exist. Do not overwrite the current production library.
 3. Confirm a representative `seff <jobid_task>` report before committing to a
    larger repeat or changed resource request.
 4. On Sol, merge only after all 128 shards exist:
@@ -70,7 +56,7 @@ entries per shard (plus the free-water atom on shard 0).
    cd /scratch/jfigger/madi/Custom_MADI
    python -m scripts.merge_shards \
      libraries/madi_dense_universal_remediated.shard*.npz \
-     --require-shards 128 \
+     --require-shards 369 \
      --out libraries/madi_dense_universal_remediated.npz
    ```
 

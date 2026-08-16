@@ -2,11 +2,11 @@
 #SBATCH --job-name=madi_dense
 #SBATCH -p public
 #SBATCH -q public
-#SBATCH --array=0-127
+#SBATCH --array=0-368
 #SBATCH -N 1
-#SBATCH -c 16
-#SBATCH -G 1
-#SBATCH --mem=64G
+#SBATCH -c 2
+#SBATCH -G a100.20gb:1
+#SBATCH --mem=24G
 #SBATCH -t 1-00:00:00
 #SBATCH -o logs/madi_dense_%A_%a.out
 #SBATCH -e logs/madi_dense_%A_%a.err
@@ -111,7 +111,7 @@ case "${MODE}" in
     ;;
 
   production)
-    N_SHARDS="${2:-128}"
+    N_SHARDS="${2:-369}"
     if (( TASK_ID < 0 || TASK_ID >= N_SHARDS )); then
       echo "production task ${TASK_ID} is outside [0, ${N_SHARDS})" >&2
       exit 2
@@ -125,6 +125,7 @@ case "${MODE}" in
       --library libraries/madi_dense_universal_remediated.npz \
       --shard-id "${TASK_ID}" \
       --n-shards "${N_SHARDS}" \
+      --remediation-shard-scheme rho_monotonic \
       --seed 20260803 \
       --vi-min 0.4 \
       --vi-max 0.99 \

@@ -71,6 +71,14 @@ BIG_DELTAS_MS: List[float] = list(range(1, 51)) + list(range(55, 81, 5))
 # re-simulating.
 T_MAX_MS = 128.0
 
+# Production Monte-Carlo allocation approved by the v5 stencil-probe beta
+# analysis.  Three Cartesian components are harvested from every 3-D walk.
+PRODUCTION_WALKERS_PER_ENSEMBLE = 50_000
+PRODUCTION_ENSEMBLES_PER_ENTRY = 40
+PRODUCTION_AXIS_WALKS_PER_ENTRY = (
+    3 * PRODUCTION_WALKERS_PER_ENSEMBLE * PRODUCTION_ENSEMBLES_PER_ENTRY
+)
+
 B_MAX_S_MM2 = 12000.0
 B_STEP_S_MM2 = 500.0
 
@@ -167,7 +175,7 @@ class SimConfig:
     T_max_ms:    float = T_MAX_MS       # walk duration ceiling       [ms]
 
     # Walkers per ensemble.
-    n_walkers:   int   = 50_000
+    n_walkers:   int   = PRODUCTION_WALKERS_PER_ENSEMBLE
 
     # Independent ensembles built PER LIBRARY ENTRY (single isotropic
     # ensemble design — all 3 axes of each 3-D walk are harvested, so
@@ -179,6 +187,17 @@ class SimConfig:
     # (peak-memory tuning knob only — None processes all n_walkers of an
     # ensemble in one launch; set lower on memory-constrained GPUs).
     walker_chunk: Optional[int] = None
+
+    # ``exact`` is the reference SI Eq. S2 classifier.  ``exact_cached`` is
+    # an equivalence-preserving acceleration: it may short-circuit only when
+    # a conservative facet-distance or candidate-set proof establishes the
+    # same answer; otherwise it invokes the unchanged exact classifier.
+    # The cache knobs are benchmark parameters until the Sol sweep selects the
+    # production values.  They do not alter geometry, contraction, or physics.
+    classifier_mode: str = "exact"
+    classifier_cache_delta_max_um: float = 1.0
+    classifier_cache_min_safe_radius_um: float = 0.0
+    classifier_cache_candidate_capacity: int = 256
 
     # --- Ensemble geometry -------------------------------------------------
     # SI §S.III Eq. S8 determines the production Ω_sim edge W separately for
@@ -319,6 +338,14 @@ class SimConfig:
             raise ValueError("geometry_reference_required_cells must be positive.")
         if self.geometry_reference_required_alpha_values < 1:
             raise ValueError("geometry_reference_required_alpha_values must be positive.")
+        if self.classifier_mode not in {"exact", "exact_cached"}:
+            raise ValueError("classifier_mode must be 'exact' or 'exact_cached'.")
+        if self.classifier_cache_delta_max_um <= 0.0:
+            raise ValueError("classifier_cache_delta_max_um must be positive.")
+        if self.classifier_cache_min_safe_radius_um < 0.0:
+            raise ValueError("classifier_cache_min_safe_radius_um must be non-negative.")
+        if self.classifier_cache_candidate_capacity < 2:
+            raise ValueError("classifier_cache_candidate_capacity must be at least two.")
 
     @property
     def grid_size(self) -> int:

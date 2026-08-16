@@ -68,7 +68,9 @@ import numpy as np
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(current_dir))
 
-from madi.config   import SimConfig, BVALS_S_MM2, BVALS_UNIQUE, DELTAS_BIG
+from madi.config   import (SimConfig, BVALS_S_MM2, BVALS_UNIQUE, DELTAS_BIG,
+                           PRODUCTION_ENSEMBLES_PER_ENTRY,
+                           PRODUCTION_WALKERS_PER_ENSEMBLE)
 from madi.library  import (build_library, build_library_from_triplets,
                             load_library, load_library_meta,
                             match_voxels_batch, match_voxels_batch_fits0,
@@ -428,7 +430,15 @@ PRESETS = {
         # and analytic quadrature weights are made below, not here, so no
         # caller can accidentally turn this back into a linear dense grid.
         "grid": "remediation_log",
-        "cfg":  dict(n_walkers=100_000, n_ensembles=40),
+        # The v5 stencil probe's load-bearing derivatives retain beta well
+        # below 0.01 even under the conservative 2x variance assumption for
+        # this 50k-walker allocation.  The classifier remains ``exact`` until
+        # the separately benchmarked cached implementation clears its gate.
+        "cfg":  dict(
+            n_walkers=PRODUCTION_WALKERS_PER_ENSEMBLE,
+            n_ensembles=PRODUCTION_ENSEMBLES_PER_ENTRY,
+            classifier_mode="exact",
+        ),
     },
 }
 
@@ -449,6 +459,41 @@ def _entry_key_for_script(kio: float, rho: float, volume: float):
     if rho == 0.0 and volume == 0.0:
         return ("free_water", 0.0, 0.0)
     return (round(float(kio), 4), round(float(rho), 1), round(float(volume), 6))
+
+
+def remediation_pairs_for_shard(
+    triplets: list[tuple[float, float, float]],
+    *,
+    shard_id: int,
+    n_shards: int,
+    scheme: str,
+) -> list[tuple[float, float]]:
+    """Return the cellular `(rho,V)` groups assigned to one remediation shard.
+
+    The production ``rho_monotonic`` scheme intentionally maps shard index to
+    ascending-rho group index when there are 369 shards.  That makes the
+    three per-rho submission bands truthful.  Its snake fallback is only for
+    a site-imposed lower shard count; it balances high-rho groups without
+    claiming to preserve monotonic task order.
+    """
+    if n_shards < 1 or not 0 <= shard_id < n_shards:
+        raise ValueError("shard_id must be in [0, n_shards)")
+    pairs = {(rho, volume) for _, rho, volume in triplets if rho > 0.0}
+    if scheme == "rho_monotonic":
+        ordered = sorted(pairs, key=lambda pair: (pair[0], pair[1]))
+        if n_shards > len(ordered):
+            raise ValueError("rho_monotonic sharding cannot use more shards than retained (rho,V) groups")
+        selected: list[tuple[float, float]] = []
+        for index, pair in enumerate(ordered):
+            block, offset = divmod(index, n_shards)
+            assigned = offset if block % 2 == 0 else n_shards - 1 - offset
+            if assigned == shard_id:
+                selected.append(pair)
+        return selected
+    if scheme == "legacy_vi_round_robin":
+        ordered = sorted(pairs, key=lambda pair: pair[0] * pair[1])
+        return [pair for index, pair in enumerate(ordered) if index % n_shards == shard_id]
+    raise ValueError(f"unknown remediation shard scheme {scheme!r}")
 
 
 def load_remediation_entry_subset(
@@ -1528,6 +1573,15 @@ def main():
     # -- Sharding --
     ap.add_argument("--shard-id", type=int, default=None)
     ap.add_argument("--n-shards", type=int, default=None)
+    ap.add_argument(
+        "--remediation-shard-scheme",
+        choices=("legacy_vi_round_robin", "rho_monotonic"),
+        default="legacy_vi_round_robin",
+        help=("[dense remediation grid] legacy round-robin order by rho*V, or "
+              "rho-ascending production assignment. The latter gives one "
+              "monotonic-rho group per shard at n_shards=369 and uses a "
+              "snake assignment if fewer shards are explicitly requested."),
+    )
 
     # -- Build-level RNG seed --
     ap.add_argument("--seed", type=int, default=0,
@@ -1911,14 +1965,16 @@ def main():
                 if not (0 <= args.shard_id < args.n_shards):
                     print(f"ERROR: --shard-id must be in [0, {args.n_shards})")
                     return
-                cellular_pairs = sorted(
-                    {(r, v) for _, r, v in remediation_triplets if r > 0.0},
-                    key=lambda p: p[0] * p[1],
-                )
-                my_pairs = {
-                    pair for i, pair in enumerate(cellular_pairs)
-                    if i % args.n_shards == args.shard_id
-                }
+                try:
+                    my_pairs = set(remediation_pairs_for_shard(
+                        remediation_triplets,
+                        shard_id=args.shard_id,
+                        n_shards=args.n_shards,
+                        scheme=args.remediation_shard_scheme,
+                    ))
+                except ValueError as exc:
+                    print(f"ERROR: {exc}")
+                    return
                 shard_triplets = [
                     t for t in remediation_triplets
                     if (t[1] > 0.0 and (t[1], t[2]) in my_pairs)
@@ -1934,12 +1990,25 @@ def main():
                              else args.library.format(shard=args.shard_id, n_shards=args.n_shards))
                 print(f"\n  Sharding: {args.shard_id}/{args.n_shards}; "
                       f"{len(shard_triplets)} triplets -> {save_path}")
+                print(f"  remediation shard scheme: {args.remediation_shard_scheme}; "
+                      f"{len(my_pairs)} (rho,V) groups")
+                shard_grid_metadata = {
+                    **build_grid_metadata,
+                    "sharding": {
+                        "scheme": args.remediation_shard_scheme,
+                        "n_shards": int(args.n_shards),
+                        "group_order": (
+                            "rho_ascending_then_V" if args.remediation_shard_scheme == "rho_monotonic"
+                            else "rho_times_V_ascending"
+                        ),
+                    },
+                }
                 build_library_from_triplets(
                     shard_triplets, cfg=cfg, save_path=save_path,
                     existing_library=existing, seed=args.seed,
                     vi_min=args.vi_min, vi_max=args.vi_max,
                     entry_weights=shard_weights,
-                    grid_metadata=build_grid_metadata,
+                    grid_metadata=shard_grid_metadata,
                 )
                 return
 
