@@ -48,7 +48,7 @@ wall-time behaviour, not the total allocation consumed.
    `shard368.npz` must exist. Do not overwrite the current production library.
 3. Confirm a representative `seff <jobid_task>` report before committing to a
    larger repeat or changed resource request.
-4. On Sol, merge only after all 128 shards exist:
+4. On Sol, merge only after all 369 shards exist:
 
    ```bash
    module load mamba/latest

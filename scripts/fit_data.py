@@ -69,6 +69,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(current_dir))
 
 from madi.config   import (SimConfig, BVALS_S_MM2, BVALS_UNIQUE, DELTAS_BIG,
+                           PRODUCTION_CLASSIFIER_CACHE_CANDIDATE_CAPACITY,
+                           PRODUCTION_CLASSIFIER_CACHE_DELTA_MAX_UM,
+                           PRODUCTION_CLASSIFIER_CACHE_MIN_SAFE_RADIUS_UM,
+                           PRODUCTION_CLASSIFIER_MODE,
                            PRODUCTION_ENSEMBLES_PER_ENTRY,
                            PRODUCTION_WALKERS_PER_ENSEMBLE)
 from madi.library  import (build_library, build_library_from_triplets,
@@ -432,12 +436,16 @@ PRESETS = {
         "grid": "remediation_log",
         # The v5 stencil probe's load-bearing derivatives retain beta well
         # below 0.01 even under the conservative 2x variance assumption for
-        # this 50k-walker allocation.  The classifier remains ``exact`` until
-        # the separately benchmarked cached implementation clears its gate.
+        # this 50k-walker allocation.  The conservative exact cache passed
+        # CPU/GPU equivalence plus full-size Sol speed gates; every cache miss
+        # still invokes the unchanged SI Eq. S2 classifier.
         "cfg":  dict(
             n_walkers=PRODUCTION_WALKERS_PER_ENSEMBLE,
             n_ensembles=PRODUCTION_ENSEMBLES_PER_ENTRY,
-            classifier_mode="exact",
+            classifier_mode=PRODUCTION_CLASSIFIER_MODE,
+            classifier_cache_delta_max_um=PRODUCTION_CLASSIFIER_CACHE_DELTA_MAX_UM,
+            classifier_cache_min_safe_radius_um=PRODUCTION_CLASSIFIER_CACHE_MIN_SAFE_RADIUS_UM,
+            classifier_cache_candidate_capacity=PRODUCTION_CLASSIFIER_CACHE_CANDIDATE_CAPACITY,
         ),
     },
 }

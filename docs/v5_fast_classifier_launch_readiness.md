@@ -1,13 +1,15 @@
 # v5 exact-classifier cache and launch readiness
 
-## Verdict: PENDING GPU GATE — do not submit production
+## Verdict: PENDING FULL-A100 RESOURCE GATE — do not submit production
 
 The runtime diagnosis establishes that the exact full-facet classifier, not
 geometry construction or signal reduction, causes the production build cost.
 The new two-tier cache is locally equivalent to the exact classifier on the
-fixed CPU golden fixture.  It still needs the Sol GPU equivalence and measured
-speed gates before it can be selected for production.  No production or W4
-job is authorized by this record.
+fixed CPU golden fixture.  The Sol GPU golden check, parameter sweep, and
+50,000-walker speed gate all passed.  One resource-planning gate remains:
+establish the cached group time on a full A100, because the high-rho group is
+too slow for the existing 24-hour layout on a 20-GB MIG slice.  No production
+or W4 job is authorized by this record.
 
 ## Why the cache is safe
 
@@ -56,11 +58,114 @@ not a CPU performance run or a production-like simulation.
 | Deliberate near-shifted-facet Tier-1 refusals | 8 / 8 |
 | Candidate-buffer overflows in fixture | 0 |
 
-The GPU gate repeats this fixture on Sol and compares it to the established
-CPU output.  The speed gate then measures the exact and cached normal
+The GPU golden gate repeats this fixture on Sol and compares it to the
+established CPU output.  The speed gate measures the exact and cached normal
 walk-plus-reduction path at the production grid's low, centre, and high rho
 points, recording cache hits separately for intracellular and extracellular
 endpoints.
+
+## Completed Sol GPU checks
+
+### GPU golden replay: job 61531014
+
+The cached GPU kernel passed the established 64-walker, 4,000-step golden
+fixture.  It made 256,064 classifier requests: 3,923 full classifications,
+14,330 Tier-1 hits, and 237,811 Tier-2 hits; these sum exactly to the request
+count.  There were zero cache-capacity overflows and zero fatal escapes.
+
+The GPU signal agreed with the stored CPU golden signal to an absolute maximum
+of `5.68e-14` (relative maximum `1.18e-15`), far inside the predeclared
+`5e-12` absolute and `5e-11` relative tolerances.  Occupancy and escape state
+were exactly equal.  CPU-versus-GPU reductions are not bit-identical because
+their floating-point reduction order differs; that is a baseline GPU golden
+property, not a cache discrepancy.  The direct cached-versus-exact GPU
+comparison below is bit-identical.
+
+The log contains only Numba low-occupancy warnings for the deliberately tiny
+golden/reduction grids.  It contains no Python, CUDA, escape, geometry, or
+classifier error.  This fixture uses its declared non-certified test geometry,
+not the production geometry reference, as appropriate for an equivalence test.
+
+### Cache-parameter sweep: array job 61530730
+
+Each task used one production-grid geometry, one 5,000-walker ensemble, the
+full 31,125-column production storage grid, and `k_io=20 s^-1`.  Geometry
+build time and CUDA JIT warm-up were excluded from the timing comparison;
+every cached run reused the exact run's geometry and walk seed.  At all three
+densities, every tested setting was bit-identical to the exact GPU run in
+cosine sum, sine sum, occupancy counts, and fatal-escape count.
+
+| `delta_max` (um), minimum Tier-1 radius (um) | Low rho speedup | Centre speedup | High rho speedup |
+|---|---:|---:|---:|
+| 0.5, 0 | 2.58x | 2.95x | 2.71x |
+| 1.0, 0 | 5.66x | 6.15x | 5.51x |
+| **2.0, 0** | **10.09x** | **10.93x** | **6.05x** |
+| 1.0, 0.25 | 5.64x | 6.17x | 5.51x |
+| 1.0, 0.5 | 5.65x | 6.15x | 5.47x |
+
+`delta_max=2.0 um`, zero minimum Tier-1 radius, and a 256-seed cache is the
+unambiguous candidate for the full-size speed gate: it is fastest at every
+density and clears the predeclared 3x threshold even at high rho.  The tested
+minimum-radius guard did not improve the 1.0-um timing (differences were at
+most 0.3%) and merely moved otherwise safe Tier-1 work into Tier 2.  Zero is
+therefore the simpler measured choice.  This is parameter selection, not yet
+a production selection: the full-size gate remains mandatory.
+
+For the selected 2.0-um setting, Tier-1 plus Tier-2 avoided a full KD-tree
+classification on 99.70%, 99.60%, and 99.69% of endpoints at low, centre,
+and high rho, respectively.  Intracellular fast-path rates were 99.75%,
+99.59%, and 99.71%; extracellular rates were 99.59%, 99.61%, and 99.67%.
+Tier 2 supplied all extracellular hits by construction and became especially
+important at high rho (97.3% of all requests); this is why Tier 1 alone would
+not be sufficient.  Candidate-buffer overflow was zero for every setting and
+all three geometries.  Overflow would fall back to full classification, so it
+could affect speed but never correctness; the three-point sweep is not proof
+that no production group will overflow.
+
+The low-rho task used a 1g.20gb A100 MIG slice and the centre/high tasks used
+2g.20gb slices.  Each reported speedup compares exact and cached runs within
+the same task, so it is valid.  Absolute seconds across different density
+tasks should not be compared as a pure density effect because the MIG compute
+profiles differ.
+
+### Full-size cache gate: array job 61532125
+
+This is the required direct measurement at the production 50,000 walkers per
+ensemble, again at low, centre, and high rho with the full 31,125-column grid.
+The selected `delta_max=2.0 um`, zero-radius-guard, 256-candidate cache was
+bit-identical to the exact GPU path in all four recorded quantities at every
+density: cosine sum, sine sum, occupancy counts, and fatal-escape count.
+There were zero candidate-buffer overflows.  The benchmark would have aborted
+on any fatal escape, so its successful JSON outputs also establish zero
+escapes in these six exact/cached walks.
+
+| Density | GPU slice | Exact walk+reduction | Cached walk+reduction | Measured speedup |
+|---|---|---:|---:|---:|
+| Low rho | A100 MIG 2g.20gb | 94.32 s | 9.26 s | **10.18x** |
+| Centre rho | A100 MIG 1g.20gb | 271.56 s | 27.11 s | **10.02x** |
+| High rho | A100 MIG 2g.20gb | 271.80 s | 53.95 s | **5.04x** |
+
+This clears the predeclared 3x gate at every density.  The high-rho value is
+the governing result; it is lower because Tier 2 must handle nearly every
+endpoint there, but it is still a five-fold reduction in the measured normal
+walk-plus-reduction cost.  At the selected setting the full-classification
+fractions were only 0.302%, 0.399%, and 0.306%, respectively.  Accounting
+again closed exactly: full + Tier 1 + Tier 2 equalled all 6,400,050,000
+endpoint requests in each run.
+
+The Slurm jobs were also healthy: they completed in 2:01, 5:18, and 6:05,
+with 186 MB, 188 MB, and 340 MB maximum RSS, respectively.  Those wall times
+include geometry construction, CUDA compilation warm-up, and both the exact
+and cached reference runs; they are not projected production group times.
+The only stderr content was the expected Numba warning about the benchmark's
+one-ensemble reduction launch.  There were no Python, CUDA, classifier,
+geometry, or escape errors.
+
+The production dense preset now records this validated exact cache in artifact
+metadata: `exact_cached`, `delta_max=2.0 um`, minimum safety radius `0`, and
+candidate capacity `256`.  This changes only a provably equivalent route to
+the existing SI Eq. S2 classifier; it does not change the geometry, membrane
+rule, RNG stream, walk time step, or v5 schema.
 
 ## Monte-Carlo allocation
 
@@ -77,19 +182,32 @@ times below the 0.015 trust floor.  Stored `signal_variance` remains the
 authoritative uncertainty estimate; this nominal floor is not a substitute
 for it.
 
-## Cost and sharding before the GPU speed result
+## Cost and sharding after the 20-GB MIG speed result
 
-The prior exact-classifier benchmark projected 51-k_io, 40-ensemble groups of
-26.5 h (low rho), 34.3 h (centre), and 93.4 h (high rho) at 100,000 walkers.
-Geometry was only 0.13% of a group.  Halving walkers therefore gives the
-following near-linear pre-cache planning values:
+There are 51 k_io values and 40 ensembles per `(rho,V)` group.  Multiplying
+the measured cached one-ensemble, one-k_io time by `51 x 40` gives the
+following direct first-order task estimates on the actual MIG profiles used
+by job 61532125.  Geometry is built once per group and adds only 3--23 seconds
+to these values.
 
-| Location | 50k-walker group before cache | At 3× cache speed | At 5× cache speed |
-|---|---:|---:|---:|
-| Low rho | 13.2 h | 4.4 h | 2.6 h |
-| Centre | 17.2 h | 5.7 h | 3.4 h |
-| High rho | 46.7 h | 15.6 h | 9.3 h |
-| Full build | ~9,750 GPU-h | ~3,250 GPU-h | ~1,950 GPU-h |
+| Location | Cached group time on measured MIG slice |
+|---|---:|
+| Low rho | 5.25 h |
+| Centre rho | 15.36 h |
+| High rho | **30.57 h** |
+
+The high-rho case exceeds the one-day task limit before any safety margin is
+applied.  Therefore the existing `a100.20gb:1` production request is not
+acceptable for the one-group-per-task, 369-shard layout.  Resharding alone
+would not reduce total compute.  Splitting a group by k_io would duplicate
+geometry and add operational complexity; it is not selected while the simpler
+full-A100 option has not yet been measured.
+
+The earlier direct exact benchmark ran on a full A100 and was substantially
+faster per walker than the MIG measurements (about 3--9x, depending on
+density and slice profile).  That is consistent with the smaller MIG compute
+partition, but it is not a substitute for a direct cached measurement.  A
+short serial full-A100 benchmark is therefore the remaining resource gate.
 
 The 369 retained `(rho,V)` pairs are now ordered by ascending rho and assigned
 one per task.  This eliminates the former `rho*V = v_i` proxy, which was
@@ -97,9 +215,9 @@ nearly constant inside the mask and did not balance the cost-driving rho
 dependence.  The exact production bands are 127 tasks (0–126), 121 tasks
 (127–247), and 121 tasks (248–368).  The free-water atom is added to task 0.
 
-These numbers are planning arithmetic, not a measured result.  The cache
-speed must be at least 3× to clear the stated gate.  Per-band wall limits will
-be set to roughly twice the measured worst case after that result returns.
+The cache speed gate is complete.  Per-band wall limits and the production GRES
+will be set from the remaining full-A100 measurement, at roughly twice the
+measured worst case for each band.
 
 ## Array scheduling and storage checks still required on Sol
 
@@ -128,10 +246,10 @@ The raw v5 matrix floor remains 9.29 GiB regardless of walker count.  Scratch
 must accommodate all 369 shards plus the merged artifact and simultaneous
 merge inputs/outputs; no sufficient quota figure has yet been recorded.
 
-## Next GPU-only commands
+## Remaining GPU-only resource gate
 
-After this change set is committed and pulled to Sol, run these exact commands
-from the established checkout:
+After the small follow-up script is committed and pulled to Sol, run these
+exact commands from the established checkout:
 
 ```bash
 cd /scratch/tksimmo2/madi/custom_madi
@@ -139,11 +257,14 @@ git status --short
 git pull --ff-only
 git log -1 --oneline
 sha256sum -c data/geometry_reference_si_kappa_0p9.npz.sha256
-sbatch scripts/validate_exact_cache_gpu.sbatch
-sbatch scripts/benchmark_exact_cache_sweep.sbatch
+sbatch scripts/benchmark_exact_cache_full_a100.sbatch
 ```
 
-The jobs use a 20-GB A100 MIG slice, two CPUs, and Sol's required 24-GiB host
-memory minimum.  They create validation JSON only and do not write a library.
-The speed-mode job, exact production commands, final cache constants, storage
-headroom, and GO/NO-GO decision follow only after these outputs are reviewed.
+This is a serial, three-task, one-hour `htc` array: one exact-plus-cached
+50,000-walker ensemble at each density.  It requests one full A100 rather
+than a MIG slice, one CPU, and Sol's required 24-GiB host-memory minimum.
+The one-CPU request is supported by job 61532125, which consumed only one
+core across all tasks.  Serial submission (`%1`) caps this measurement at one
+GPU at a time.  It creates validation JSON only and does not write a library.
+The production GRES, storage headroom, per-band wall limits, exact production
+commands, and GO/NO-GO decision follow only after its outputs are reviewed.

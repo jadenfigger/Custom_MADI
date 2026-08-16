@@ -79,6 +79,16 @@ PRODUCTION_AXIS_WALKS_PER_ENTRY = (
     3 * PRODUCTION_WALKERS_PER_ENSEMBLE * PRODUCTION_ENSEMBLES_PER_ENTRY
 )
 
+# These values were selected by the Sol GPU equivalence and full-size speed
+# gates (jobs 61531014, 61530730, and 61532125).  They are used explicitly by
+# the dense production preset; SimConfig's generic defaults remain the
+# reference exact classifier so small tests and non-production diagnostics do
+# not silently select an acceleration path.
+PRODUCTION_CLASSIFIER_MODE = "exact_cached"
+PRODUCTION_CLASSIFIER_CACHE_DELTA_MAX_UM = 2.0
+PRODUCTION_CLASSIFIER_CACHE_MIN_SAFE_RADIUS_UM = 0.0
+PRODUCTION_CLASSIFIER_CACHE_CANDIDATE_CAPACITY = 256
+
 B_MAX_S_MM2 = 12000.0
 B_STEP_S_MM2 = 500.0
 
@@ -192,8 +202,9 @@ class SimConfig:
     # an equivalence-preserving acceleration: it may short-circuit only when
     # a conservative facet-distance or candidate-set proof establishes the
     # same answer; otherwise it invokes the unchanged exact classifier.
-    # The cache knobs are benchmark parameters until the Sol sweep selects the
-    # production values.  They do not alter geometry, contraction, or physics.
+    # The generic defaults are the reference path.  The dense production preset
+    # supplies the separately validated cache settings.  Neither path alters
+    # geometry, contraction, or physics.
     classifier_mode: str = "exact"
     classifier_cache_delta_max_um: float = 1.0
     classifier_cache_min_safe_radius_um: float = 0.0
