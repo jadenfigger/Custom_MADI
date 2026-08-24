@@ -239,6 +239,10 @@ class SimConfig:
     # α* and it does not supply <A/V> for k_io.
     geometry_validation_points: int = 200_000
     geometry_vi_tolerance: float = 0.005
+    # Point samples from one finite Poisson--Voronoi realization are spatially
+    # correlated. Equal-volume batch means estimate the corresponding
+    # finite-domain uncertainty for the acceptance gate.
+    geometry_validation_blocks_per_axis: int = 8
 
     # SI §S.III: escaping Ω_sim is a fatal simulation error.  There is no
     # periodic production mode and no survivor selection / escape fraction.
@@ -345,6 +349,8 @@ class SimConfig:
             raise ValueError("population_max_expansions must be positive.")
         if self.geometry_validation_points <= 0:
             raise ValueError("geometry_validation_points must be positive.")
+        if self.geometry_validation_blocks_per_axis < 2:
+            raise ValueError("geometry_validation_blocks_per_axis must be at least two.")
         if self.geometry_reference_required_cells < 1:
             raise ValueError("geometry_reference_required_cells must be positive.")
         if self.geometry_reference_required_alpha_values < 1:

@@ -31,6 +31,15 @@ analytic weights, which this design satisfies; changing the 51-point spacing
 to a particular 55-point scheme would be a separate parameter-resolution
 decision and is not made silently here.
 
+## Finite-geometry restart note
+
+Job `61617744` exposed an overly narrow low-density finite-geometry packing
+gate: its pointwise volume-sampling SE treated correlated points in a single
+finite Ω_sim realization as independent.  The corrected gate includes an
+equal-volume spatial batch-means SE while leaving S7a, Eq. S2, Eq. S8, and
+Eq. 5 unchanged.  See `finite_geometry_acceptance.md` for the diagnosis,
+provenance fields, and the exact 30-shard restart set.
+
 ## Sol launch, only after explicit approval
 
 The revised layout has 369 shards: exactly one cellular `(rho,V)` group per

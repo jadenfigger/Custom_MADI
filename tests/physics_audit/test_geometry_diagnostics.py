@@ -11,6 +11,7 @@ from madi.config import SimConfig
 from madi.ensemble import (
     alpha_star_from_vi,
     create_ensemble,
+    geometry_vi_acceptance_limit,
     governing_mean_A_over_V,
     si_domain_side_um,
 )
@@ -47,6 +48,19 @@ def test_s7a_high_vi_targets_are_distinct_and_never_clamped() -> None:
     values = np.asarray([alpha_star_from_vi(vi, rho) for vi in targets])
     assert np.all(np.diff(values) < 0.0)
     assert np.unique(np.round(values, 12)).size == len(values)
+
+
+def test_geometry_acceptance_accounts_for_spatially_correlated_packing() -> None:
+    """Low-rho Ω_sim points are not independent Bernoulli trials."""
+    cfg = SimConfig(
+        small_deltas=[1.0], big_deltas=[1.0], T_max_ms=2.0,
+        geometry_vi_tolerance=0.005,
+    )
+    # A 200k-point probe at v_i≈0.41 has a point SE of about 0.0011.  A
+    # finite low-rho geometry can have a larger spatial batch-means SE, which
+    # must control the four-SE realization acceptance instead.
+    assert geometry_vi_acceptance_limit(cfg, 0.0011, 0.00225) == pytest.approx(0.009)
+    assert geometry_vi_acceptance_limit(cfg, 0.0011, float("nan")) == pytest.approx(0.005)
 
 
 def test_governing_reference_is_untrimmed_and_scales_as_rho_one_third(tmp_path) -> None:
@@ -97,7 +111,11 @@ def test_full_facet_realised_labels_match_s7a_across_p0a_grid(
     )
     seed = 20_260_900 + int(round(target_vi * 100)) + int(rho // 1.0e5)
     ensemble = create_ensemble(rho, target_vi * 1.0e6 / rho, cfg, seed=seed)
-    allowed = max(cfg.geometry_vi_tolerance, 4.0 * ensemble.geometry.realised_vi_se)
+    allowed = geometry_vi_acceptance_limit(
+        cfg,
+        ensemble.geometry.realised_vi_se,
+        ensemble.geometry.realised_vi_spatial_se,
+    )
     assert abs(ensemble.vi - target_vi) <= allowed
     assert ensemble.rho * ensemble.V * 1e-6 == pytest.approx(ensemble.vi, abs=1e-12)
     assert ensemble.mean_AV == pytest.approx(governing_mean_A_over_V(target_vi, rho, cfg)[0])

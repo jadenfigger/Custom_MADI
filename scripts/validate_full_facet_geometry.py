@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from madi.config import SimConfig
-from madi.ensemble import create_ensemble
+from madi.ensemble import create_ensemble, geometry_vi_acceptance_limit
 
 
 VI_TARGETS = (0.40, 0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99)
@@ -128,8 +128,12 @@ def main() -> int:
                 "V_requested_pL": V,
                 "vi_measured": ensemble.vi,
                 "vi_mc_se": stats.realised_vi_se,
+                "vi_spatial_batch_se": stats.realised_vi_spatial_se,
+                "vi_spatial_batches_per_axis": stats.validation_blocks_per_axis,
                 "vi_error": ensemble.vi - target_vi,
-                "vi_acceptance_limit": max(cfg.geometry_vi_tolerance, 4.0 * stats.realised_vi_se),
+                "vi_acceptance_limit": geometry_vi_acceptance_limit(
+                    cfg, stats.realised_vi_se, stats.realised_vi_spatial_se,
+                ),
                 "rho_measured_per_uL": ensemble.rho,
                 "V_measured_pL": ensemble.V,
                 "alpha_star_um": ensemble.alpha_star,

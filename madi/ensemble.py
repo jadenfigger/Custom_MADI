@@ -123,6 +123,11 @@ class GeometryStats:
     population: PopulationCertificate
     reference_path: str
     reference_metadata: dict
+    # The existing SE is conditional point-sampling uncertainty. This value
+    # also reflects finite-realisation packing variation via spatial batches.
+    # Defaults retain compatibility with existing golden fixtures.
+    realised_vi_spatial_se: float = float("nan")
+    validation_blocks_per_axis: int = 0
 
     def to_dict(self) -> dict:
         out = asdict(self)
@@ -638,12 +643,55 @@ def _make_population(
     )
 
 
-def _measure_vi(ens: Ensemble, n: int, rng: np.random.Generator) -> Tuple[float, float]:
+def _measure_vi(
+    ens: Ensemble,
+    n: int,
+    rng: np.random.Generator,
+    blocks_per_axis: int,
+) -> Tuple[float, float, float, int]:
+    """Measure finite packing and its pointwise and spatial uncertainty.
+
+    The binomial SE detects an undersampled volume probe, but nearby samples
+    in a single finite Voronoi realization are not independent. Equal-volume
+    spatial batch means estimate that finite-domain component. This validates
+    a realization only; it never changes S7a or the Eq. 5 input.
+    """
     points = rng.uniform(0.0, ens.L, size=(int(n), 3))
     _, inside = ens.classify_cpu(points)
     vi = float(np.mean(inside))
     se = float(np.sqrt(max(vi * (1.0 - vi), 0.0) / max(len(points), 1)))
-    return vi, se
+    # Small diagnostic callers need not request more spatial batches than
+    # their sample count can populate.
+    effective_axis = min(
+        int(blocks_per_axis), max(1, int(np.floor(len(points) ** (1.0 / 3.0))))
+    )
+    if effective_axis < 2:
+        return vi, se, float("nan"), effective_axis
+    indices = np.minimum(
+        (points / ens.L * effective_axis).astype(np.intp), effective_axis - 1,
+    )
+    batch = np.ravel_multi_index(indices.T, (effective_axis,) * 3)
+    n_batches = effective_axis ** 3
+    counts = np.bincount(batch, minlength=n_batches)
+    sums = np.bincount(batch, weights=inside.astype(np.float64), minlength=n_batches)
+    means = sums[counts > 0] / counts[counts > 0]
+    spatial_se = (
+        float(np.std(means, ddof=1) / np.sqrt(len(means)))
+        if len(means) >= 2 else float("nan")
+    )
+    return vi, se, spatial_se, effective_axis
+
+
+def geometry_vi_acceptance_limit(
+    cfg: SimConfig,
+    point_se: float,
+    spatial_se: float = float("nan"),
+) -> float:
+    """Return the four-SE finite-geometry acceptance limit."""
+    terms = [float(cfg.geometry_vi_tolerance), 4.0 * float(point_se)]
+    if np.isfinite(spatial_se) and spatial_se >= 0.0:
+        terms.append(4.0 * float(spatial_se))
+    return float(max(terms))
 
 
 def create_ensemble(
@@ -714,8 +762,11 @@ def create_ensemble(
         kd_node_axis=provisional_nodes[1], kd_node_left=provisional_nodes[2],
         kd_node_right=provisional_nodes[3], kd_node_parent=provisional_nodes[4], tree=tree,
     )
-    realised_vi, vi_se = _measure_vi(ens, cfg.geometry_validation_points, rng)
-    allowed = max(float(cfg.geometry_vi_tolerance), 4.0 * vi_se)
+    realised_vi, vi_se, vi_spatial_se, validation_blocks = _measure_vi(
+        ens, cfg.geometry_validation_points, rng,
+        cfg.geometry_validation_blocks_per_axis,
+    )
+    allowed = geometry_vi_acceptance_limit(cfg, vi_se, vi_spatial_se)
     if verify_vi and abs(realised_vi - target_vi) > allowed:
         raise RuntimeError(
             "Finite Ω_sim packing failed SI geometry acceptance: "
@@ -741,6 +792,8 @@ def create_ensemble(
         sim_side_um=side, source_side_um=source_side,
         population=population, reference_path=reference.path,
         reference_metadata=reference.metadata,
+        realised_vi_spatial_se=vi_spatial_se,
+        validation_blocks_per_axis=validation_blocks,
     )
     ens.rho = stats.realised_rho_per_uL
     ens.V = stats.realised_mean_volume_pL
@@ -751,7 +804,8 @@ def create_ensemble(
             "    [SI geometry] "
             f"W={side:.3f} um, Ωsrc={source_side:.3f} um, seeds(sim/pop)="
             f"{n_sim}/{len(seeds)}, target v_i={target_vi:.5f}, "
-            f"realised={realised_vi:.5f}±{vi_se:.5f}, alpha*={alpha_star:.5f} um, "
+            f"realised={realised_vi:.5f}±{vi_se:.5f} (spatial SE {vi_spatial_se:.5f}), "
+            f"alpha*={alpha_star:.5f} um, "
             f"<A/V>_process={mean_av:.5f} um^-1"
         )
     return ens
@@ -777,6 +831,7 @@ def create_dummy_ensemble(cfg: SimConfig) -> Ensemble:
         annulus_q95_um=0.0, n_seeds_pop=0, n_seeds_sim=0,
         n_validation_points=0, sim_side_um=side, source_side_um=source_side,
         population=certificate, reference_path="", reference_metadata={},
+        realised_vi_spatial_se=0.0, validation_blocks_per_axis=0,
     )
     return Ensemble(
         seeds=np.zeros((2, 3), dtype=np.float64), annulus=np.zeros(2, dtype=np.float64),
@@ -796,7 +851,10 @@ def estimate_vi(ens: Ensemble, n: int = 200_000, seed: int = 42) -> float:
     """Independent exact-classifier volume-fraction measurement in Ω_sim."""
     if ens.is_free_water:
         return 0.0
-    vi, _ = _measure_vi(ens, n, np.random.default_rng(seed))
+    vi, _, _, _ = _measure_vi(
+        ens, n, np.random.default_rng(seed),
+        SimConfig().geometry_validation_blocks_per_axis,
+    )
     return vi
 
 

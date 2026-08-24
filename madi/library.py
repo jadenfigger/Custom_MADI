@@ -714,6 +714,11 @@ def _cfg_metadata(
         },
         "geometry_validation_points": cfg.geometry_validation_points,
         "geometry_vi_tolerance": cfg.geometry_vi_tolerance,
+        "geometry_validation_blocks_per_axis": cfg.geometry_validation_blocks_per_axis,
+        "geometry_vi_acceptance": (
+            "max(absolute_tolerance, 4*point_binomial_SE, "
+            "4*equal_volume_spatial_batch_means_SE)"
+        ),
         "walkers_per_ensemble": cfg.n_walkers,
         "ensembles_per_entry": cfg.n_ensembles,
         "axis_walks_per_entry": 3 * int(cfg.n_walkers) * int(cfg.n_ensembles),
