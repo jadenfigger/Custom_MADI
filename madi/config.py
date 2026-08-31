@@ -243,6 +243,11 @@ class SimConfig:
     # correlated. Equal-volume batch means estimate the corresponding
     # finite-domain uncertainty for the acceptance gate.
     geometry_validation_blocks_per_axis: int = 8
+    # A production build evaluates 369 × 40 finite geometries.  The spatial
+    # batch SE is a finite-realisation uncertainty, so use a five-SE
+    # familywise guard rather than rejecting the expected rare 4--5 SE tail.
+    # This does not change alpha*, the SI reference <A/V>, or any geometry.
+    geometry_vi_spatial_se_multiplier: float = 5.0
 
     # SI §S.III: escaping Ω_sim is a fatal simulation error.  There is no
     # periodic production mode and no survivor selection / escape fraction.
@@ -351,6 +356,8 @@ class SimConfig:
             raise ValueError("geometry_validation_points must be positive.")
         if self.geometry_validation_blocks_per_axis < 2:
             raise ValueError("geometry_validation_blocks_per_axis must be at least two.")
+        if self.geometry_vi_spatial_se_multiplier <= 0.0:
+            raise ValueError("geometry_vi_spatial_se_multiplier must be positive.")
         if self.geometry_reference_required_cells < 1:
             raise ValueError("geometry_reference_required_cells must be positive.")
         if self.geometry_reference_required_alpha_values < 1:

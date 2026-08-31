@@ -687,10 +687,10 @@ def geometry_vi_acceptance_limit(
     point_se: float,
     spatial_se: float = float("nan"),
 ) -> float:
-    """Return the four-SE finite-geometry acceptance limit."""
+    """Return the pointwise-four-SE / spatial-familywise acceptance limit."""
     terms = [float(cfg.geometry_vi_tolerance), 4.0 * float(point_se)]
     if np.isfinite(spatial_se) and spatial_se >= 0.0:
-        terms.append(4.0 * float(spatial_se))
+        terms.append(float(cfg.geometry_vi_spatial_se_multiplier) * float(spatial_se))
     return float(max(terms))
 
 

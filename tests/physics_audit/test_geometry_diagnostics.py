@@ -58,8 +58,8 @@ def test_geometry_acceptance_accounts_for_spatially_correlated_packing() -> None
     )
     # A 200k-point probe at v_i≈0.41 has a point SE of about 0.0011.  A
     # finite low-rho geometry can have a larger spatial batch-means SE, which
-    # must control the four-SE realization acceptance instead.
-    assert geometry_vi_acceptance_limit(cfg, 0.0011, 0.00225) == pytest.approx(0.009)
+    # must control the familywise spatial realization acceptance instead.
+    assert geometry_vi_acceptance_limit(cfg, 0.0011, 0.00225) == pytest.approx(0.01125)
     assert geometry_vi_acceptance_limit(cfg, 0.0011, float("nan")) == pytest.approx(0.005)
 
 
