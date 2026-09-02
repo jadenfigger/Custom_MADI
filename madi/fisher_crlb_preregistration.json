@@ -1,0 +1,23 @@
+{
+  "schema": "madi-fisher-crlb-preregistration-v1",
+  "parameter_order": ["log_rho", "log_V", "k_io"],
+  "stencil_half_widths": {"rho": [1, 2, 3, 4], "V": [1, 2], "k_io": [1]},
+  "snr_levels": [20, 50, 100],
+  "kappa_unidentified_threshold": 10.0,
+  "trust_floor": 0.015,
+  "rician_magnitude_snr_min": 3.0,
+  "gradient_limits_T_per_m": {"clinical": 0.08, "research": 0.3},
+  "noise_model": {"T2_ms": 80.0, "t_epi_ms": 0.0, "averages_per_column": 1},
+  "protocols": {
+    "madi_ii": {"delta_ms": 20.0, "Delta_ms": 50.0},
+    "madi_iii": {"delta_ms": 7.0, "Delta_ms": 25.0},
+    "jackson_thesis": {"status": "requires_source_timing_confirmation"},
+    "multi_Delta_candidates": [
+      {"delta_ms": 5.0, "Delta_ms": 15.0},
+      {"delta_ms": 7.0, "Delta_ms": 25.0},
+      {"delta_ms": 10.0, "Delta_ms": 30.0},
+      {"delta_ms": 15.0, "Delta_ms": 40.0},
+      {"delta_ms": 20.0, "Delta_ms": 50.0}
+    ]
+  }
+}

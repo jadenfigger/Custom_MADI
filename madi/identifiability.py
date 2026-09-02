@@ -49,9 +49,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .library import LibraryEntry, resolve_grid_columns
+from .fisher_crlb import PARAMETER_ORDER as V5_PARAMETER_ORDER
+from .fisher_crlb import fisher_diagnostics, fisher_matrix
 
 
-PARAM_NAMES = ("kio", "rho", "V")
+# Keep the legacy public row order below for compatibility with the old CLI.
+# New v5 Phase-1 consumers use V5_PARAMETER_ORDER=(log_rho, log_V, k_io).
+PARAM_NAMES = ("kio", "log_rho", "log_V")
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +167,18 @@ def _build_axis_groups(library: List[LibraryEntry]):
     V_groups:   Dict[Tuple[float, float], List[Tuple[float, int]]] = defaultdict(list)
 
     for i, e in enumerate(library):
-        k, r, v = _rkio(e.kio), _rrho(e.rho), _rV(e.V)
+        # v5 realized rho/V labels record the finite geometry that was
+        # actually simulated.  They are deliberately not literal grid keys:
+        # grouping on them makes every canonical neighbour appear isolated.
+        # Nominal labels choose the stencil; realized labels remain the
+        # denominator below, as required for a realised-coordinate derivative.
+        nk = e.kio_nominal if e.kio_nominal is not None else e.kio
+        nr = e.rho_nominal if e.rho_nominal is not None else e.rho
+        nv = e.V_nominal if e.V_nominal is not None else e.V
+        k, r, v = _rkio(nk), _rrho(nr), _rV(nv)
         kio_groups[(r, v)].append((e.kio, i))
-        rho_groups[(k, v)].append((e.rho, i))
-        V_groups[(k, r)].append((e.V, i))
+        rho_groups[(k, v)].append((np.log(e.rho), i))
+        V_groups[(k, r)].append((np.log(e.V), i))
 
     for grp in (kio_groups, rho_groups, V_groups):
         for key in grp:
@@ -266,6 +278,28 @@ def compute_fim(
             f"{D.shape[1]} (delta,Delta,b) columns.")
     Dw = D / sigma_m[None, :]
     return Dw @ Dw.T
+
+
+def compute_debiased_v5_fim(
+    d_log_rho: np.ndarray,
+    d_log_V: np.ndarray,
+    d_kio: np.ndarray,
+    col_idx: np.ndarray,
+    sigma_m,
+    derivative_variance: np.ndarray | None = None,
+    *,
+    kio_ref: float,
+) -> dict:
+    """v5 Fisher core in the Phase-1 parameter order.
+
+    ``derivative_variance`` has one row per selected column and one column
+    per parameter.  When supplied, only the Fisher diagonal is corrected;
+    central differences use disjoint endpoint pairs across axes, so changing
+    the off-diagonals would bias the degeneracy information.
+    """
+    J = np.column_stack((d_log_rho[col_idx], d_log_V[col_idx], d_kio[col_idx]))
+    F = fisher_matrix(J, sigma_m, derivative_variance)
+    return fisher_diagnostics(F, kio_ref)
 
 
 @dataclass
