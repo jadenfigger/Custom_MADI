@@ -1,5 +1,23 @@
 # Marginal S0 and Fisher/CRLB implementation handoff
 
+> **Status as of 2026-09-05: CURRENT, and partly live.** This document was
+> archived as a stale plan during the documentation reorganization. Its
+> nuisance-amplitude decision has since been approved and implemented, so it is
+> back at the docs root. It is a **mixed** document and the two halves have
+> different statuses:
+>
+> | Section | Status |
+> |---|---|
+> | "Fisher outputs" -- the nuisance-`S0` block matrix and its known / finite-`b0` / unknown amplitude regimes | **LIVE.** Adopted 2026-09-05 and implemented in `madi/fisher_crlb.py` as `amplitude_marginal_fisher`, `amplitude_marginal_diagnostics`, and `amplitude_prior_precision`; reported by `scripts/report_s0_marginal_crlb.py`; pre-registered in `madi/fisher_crlb_preregistration.json` under `amplitude_model`. |
+> | The `--s0-mode` fitting CLI, marginal MAP/Bayes likelihoods, AMICO handling, and their test list | **STILL A PLAN.** Not implemented. Retained here as the specification for that work. |
+> | The Phase 0 architecture map, `theta = (kio, v_in, V)` coordinates, local-linear-regression derivatives, and the v2 `(Delta, b)` column contract | **SUPERSEDED.** The v5 framework uses `theta = (log rho, log V, k_io)`, canonical-neighbour central differences on realized labels, and a `(delta, Delta, b)` contract. See `fisher_crlb_analysis_plan.md` and `fisher_phase01_framework.md`. |
+>
+> The line below reading "No production fitting, library, or analysis code has
+> been changed for this feature" was true when written and is **no longer true
+> for the Fisher half**. It is left in place unedited; this header is the
+> correction. See the amendment log at the end of this file.
+
+
 ## Purpose and status
 
 This document is the implementation handoff for two deferred MADI features:
@@ -438,3 +456,54 @@ larger experiments.
 * Ask before broad library API or persistent-GPU-cache refactors.
 * Report contrary empirical results honestly, including leverage, derivative
   reliability, residual clamping, and synthetic recovery behavior.
+
+---
+
+## Amendment log
+
+### 2026-09-05 -- nuisance-amplitude Fisher specification adopted; document un-archived
+
+- **Previously:** this file sat at `docs/archive/marginal_s0_fisher_crlb_implementation_plan.md`,
+  classified STALE PLAN in [`INDEX.md`](INDEX.md) with the note *"Its nuisance-S0
+  decision remains relevant; its v2 implementation map is superseded."* The
+  active Fisher plan did not adopt it, and
+  [`fisher_phase01_framework.md`](fisher_phase01_framework.md) listed S0 as the
+  first of its "Plan items needing a decision".
+- **Now:** the nuisance-amplitude decision is approved. The document is at the
+  docs root, classified CURRENT, and cross-referenced from
+  [`fisher_crlb_analysis_plan.md`](fisher_crlb_analysis_plan.md) section 2.7.
+  Its Fisher half is implemented; its fitting half remains an unimplemented
+  plan; its v2 coordinate and column-contract material is superseded.
+- **Why:** the user approved the amendment. Reporting a fixed-`S0` CRLB alone
+  overstates achievable precision, because no real acquisition knows the
+  amplitude exactly, and Phase 5 would otherwise divide `--fit-s0` estimator
+  RMSE by a bound those fitters structurally cannot reach.
+- **What supersedes what:** nothing in this file is deleted. The header table
+  above is the authoritative per-section status.
+
+### 2026-09-06 -- the reporting path declares its column basis
+
+- **Previously:** `scripts/report_s0_marginal_crlb.py`, the LIVE half's reporting
+  entry point, took whichever of an acquisition's declared columns happened to
+  survive the Phase-1 selection and dropped the rest silently. That selection was
+  itself a 300 mT/m scanner mask, so the basis was incidental rather than
+  declared: the MADI III `(7, 25)` row was computed on 24 columns, of which 10
+  require up to 389 mT/m, and survived only because `(7, 25)` is also a
+  diagnostic timing pair.
+- **Now:** an acquisition's declared `(delta, Delta)` and `b` range is required to
+  exist in the substrate and raises if it does not; the report records
+  `column_domain`, `column_basis` and `max_gradient_T_per_m_used`; and
+  `--gradient-scenario` applies a pre-registered hardware ceiling as an explicit,
+  recorded condition.
+- **Why:** the analysis-domain audit of 2026-09-06,
+  [`fisher_domain_audit.md`](fisher_domain_audit.md). A CRLB gap reported under
+  an acquisition's name must be the gap for that acquisition.
+- **Effect on the reported numbers: none.** Regenerated on the corrected
+  unrestricted substrate, every fixed-versus-marginal CRLB ratio in
+  [`fisher_phase01_framework.md`](fisher_phase01_framework.md) reproduces to
+  every reported digit, at all three acquisitions and all three amplitude
+  regimes. The unconditioned basis is now stated as such, and the
+  research-conditioned reading of MADI III (14 columns rather than 24) is
+  available with one flag.
+- **Not changed:** the specification in this document, and the status of its
+  three sections.

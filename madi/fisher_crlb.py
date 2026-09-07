@@ -3,6 +3,10 @@
 This module deliberately contains no protocol ranking or CRLB map code.  It
 validates an artifact, builds central finite-difference fields, and exposes
 the noise/feasibility and Fisher primitives needed by later phases.
+
+It also carries the analysis-domain contract (`ColumnDomain`, `require_columns`)
+that keeps the reusable model-derived substrate separate from the conditional
+acquisition analyses layered on top of it.
 """
 
 from __future__ import annotations
@@ -513,6 +517,18 @@ def feasibility_masks(signals: np.ndarray, pair_deltas: np.ndarray, pair_Deltas:
                       T2_ms: float = 80.0, t_epi_ms: float = 0.0,
                       trust_floor: float = 0.015, rician_snr_min: float = 3.0,
                       G_max: float = 0.08) -> dict[str, np.ndarray]:
+    """Conditional acquisition masks for one declared scanner and noise model.
+
+    Every mask here is CONDITIONAL: it depends on a gradient ceiling, a TE/T2
+    noise model, an averaging allocation and a trust threshold, none of which
+    the library knows about.  They are legitimate inputs to a declared
+    conditional analysis and legitimate annotations on the substrate.
+
+    They are **not** an extraction filter.  Using any of them to decide which
+    stored columns get a derivative, a variance or a cache entry makes the
+    modelled information unrecoverable at any other scanner setting.  See
+    `ColumnDomain` and docs/fisher_domain_audit.md.
+    """
     delta, Delta, b = column_arrays(pair_deltas, pair_Deltas, b_values)
     sigma = te_noise_sigma(delta, Delta, sigma0=sigma0, averages=averages, T2_ms=T2_ms, t_epi_ms=t_epi_ms)
     signals = np.asarray(signals, dtype=float)
@@ -539,6 +555,175 @@ def feasibility_masks(signals: np.ndarray, pair_deltas: np.ndarray, pair_Deltas:
     masks["gradient_T_per_m"] = gradient
     masks["sigma"] = sigma
     return masks
+
+
+# ---------------------------------------------------------------------------
+# Analysis-domain contract -- added 2026-09-06
+# ---------------------------------------------------------------------------
+#
+# The Fisher work has two layers and they must not be confused.
+#
+#   REUSABLE SUBSTRATE.  Signal, finite-difference derivatives, derivative
+#   Monte-Carlo variance/covariance, truncation-bias diagnostics.  These follow
+#   from the validated library alone.  Nothing about a scanner, a TE, a T2, an
+#   SNR, an averaging budget, or a trust threshold enters them, so their domain
+#   is the stored acquisition grid: every `(delta, Delta, b)` column the library
+#   holds.
+#
+#   CONDITIONAL ANALYSIS.  Gradient feasibility at a chosen `G_max`, TE/T2
+#   noise, Rician validity at a chosen averaging, the `S/S0` trust floor,
+#   budgets, protocol optimisation.  Each is a statement about a declared
+#   acquisition, is legitimate, and belongs at evaluation time where it is
+#   named in the result.
+#
+# A conditional quantity may be calculated, annotated, reported and stratified
+# on the substrate.  It must never decide whether a stored column is extracted
+# or cached, because that makes the modelled information unrecoverable without
+# regenerating the substrate.  `ColumnDomain` is the machine-checkable form of
+# that rule: every cache and every report declares the domain it represents,
+# and `require_columns` refuses to let a restricted cache be read as universal.
+#
+# See docs/fisher_domain_audit.md and the pre-registration block
+# `analysis_domain_architecture`.
+
+STORED_COLUMN_DOMAIN = "all_stored_columns"
+LEGACY_COLUMN_DOMAIN = "legacy_undeclared"
+
+
+@dataclass(frozen=True)
+class ColumnDomain:
+    """Which stored `(delta, Delta, b)` columns an artifact actually represents.
+
+    `column_indices` are indices into the full stored column grid, sorted and
+    unique.  `basis` names how they were chosen; `STORED_COLUMN_DOMAIN` is the
+    unrestricted substrate and is the only basis that may be read as universal.
+    """
+
+    basis: str
+    column_indices: np.ndarray
+    full_stored_columns: int
+    restriction_source: str | None = None
+    restriction_note: str | None = None
+
+    def __post_init__(self) -> None:
+        indices = np.asarray(self.column_indices, dtype=np.int64)
+        if indices.ndim != 1:
+            raise ValueError("column_indices must be one-dimensional")
+        if indices.size and (indices.min() < 0 or indices.max() >= self.full_stored_columns):
+            raise ValueError("column_indices fall outside the stored column grid")
+        if np.any(np.diff(indices) <= 0):
+            raise ValueError("column_indices must be strictly increasing and unique")
+        object.__setattr__(self, "column_indices", indices)
+
+    @property
+    def is_complete(self) -> bool:
+        """True only when the domain is the whole stored acquisition grid."""
+        return len(self.column_indices) == self.full_stored_columns
+
+    @property
+    def position_of(self) -> np.ndarray:
+        """Full-grid column index -> position in this domain, or -1 if absent."""
+        answer = np.full(self.full_stored_columns, -1, dtype=np.int64)
+        answer[self.column_indices] = np.arange(len(self.column_indices), dtype=np.int64)
+        return answer
+
+    def covers(self, wanted: Iterable[int]) -> np.ndarray:
+        wanted = np.asarray(list(wanted), dtype=np.int64)
+        return self.position_of[wanted] >= 0 if wanted.size else np.zeros(0, dtype=bool)
+
+    def banner(self) -> str:
+        if self.is_complete:
+            return (f"COLUMN DOMAIN COMPLETE — all {self.full_stored_columns} stored "
+                    f"(delta, Delta, b) columns")
+        return (f"COLUMN DOMAIN RESTRICTED — {len(self.column_indices)} of "
+                f"{self.full_stored_columns} stored columns, basis={self.basis!r}. "
+                "This artifact is NOT a universal substrate; downstream results "
+                "conditioned on columns it omits are unavailable, not zero.")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "basis": self.basis,
+            "is_complete_stored_grid": bool(self.is_complete),
+            "columns": int(len(self.column_indices)),
+            "full_stored_columns": int(self.full_stored_columns),
+            "restriction_source": self.restriction_source,
+            "restriction_note": self.restriction_note,
+            "declares": ("reusable model-derived substrate; no hardware, acquisition or "
+                         "trust mask applied" if self.is_complete else
+                         "RESTRICTED; a conditional mask was applied at extraction time"),
+        }
+
+
+def stored_column_domain(full_stored_columns: int) -> ColumnDomain:
+    """The unrestricted substrate: every stored acquisition column."""
+    return ColumnDomain(basis=STORED_COLUMN_DOMAIN,
+                        column_indices=np.arange(int(full_stored_columns), dtype=np.int64),
+                        full_stored_columns=int(full_stored_columns))
+
+
+def read_column_domain(manifest: dict[str, Any]) -> ColumnDomain:
+    """Recover the declared domain from a Phase-1 manifest, old or new.
+
+    A manifest written before 2026-09-06 carries no declaration.  Rather than
+    assume it was universal -- which is exactly the failure this contract
+    exists to prevent -- it is reported as `LEGACY_COLUMN_DOMAIN`, so the
+    guards below treat it as restricted unless it happens to hold every column.
+    """
+    block = manifest.get("column_domain")
+    selection = manifest.get("column_selection", {})
+    indices = np.asarray(selection.get("selected_full_column_indices", []), dtype=np.int64)
+    full = int(selection.get("full_stored_columns", len(indices)))
+    if block is None:
+        return ColumnDomain(basis=LEGACY_COLUMN_DOMAIN, column_indices=indices,
+                            full_stored_columns=full,
+                            restriction_source=manifest.get("feasibility"),
+                            restriction_note=("manifest predates the column-domain contract; "
+                                              "its basis is not declared and is not assumed universal"))
+    return ColumnDomain(basis=str(block["basis"]), column_indices=indices,
+                        full_stored_columns=int(block.get("full_stored_columns", full)),
+                        restriction_source=block.get("restriction_source"),
+                        restriction_note=block.get("restriction_note"))
+
+
+def require_columns(domain: ColumnDomain, wanted: Iterable[int], purpose: str,
+                    delta: np.ndarray | None = None, Delta: np.ndarray | None = None,
+                    b: np.ndarray | None = None) -> np.ndarray:
+    """Positions of `wanted` inside `domain`, refusing any silent omission.
+
+    This is the incomplete-cache guard.  Downstream code that quietly drops the
+    columns a cache happens not to hold would report a conditional analysis of a
+    smaller acquisition under the name of the one that was asked for, which is
+    the defect this contract exists to prevent.
+    """
+    wanted = np.asarray(list(wanted), dtype=np.int64)
+    positions = domain.position_of[wanted] if wanted.size else np.zeros(0, dtype=np.int64)
+    missing = wanted[positions < 0] if wanted.size else wanted
+    if missing.size:
+        detail = ""
+        if delta is not None and Delta is not None and b is not None:
+            head = missing[:5]
+            detail = "; first missing (delta, Delta, b) = " + ", ".join(
+                f"({float(delta[i]):g}, {float(Delta[i]):g}, {float(b[i]):g})" for i in head)
+        raise ValueError(
+            f"{purpose}: {missing.size} of {wanted.size} requested stored columns are absent "
+            f"from this artifact's column domain (basis={domain.basis!r}, "
+            f"{len(domain.column_indices)}/{domain.full_stored_columns} columns){detail}. "
+            "Rebuild the substrate over the full stored grid rather than reinterpreting "
+            "a restricted cache as universal."
+        )
+    return positions
+
+
+def gradient_feasible_columns(delta_ms: np.ndarray, Delta_ms: np.ndarray, b_s_mm2: np.ndarray,
+                              G_max: float) -> np.ndarray:
+    """Full-grid indices of columns achievable at a stated gradient ceiling.
+
+    A CONDITIONAL quantity: it answers "which stored columns could this scanner
+    play", not "which columns does the model describe".  It is the authoritative
+    reconstruction of the hardware mask from the unrestricted substrate, so
+    Phase 0.4 and every later conditional analysis call this one function.
+    """
+    return np.flatnonzero(gradient_strength_t_per_m(delta_ms, Delta_ms, b_s_mm2) <= float(G_max))
 
 
 def fisher_matrix(J: np.ndarray, sigma: np.ndarray | float, variance: np.ndarray | None = None,
@@ -591,3 +776,262 @@ def derivative_variance(signal_variance_minus: np.ndarray, signal_variance_plus:
                      (ensemble_plus - ensemble_plus.mean(axis=0)), axis=0) / (n_ensembles - 1)
         answer = answer - 2.0 * cov / n_ensembles
     return np.maximum(answer, 0.0) / denominator ** 2
+
+
+# ---------------------------------------------------------------------------
+# Nuisance amplitude (S0) -- adopted 2026-09-05 from the marginal-S0 handoff
+# ---------------------------------------------------------------------------
+#
+# The Fisher primitives above treat the library's normalized S/S0 curve as the
+# forward model, which silently asserts that the amplitude S0 is known exactly.
+# No real acquisition knows it exactly.  Modelling the measurement as
+#
+#     m_c = a * S_c(theta) + eps_c ,   eps_c ~ N(0, sigma_c^2)
+#
+# with amplitude `a = S0` promotes S0 to a fourth, unwanted ("nuisance")
+# parameter.  Writing the augmented information matrix in blocks,
+#
+#     F_full = [ F_tt   F_ta ]      F_tt = a^2 sum_c J_cj J_ck / sigma_c^2
+#              [ F_at   F_aa ]      F_ta = a   sum_c J_cj S_c  / sigma_c^2
+#                                   F_aa =     sum_c S_c^2     / sigma_c^2 + lambda
+#
+# the bound on theta alone is the Schur complement
+#
+#     F_eff = F_tt - F_ta F_aa^-1 F_at .
+#
+# `lambda >= 0` is an independent Gaussian prior precision on the amplitude and
+# selects the three regimes named in the handoff:
+#
+#     lambda = 0        amplitude entirely unknown (weakest bound)
+#     lambda = n0_eff/sigma0^2   amplitude measured with finite precision
+#     lambda -> infinity         amplitude known exactly; F_eff -> F_tt
+#
+# F_ta F_aa^-1 F_at is a rank-one positive-semidefinite outer product, so
+# F_eff <= F_tt in the Loewner order for every lambda: marginalizing over an
+# unknown amplitude can only lose information, never add it.  The gap between
+# the two bounds is reported as its own quantity because it measures how much
+# identifiability is spent on amplitude uncertainty alone, with no reference to
+# any particular fitter.
+#
+# Monte-Carlo debiasing convention.  Only the F_tt diagonal is debiased, exactly
+# as `fisher_matrix` already does, because E[J_hat^2] = J^2 + Var(J_hat) is a
+# first-order bias that does not cancel.  F_ta is left uncorrected for the same
+# reason the cross-axis off-diagonals are: J_hat is the difference of the two
+# stencil endpoints, so under common random numbers
+# Cov(J_hat, S_centre) = [Cov(S+, S_c) - Cov(S-, S_c)] / h, and the two
+# covariances are similar in size and opposite in sign, leaving a residual far
+# below the diagonal bias this correction exists to remove.
+
+
+def amplitude_prior_precision(n0_eff: float, sigma_reference: float,
+                              reference_signal: float = 1.0) -> float:
+    """Gaussian prior precision on `S0` contributed by a low-b reference shell.
+
+    A true `b = 0` reference measured with `n0_eff` effective averages at noise
+    `sigma_reference` pins the amplitude with precision `n0_eff/sigma^2`, since
+    the normalized signal there is exactly one.
+
+    An acquisition whose lowest shell is `b = b_ref > 0` -- the Jackson-thesis
+    structure, whose lowest shell is `b = 50 s/mm2` -- has no such column.
+    Using that shell as the normalizer asserts `S(b_ref) = 1` and supplies
+    amplitude precision `n0_eff * S(b_ref)^2 / sigma^2` while discarding the
+    shell's tissue-derivative content.  Pass the realized `S(b_ref)` as
+    ``reference_signal`` to model that.  The information deliberately dropped
+    by the collapse is the difference between this prior treatment and simply
+    retaining `b_ref` as an ordinary column, which is the quantity Phase 4
+    hypothesis H4 is about.
+    """
+    if n0_eff < 0:
+        raise ValueError("n0_eff must be non-negative")
+    if sigma_reference <= 0:
+        raise ValueError("sigma_reference must be positive")
+    return float(n0_eff) * float(reference_signal) ** 2 / float(sigma_reference) ** 2
+
+
+def amplitude_marginal_fisher(J: np.ndarray, signal: np.ndarray,
+                              sigma: np.ndarray | float, *,
+                              amplitude: float = 1.0,
+                              variance: np.ndarray | None = None,
+                              measurement_mask: np.ndarray | None = None,
+                              s0_prior_precision: float = 0.0) -> dict[str, Any]:
+    """Fixed-S0 and S0-marginalized Fisher matrices for one node.
+
+    Parameters
+    ----------
+    J : (columns, parameters) Jacobian of the normalized signal.
+    signal : (columns,) normalized signal `S/S0` at the same node and columns.
+    sigma : scalar or (columns,) noise standard deviation of `m_c`.
+    amplitude : the amplitude `a = S0` the acquisition actually carries.
+    variance : optional (columns, parameters) `Var(J_hat)` for diagonal
+        debiasing, as in `fisher_matrix`.
+    s0_prior_precision : `lambda >= 0`; use `amplitude_prior_precision`.
+
+    Returns a dict holding both bounds and the gap between them.
+    """
+    J = np.asarray(J, dtype=float)
+    signal = np.asarray(signal, dtype=float)
+    if J.ndim != 2:
+        raise ValueError("J must be (columns, parameters)")
+    if signal.shape != (J.shape[0],):
+        raise ValueError("signal must have one value per J row")
+    if s0_prior_precision < 0:
+        raise ValueError("s0_prior_precision must be non-negative")
+    sigma = np.broadcast_to(np.asarray(sigma, dtype=float), (J.shape[0],))
+    if measurement_mask is not None:
+        keep = np.asarray(measurement_mask, dtype=bool)
+        if keep.shape != (J.shape[0],):
+            raise ValueError("measurement_mask must have one boolean per column")
+        J, signal, sigma = J[keep], signal[keep], sigma[keep]
+        if variance is not None:
+            variance = np.asarray(variance)[keep]
+
+    a = float(amplitude)
+    # Reuse the audited debiasing path, then scale into amplitude units.  The
+    # Jacobian of the *measurement* is a*J, so F_tt carries a^2.
+    F_tt = a ** 2 * fisher_matrix(J, sigma, variance)
+    F_ta = a * (J / sigma[:, None] ** 2).T @ signal
+    F_aa = float(np.sum(signal ** 2 / sigma ** 2)) + float(s0_prior_precision)
+
+    if F_aa > 0:
+        correction = np.outer(F_ta, F_ta) / F_aa
+    else:
+        # No column and no prior constrains the amplitude at all; theta is then
+        # unidentifiable in any direction that F_ta touches.  Report it rather
+        # than silently returning the fixed-S0 answer.
+        correction = np.full_like(F_tt, np.inf)
+    F_eff = F_tt - correction
+
+    loewner = np.linalg.eigvalsh(correction) if np.all(np.isfinite(correction)) else np.full(J.shape[1], np.inf)
+    return {
+        "F_fixed_s0": F_tt,
+        "F_theta_s0": F_ta,
+        "F_s0_s0": F_aa,
+        "F_marginal_s0": F_eff,
+        "information_lost_to_amplitude": correction,
+        "loewner_gap_eigenvalues": loewner,
+        "loewner_ok": bool(np.all(loewner >= -1e-9 * max(1.0, float(np.max(np.abs(F_tt)))))),
+        "s0_prior_precision": float(s0_prior_precision),
+        "amplitude": a,
+    }
+
+
+def amplitude_marginal_diagnostics(result: dict[str, Any], kio_ref: float) -> dict[str, Any]:
+    """Fixed-S0 and marginalized CRLB/kappa diagnostics plus their gap.
+
+    ``crlb_ratio`` is the per-parameter factor by which the achievable standard
+    deviation grows once the amplitude is treated as unknown.  It is >= 1
+    whenever both matrices invert, and is the headline "cost of not knowing
+    S0" number.
+    """
+    fixed = fisher_diagnostics(result["F_fixed_s0"], kio_ref)
+    marginal = fisher_diagnostics(result["F_marginal_s0"], kio_ref)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.divide(marginal["crlb"], fixed["crlb"],
+                          out=np.full(len(PARAMETER_ORDER), np.inf, dtype=float),
+                          where=fixed["crlb"] > 0)
+    return {
+        "parameter_order": list(PARAMETER_ORDER),
+        "fixed_s0": fixed,
+        "marginal_s0": marginal,
+        "crlb_ratio_marginal_over_fixed": ratio,
+        "loewner_ok": result["loewner_ok"],
+        "s0_prior_precision": result["s0_prior_precision"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Packed batched Fisher algebra -- added 2026-09-05 for Phase 2
+# ---------------------------------------------------------------------------
+#
+# Phase 2 evaluates on the order of 10^5 candidate acquisitions at ~10^4 grid
+# nodes each, so it needs the 3x3 inverse diagonal for millions of matrices at
+# once.  `fisher_diagnostics` calls `np.linalg.inv` on one matrix and is the
+# readable reference; these functions are its vectorized form and are pinned to
+# it by test, rather than being a second implementation left to drift.
+#
+# A symmetric 3x3 Fisher matrix is carried "packed" as its six independent
+# entries in PARAMETER_ORDER = (log rho, log V, k_io):
+#
+#     packed = [F_rr, F_rV, F_rk, F_VV, F_Vk, F_kk]
+#
+# so that a batch of matrices is an array of shape (..., 6) and accumulating
+# information over acquisition columns is a plain sum along an axis.
+
+FISHER_PACKED_ORDER = ("rho_rho", "rho_V", "rho_kio", "V_V", "V_kio", "kio_kio")
+_PACKED_DIAGONAL = (0, 3, 5)
+
+
+def pack_fisher(F: np.ndarray) -> np.ndarray:
+    """Pack a (..., 3, 3) symmetric matrix into its six independent entries."""
+    F = np.asarray(F, dtype=float)
+    if F.shape[-2:] != (3, 3):
+        raise ValueError("F must be (..., 3, 3)")
+    return np.stack([F[..., 0, 0], F[..., 0, 1], F[..., 0, 2],
+                     F[..., 1, 1], F[..., 1, 2], F[..., 2, 2]], axis=-1)
+
+
+def unpack_fisher(packed: np.ndarray) -> np.ndarray:
+    """Expand (..., 6) packed entries back to a (..., 3, 3) symmetric matrix."""
+    packed = np.asarray(packed, dtype=float)
+    if packed.shape[-1] != 6:
+        raise ValueError("packed Fisher must have a trailing axis of length 6")
+    a, b, c, d, e, f = (packed[..., i] for i in range(6))
+    return np.stack([np.stack([a, b, c], axis=-1),
+                     np.stack([b, d, e], axis=-1),
+                     np.stack([c, e, f], axis=-1)], axis=-2)
+
+
+def packed_inverse_diagonal(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return `([F^-1]_jj, det F, positive_definite)` for a batch of packed matrices.
+
+    The diagonal of the inverse is the cofactor ratio, so it needs no matrix
+    inversion.  `positive_definite` is the leading-minor (Sylvester) test
+    STRENGTHENED to require all three cofactors positive as well, which is the
+    same thing as requiring every entry of the inverse diagonal to be positive.
+
+    Sylvester's three leading minors already imply positive cofactors for an
+    exactly positive-definite matrix, so the extra conditions are redundant in
+    arithmetic but not in floating point: a Fisher matrix near the boundary can
+    pass the leading-minor test and still return a non-positive cofactor ratio,
+    which would be reported as a NaN CRLB rather than as an unidentified node.
+    Requiring what the CRLB actually needs -- a positive inverse diagonal --
+    makes the test self-consistent, and is strictly conservative.
+
+    A matrix that fails is reported rather than silently inverted, because the
+    Monte-Carlo diagonal debias can push a weakly determined node indefinite and
+    the resulting "CRLB" would be meaningless.
+    """
+    packed = np.asarray(packed, dtype=float)
+    a, b, c, d, e, f = (packed[..., i] for i in range(6))
+    cof_a = d * f - e * e
+    cof_d = a * f - c * c
+    cof_f = a * d - b * b
+    det = a * cof_a - b * (b * f - c * e) + c * (b * e - c * d)
+    positive = (a > 0) & (cof_a > 0) & (cof_d > 0) & (cof_f > 0) & (det > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inverse_diagonal = np.stack([cof_a / det, cof_d / det, cof_f / det], axis=-1)
+    inverse_diagonal = np.where(positive[..., None], inverse_diagonal, np.nan)
+    return inverse_diagonal, det, positive
+
+
+def packed_amplitude_marginal(packed_tt: np.ndarray, F_theta_s0: np.ndarray,
+                              F_s0_s0: np.ndarray,
+                              s0_prior_precision: np.ndarray | float = 0.0) -> np.ndarray:
+    """Batched Schur complement `F_tt - F_ta (F_aa + lambda)^-1 F_at`, packed.
+
+    `lambda = inf` returns `packed_tt` unchanged, which is the known-amplitude
+    limit.  See `amplitude_marginal_fisher` for the single-node reference and
+    the derivation.
+    """
+    packed_tt = np.asarray(packed_tt, dtype=float)
+    F_theta_s0 = np.asarray(F_theta_s0, dtype=float)
+    if F_theta_s0.shape[-1] != 3:
+        raise ValueError("F_theta_s0 must have a trailing axis of length 3")
+    prior = np.asarray(s0_prior_precision, dtype=float)
+    denominator = np.asarray(F_s0_s0, dtype=float) + prior
+    t0, t1, t2 = F_theta_s0[..., 0], F_theta_s0[..., 1], F_theta_s0[..., 2]
+    outer = np.stack([t0 * t0, t0 * t1, t0 * t2, t1 * t1, t1 * t2, t2 * t2], axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correction = outer / denominator[..., None]
+    correction = np.where(np.isfinite(correction), correction, 0.0)
+    return packed_tt - correction

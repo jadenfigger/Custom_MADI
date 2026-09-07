@@ -2,7 +2,7 @@
 
 This is the authoritative record for differences between this implementation
 and Springer *et al.*  It is intentionally separate from the historical
-`physics_fidelity_audit.md`, whose pre-SI findings about realized-ensemble
+[`physics_fidelity_audit.md`](provenance/physics_fidelity_audit.md), whose pre-SI findings about realized-ensemble
 `<A/V>` and residence-time `k_io` labels are superseded by the MADI I
 supporting information.
 
@@ -40,8 +40,18 @@ Primary sources:
   atom.
 - **Why:** topology is a numerical estimator choice, not forward physics;
   the weights prevent Bayesian grid-density bias.
-- **Quantified consequence:** the actual spacing is stored with each build;
-  no remediated production artifact exists yet.
+- **Quantified consequence:** the actual spacing is stored with each build.
+  The remediated production artifact now exists and is complete:
+  `data/libraries/madi_dense_universal_remediated.npz`, 369 canonical `(rho, V)`
+  groups on the 64x64 uniform-log grid masked to `0.40 <= rho*V*1e-6 <= 0.99`,
+  each crossed with the 51-value `k_io` grid, plus one free-water atom
+  (18,820 entries x 31,125 stored `(delta, Delta, b)` columns), built at
+  50,000 walkers x 40 ensembles x 3 harvested axes per entry.  Its canonical
+  node spacings are `ln(rho[i+1]/rho[i]) = 0.10964690919` and
+  `ln(V[j+1]/V[j]) = 0.15719821512`.  Verification, free-water gates, and
+  per-entry feasibility for that artifact are recorded in
+  [`fisher_phase01_framework.md`](fisher_phase01_framework.md)
+  (amendment `2026-09-05-complete-artifact`).
 - **Published MADI values comparable:** not entry-for-entry.
 - **Status:** deliberate improvement.
 
@@ -192,3 +202,25 @@ Primary sources:
 - MADI I and II disagree on pmol versus fmol scale for the same NKA example.
 - MADI III prints an ADC expression with multiplication by `b` where units
   require division.
+
+---
+
+## Amendment log
+
+Changes to this ledger record what the document previously asserted, what it
+asserts now, and why, so a reader can reconstruct a decision without diffing
+git history by hand.  Nothing is deleted; superseded wording is quoted here.
+
+### 2026-09-05 -- the remediated production artifact now exists
+
+- **Previously:** under "Dense masked log-coordinate grid", the quantified
+  consequence read *"the actual spacing is stored with each build; no
+  remediated production artifact exists yet."*
+- **Now:** that clause is replaced by the completed artifact's identity,
+  dimensions, build allocation, and canonical node spacings, with a pointer to
+  its verification record.
+- **Why:** shard 45 landed and the 369-group merge was verified complete
+  (`grid_complete: true`, zero missing groups, zero duplicate or extra groups),
+  so the statement was false.  It was flagged as stale in
+  [`INDEX.md`](INDEX.md) and in the Phase-0/1 framework's documentation
+  reconciliation; this closes it.

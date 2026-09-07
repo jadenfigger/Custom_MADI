@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Report Phase-0.4 column feasibility masks for a v5 MADI artifact."""
+"""Report Phase-0.4 column feasibility masks for a v5 MADI artifact.
+
+Everything here is a CONDITIONAL acquisition quantity: it depends on a declared
+gradient ceiling, TE/T2 noise model, averaging allocation and trust floor.  The
+report is an annotation over the stored acquisition grid and an input to later
+conditional analyses.  It is **not** an extraction filter, and since 2026-09-06
+nothing consumes it as one -- see the `analysis_domain_architecture` block of
+the pre-registration and docs/fisher_domain_audit.md.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,8 +17,8 @@ from pathlib import Path
 import numpy as np
 
 from madi.fisher_crlb import (artifact_manifest, assert_safe_output, column_arrays,
-                               feasibility_masks, incomplete_banner, iter_npz_array_chunks,
-                               load_preregistration)
+                               feasibility_masks, gradient_feasible_columns, incomplete_banner,
+                               iter_npz_array_chunks, load_preregistration)
 
 
 def main() -> int:
@@ -19,10 +27,18 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--snr", type=float, default=50.0,
                         help="b=0 magnitude SNR; sigma0=1/SNR")
-    parser.add_argument("--T2-ms", type=float, default=80.0)
-    parser.add_argument("--t-epi-ms", type=float, default=0.0)
+    # T2 and the EPI readout overhead default to the pre-registered noise model
+    # rather than to a second copy of those numbers held here, so that amending
+    # the pre-registration cannot silently leave this tool on a stale value.
+    parser.add_argument("--T2-ms", type=float, default=None)
+    parser.add_argument("--t-epi-ms", type=float, default=None,
+                        help="TE overhead beyond delta+Delta; pre-registered default")
     args = parser.parse_args()
     preregistration = load_preregistration()
+    if args.T2_ms is None:
+        args.T2_ms = float(preregistration["noise_model"]["T2_ms"])
+    if args.t_epi_ms is None:
+        args.t_epi_ms = float(preregistration["noise_model"]["t_epi_ms"])
     with np.load(args.artifact, allow_pickle=False) as data:
         manifest = artifact_manifest(data)
         assert_safe_output(args.output, manifest)
@@ -76,15 +92,27 @@ def main() -> int:
                     "max": int(np.max(counts)),
                 },
             }
+            results[name]["gradient_feasible_column_indices"] = gradient_feasible_columns(
+                delta, Delta, b, preregistration["gradient_limits_T_per_m"][name]).astype(int).tolist()
+            results[name]["combined_any_entry_column_indices"] = np.flatnonzero(
+                item["combined_any"]).astype(int).tolist()
             if name == "research":
                 derivative_selection = np.flatnonzero(item["combined_any"]).astype(int).tolist()
-        report = {"schema": "madi-fisher-column-feasibility-v1", "artifact": str(args.artifact),
+        report = {"schema": "madi-fisher-column-feasibility-v2", "artifact": str(args.artifact),
                   "banner": incomplete_banner(manifest), **manifest.as_dict(),
                   "columns": int(len(b)), "snr_at_b0": args.snr, "T2_ms": args.T2_ms,
                   "t_epi_ms": args.t_epi_ms, "trust_floor_rule": "per_entry_inside_fisher_sum",
                   "global_minimum_rule": "diagnostic_only_not_used_for_fisher",
+                  "role": ("CONDITIONAL acquisition annotation over the stored column grid. "
+                           "None of these masks selects which columns are extracted or cached; "
+                           "the reusable Fisher substrate spans every stored column."),
                   "counts": results,
                   "derivative_column_selection": {
+                      "status": ("DEPRECATED 2026-09-06. Phase 1 no longer consumes this key as an "
+                                 "extraction filter; it selected the substrate by an unrequested "
+                                 "300 mT/m scanner ceiling. Retained so the historical restricted "
+                                 "Phase-1 basis stays reproducible via "
+                                 "run_fisher_phase1 --restrict-columns-to-feasibility."),
                       "basis": "research combined mask, any cellular entry; diagnostic columns are added by Phase 1",
                       "column_indices": derivative_selection,
                       "count": len(derivative_selection or []),
@@ -92,7 +120,11 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(report["banner"])
-    print(json.dumps(report["counts"], indent=2))
+    # The per-scenario index lists are the reusable machine-readable part; they
+    # are far too long to print, so the console summary omits them.
+    print(json.dumps({name: {key: value for key, value in item.items()
+                             if not key.endswith("column_indices")}
+                      for name, item in report["counts"].items()}, indent=2))
     return 0
 
 

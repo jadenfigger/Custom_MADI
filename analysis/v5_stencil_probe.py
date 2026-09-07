@@ -45,6 +45,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 if str(ANALYSIS_DIR) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_DIR))
 
+from madi.fisher_crlb import derivative_variance as audited_derivative_variance  # noqa: E402
 from scripts.validate_v5_stencil_probe import ProbeDefinition, load_probe_definition  # noqa: E402
 from v5_crn_diagnostic import (  # noqa: E402
     Artifact,
@@ -386,6 +387,11 @@ def declared_topology(
                 "context": (float(kio), float(definition.Vs[j0])),
                 "width": width,
                 "h1": definition.rho_step,
+                # Realised endpoint labels in the differencing coordinate.  The
+                # denominator is taken from these rather than from 2*k*h1 so the
+                # stencil cannot silently assume uniform spacing.
+                "left_coordinate": math.log(float(definition.rhos[i0 - width])),
+                "right_coordinate": math.log(float(definition.rhos[i0 + width])),
             }
             record_stencil("rho", width, keys, record)
 
@@ -409,6 +415,11 @@ def declared_topology(
                 "context": (float(kio), float(definition.rhos[i0])),
                 "width": width,
                 "h1": definition.V_step,
+                # Realised endpoint labels in the differencing coordinate.  The
+                # denominator is taken from these rather than from 2*k*h1 so the
+                # stencil cannot silently assume uniform spacing.
+                "left_coordinate": math.log(float(definition.Vs[j0 - width])),
+                "right_coordinate": math.log(float(definition.Vs[j0 + width])),
             }
             record_stencil("V", width, keys, record)
 
@@ -431,6 +442,13 @@ def declared_topology(
             "context": (float(definition.rhos[i]), float(definition.Vs[j])),
             "width": 1,
             "h1": 1.0,
+            # k_io is the axis whose production grid is NOT uniform (1 s^-1 to
+            # 30, then 5 s^-1 to 130).  h1 = 1.0 is only correct because
+            # scripts.validate_v5_stencil_probe pins KIO_VALUES to (19, 20, 21),
+            # inside the fine region.  Carry the realised labels so the
+            # denominator stays right if that declaration ever changes.
+            "left_coordinate": float(definition.kio_values[0]),
+            "right_coordinate": float(definition.kio_values[-1]),
         }
         record_stencil("k_io", 1, keys, record)
 
@@ -508,15 +526,46 @@ def _covariance_of_entry_means(artifact: Artifact, left: int, right: int) -> np.
     return covariance_ensemble[0] / float(artifact.n_ensembles)
 
 
+def _stencil_denominator(record: dict[str, Any]) -> float:
+    """Total central-difference step, taken from the realised endpoint labels.
+
+    ``2 * k * h1`` is only equal to this on a uniformly spaced axis.  It holds
+    for ``rho`` and ``V``, whose production grids are uniform in log, and for
+    the declared ``k_io`` triple (19, 20, 21), which sits inside the 1 s^-1
+    region -- but not for a ``k_io`` stencil crossing the 30 s^-1 boundary
+    where the spacing becomes 5 s^-1.  Computing from the labels makes the
+    stencil correct by construction instead of correct by declaration, and the
+    equality against the nominal form is asserted so a grid change is loud.
+    """
+    denominator = float(record["right_coordinate"]) - float(record["left_coordinate"])
+    nominal = 2.0 * int(record["width"]) * float(record["h1"])
+    if denominator <= 0.0:
+        raise DiagnosticError(
+            f"ABORT: non-positive realised stencil denominator {denominator!r}; endpoint labels are out of order."
+        )
+    if not math.isclose(denominator, nominal, rel_tol=1.0e-9, abs_tol=0.0):
+        raise DiagnosticError(
+            "ABORT: realised stencil spacing disagrees with the declared uniform step "
+            f"({denominator!r} vs {nominal!r}); the declared axis grid is no longer uniform."
+        )
+    return denominator
+
+
 def compute_beta(
     artifact: Artifact,
     stencils: dict[str, dict[int, list[dict[str, Any]]]],
 ) -> dict[str, dict[int, dict[str, Any]]]:
     """Compute unprojected production-configuration beta on all declared stencils."""
     vectors = artifact.arrays["vectors"][:, artifact.subset_indices].astype(np.float64, copy=False)
-    variance = artifact.arrays["signal_variance"][:, artifact.subset_indices].astype(
+    raw_variance = artifact.arrays["signal_variance"][:, artifact.subset_indices].astype(
         np.float64, copy=False
-    ) / float(artifact.n_ensembles)
+    )
+    ensemble_means = artifact.arrays["ensemble_means_subset"].astype(np.float64, copy=False)
+    # `variance` is the variance of an entry MEAN, i.e. signal_variance divided
+    # by n_ensembles.  It is retained only for the materially-negative guard
+    # below, which needs the unclipped numerator that the audited helper
+    # deliberately clips at zero.
+    variance = raw_variance / float(artifact.n_ensembles)
     output: dict[str, dict[int, dict[str, Any]]] = {}
     for axis in AXES:
         axis_output: dict[int, dict[str, Any]] = {}
@@ -528,7 +577,7 @@ def compute_beta(
             for record in records:
                 left = int(record["left_index"])
                 right = int(record["right_index"])
-                denominator = 2.0 * int(width) * float(record["h1"])
+                denominator = _stencil_denominator(record)
                 derivative = (vectors[right] - vectors[left]) / denominator
                 covariance = _covariance_of_entry_means(artifact, left, right)
                 numerator = variance[left] + variance[right] - 2.0 * covariance
@@ -542,7 +591,16 @@ def compute_beta(
                         "ABORT: central-difference variance is materially negative; paired covariance or "
                         f"subset indexing is inconsistent (axis={axis}, k={width}, column={worst})."
                     )
-                derivative_variance = np.maximum(numerator, 0.0) / denominator**2
+                # Single source of truth: madi.fisher_crlb.derivative_variance.
+                # This file previously recomputed the same expression inline,
+                # which is the pattern that produced the Phase-1 Var(J_hat)
+                # normalization defect in scripts/run_fisher_phase1.py.  The
+                # local `numerator` above survives only as the guard's input.
+                derivative_variance = audited_derivative_variance(
+                    raw_variance[left], raw_variance[right],
+                    ensemble_means[left], ensemble_means[right],
+                    denominator, artifact.n_ensembles,
+                )
                 beta = np.full_like(derivative, np.nan)
                 nonzero_derivative = derivative != 0.0
                 beta[nonzero_derivative] = (

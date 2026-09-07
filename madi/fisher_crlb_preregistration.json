@@ -1,23 +1,382 @@
 {
-  "schema": "madi-fisher-crlb-preregistration-v1",
-  "parameter_order": ["log_rho", "log_V", "k_io"],
-  "stencil_half_widths": {"rho": [1, 2, 3, 4], "V": [1, 2], "k_io": [1]},
-  "snr_levels": [20, 50, 100],
+  "schema": "madi-fisher-crlb-preregistration-v2",
+  "parameter_order": [
+    "log_rho",
+    "log_V",
+    "k_io"
+  ],
+  "stencil_half_widths": {
+    "rho": [
+      1,
+      2
+    ],
+    "V": [
+      1,
+      2
+    ],
+    "k_io": [
+      1
+    ]
+  },
+  "snr_levels": [
+    20,
+    50,
+    100
+  ],
   "kappa_unidentified_threshold": 10.0,
   "trust_floor": 0.015,
   "rician_magnitude_snr_min": 3.0,
-  "gradient_limits_T_per_m": {"clinical": 0.08, "research": 0.3},
-  "noise_model": {"T2_ms": 80.0, "t_epi_ms": 0.0, "averages_per_column": 1},
-  "protocols": {
-    "madi_ii": {"delta_ms": 20.0, "Delta_ms": 50.0},
-    "madi_iii": {"delta_ms": 7.0, "Delta_ms": 25.0},
-    "jackson_thesis": {"status": "requires_source_timing_confirmation"},
+  "gradient_limits_T_per_m": {
+    "clinical": 0.08,
+    "research": 0.3
+  },
+  "analysis_domain_architecture": {
+    "status": "adopted 2026-09-06; see amendment_log entry 2026-09-06-substrate-domain and docs/fisher_domain_audit.md",
+    "rule": "Preserve and analyse the full domain supplied by the validated forward model/library unless an exclusion is inherent to the validated model, mathematically required for the requested analysis, or explicitly approved as part of the scientific question. Downstream feasibility quantities may be calculated and retained as metadata without censoring the reusable upstream analysis substrate.",
+    "reusable_substrate": {
+      "contents": [
+        "stored signal S",
+        "central-difference Jacobians J",
+        "derivative variance Var(J_hat) and its CRN covariance",
+        "Richardson truncation-bias fields"
+      ],
+      "depends_on": "the validated library alone",
+      "column_domain": "every stored (delta, Delta, b) column: 1,245 timing pairs x 25 b values = 31,125",
+      "produced_by": "scripts/run_fisher_phase1.py and scripts/build_fisher_phase2_cache.py",
+      "declared_by": "madi.fisher_crlb.ColumnDomain, recorded in every manifest as column_domain"
+    },
+    "conditional_analysis": {
+      "contents": [
+        "gradient feasibility at a chosen G_max",
+        "TE/T2 measurement noise",
+        "Rician validity at a chosen averaging",
+        "the S/S0 trust floor",
+        "the image budget N",
+        "protocol optimisation",
+        "estimator efficiency"
+      ],
+      "depends_on": "a DECLARED scanner and acquisition, named in the result",
+      "applied_at": "evaluation time only: Phase 2 and later, plus scripts/analyze_fisher_feasibility.py as an annotation",
+      "may": "annotate, stratify, report, and mask a declared Fisher sum",
+      "may_not": "decide whether a stored column is extracted or cached. Doing so makes the modelled information unrecoverable at any other setting without regenerating the substrate."
+    },
+    "guards": {
+      "domain_declaration": "every cache and report carries column_domain; a manifest without one is treated as restricted, never assumed universal",
+      "incomplete_cache": "madi.fisher_crlb.require_columns raises when a declared conditional analysis asks for a column the substrate lacks, instead of silently scoring a smaller acquisition under the requested name",
+      "reconstruction": "madi.fisher_crlb.gradient_feasible_columns is the single authoritative reconstruction of a hardware mask from the unrestricted substrate",
+      "opt_in_restriction": "run_fisher_phase1 --restrict-columns-to-feasibility reproduces the pre-2026-09-06 basis deliberately and stamps the manifest RESTRICTED",
+      "tests": [
+        "test_a_hardware_profile_cannot_decide_what_the_substrate_contains",
+        "test_a_restricted_substrate_is_opt_in_stamped_and_refused_downstream",
+        "test_a_legacy_manifest_is_not_assumed_to_be_universal",
+        "test_the_conditional_gradient_mask_reconstructs_from_the_full_substrate",
+        "test_the_domain_mapping_preserves_canonical_column_identity",
+        "test_widening_the_column_domain_leaves_the_overlap_bit_identical"
+      ]
+    },
+    "representation_versus_domain": "a computational limit may change how the substrate is stored -- chunked, streamed, on demand -- but never which columns it represents. At full width the Phase-1 fields total 8.61 GiB and each Phase-2 cache member is 2.18 GiB, so no such limit binds for this library.",
+    "fidelity_caveats_are_annotations": "the rectangular-lobe (no gradient ramp) approximation is least accurate at delta = 1-3 ms (universal_library.md section 9). Those columns are labelled and retained; a fidelity caveat is never a reason to remove a stored column from the substrate."
+  },
+  "noise_model": {
+    "T2_ms": 80.0,
+    "t_epi_ms": 30.0,
+    "averages_per_column": 1
+  },
+  "amplitude_model": {
+    "status": "adopted 2026-09-05; see amendment_log entry 2026-09-05-s0-marginalization",
+    "rule": "every reported CRLB carries both a fixed-S0 and an S0-marginalized bound",
+    "marginalization": "Schur complement F_eff = F_tt - F_ta (F_aa)^-1 F_at",
+    "regimes": {
+      "known_amplitude": "s0_prior_precision -> infinity; F_eff = F_tt",
+      "finite_b0_precision": "s0_prior_precision = n0_eff * S(b_ref)^2 / sigma_ref^2",
+      "unknown_amplitude": "s0_prior_precision = 0"
+    },
+    "reported_gap": "crlb_ratio_marginal_over_fixed, per parameter; >= 1 by the Loewner ordering",
+    "phase5_requirement": "estimator efficiency for any --fit-s0 fitter run divides achieved RMSE by the S0-MARGINALIZED bound, never the fixed-S0 bound",
+    "phase4_requirement": "hypothesis H4 reuses this implementation rather than duplicating it",
+    "n0_eff_sweep": {
+      "status": "adopted 2026-09-05; see amendment_log entry 2026-09-05-n0-eff-sweep",
+      "values": [
+        0,
+        1,
+        2,
+        4,
+        8
+      ],
+      "meaning_of_zero": "the unknown-amplitude regime: no usable b~0 reference at all",
+      "plus": "the known-amplitude regime (lambda -> infinity) as the fixed-S0 limit",
+      "why": "n0_eff was a fixed assumption at 4 through Phase 0/1, where the amplitude penalty was already down to <= 0.4%. The whole penalty therefore disappears somewhere below 4, so the informative range is small and must be swept rather than assumed.",
+      "what_it_does_not_establish": "a VARIANCE statement only. It says nothing about a BIASED amplitude reference, which is the Jackson-thesis situation (lowest shell b=50, not 0, giving a systematic error of roughly 1 - exp(-50 D) on every point). Averaging reduces noise; it cannot reduce bias. That is Phase 4 hypothesis H4 and is flagged for it, not resolved in Phase 2."
+    }
+  },
+  "protocol_sweep": {
+    "status": "adopted 2026-09-05; replaces the three-named-protocol list; see amendment_log entry 2026-09-05-protocol-sweep",
+    "objective": "identify optimal realistic single-Delta and multi-Delta acquisitions across the feasible space, not to reproduce historical acquisitions",
+    "candidate_space": {
+      "source": "the library's own stored grid only; no interpolation and no fabricated columns",
+      "delta_ms": "1..30 by 1",
+      "Delta_ms": "1..50 by 1, then 55..80 by 5",
+      "constraint": "triangular, Delta >= delta",
+      "stored_pairs": 1245,
+      "b_values_s_mm2": "0..12000 by 500 (25 stored values)",
+      "feasibility_restriction": "the combined per-entry mask at the pre-registered noise model, reported separately for the clinical (80 mT/m) and research (300 mT/m) gradient scenarios",
+      "substrate_domain": "the sweep is evaluated against the unrestricted Phase-1 substrate, all 31,125 stored columns; feasibility_restriction below narrows the CANDIDATE acquisitions, not the substrate they are scored against"
+    },
+    "arm_definitions": {
+      "single_Delta": "one (delta, Delta) pair; the whole averaging budget is spent on the declared b-subset at that pair",
+      "multi_Delta": "m pairs with the budget split across them, m in {2, 3, 4}",
+      "m_justification": "m=2 is the smallest set that separates exchange from restriction by varying diffusion time at all; m<=4 keeps per-pair averaging high enough that the Rician-validity mask does not start deleting the high-b columns that carry the k_io signal at fixed N, and keeps the forward search tractable",
+      "matched_budget": "N = total acquired diffusion-weighted images (sum over selected columns of their averages) plus the declared reference images; every compared arm uses the same N",
+      "search_strategy": {
+        "status": "declared 2026-09-05 at execution; the declared sweep is not enumerable as written",
+        "m1": "exhaustive over every feasible (delta, Delta) pair",
+        "m2": "exhaustive over every unordered feasible pair-of-pairs",
+        "m3_m4": "greedy forward selection, adding one timing pair at a time to the exhaustive m=2 optimum",
+        "greedy_gap_control": "greedy m=2 (forward from the best m=1) is computed alongside exhaustive m=2, so the greedy optimality gap is measured on the one cardinality where both are available and reported rather than assumed for m=3 and m=4",
+        "multi_delta_b_subsets": "each pair contributes its own greedily selected b-subset of the declared size",
+        "matched_budget_identity": "with equal averaging across the selected columns, F = (N/n_selected) * sum_c u_c (J J^T - diag Var(J)) with u_c = 1/(sigma_1,c^2). The Fisher matrix is therefore linear in N. Protocol RANKING is NOT independent of N, however, because the Rician-validity mask depends on n_c = N/n_selected and so changes which columns are usable. An earlier revision of this entry claimed N-independence; that claim was wrong and is corrected here. Results are reported at a declared N with a sensitivity check.",
+        "b_subset_is_reselected_per_arm": "because the mask depends on n_c = N/(m * size), the b-subset, the pair sums and the masks are all rebuilt at each arm cardinality m rather than selected once at m=1 and reused under a mask that does not apply to them"
+      }
+    },
+    "b_subset_rule": {
+      "sizes": [
+        8,
+        12,
+        16
+      ],
+      "selection": "greedy forward selection from the empty set under the primary criterion",
+      "greedy_gap_control": "verified against exhaustive enumeration on a declared reduced subproblem (n_b <= 4 at a fixed pair) so the greedy optimality gap is bounded and reported, not assumed",
+      "why_not_exhaustive": "C(24,8) = 735471 subsets per timing pair times 1245 pairs is not enumerable; the rule is declared in advance so the search is not tuned after seeing results"
+    },
+    "criteria": {
+      "primary": "minimax relative CRLB: min over protocols of max over parameters of sqrt([F^-1]_jj)/theta_j",
+      "secondary": [
+        "A-optimality: minimize tr(W F^-1 W)",
+        "D-optimality: maximize det F"
+      ],
+      "bound_used": "the S0-marginalized bound wherever the modeled acquisition fits S0; the fixed-S0 bound is reported alongside, never substituted for it",
+      "relative_scale_for_k_io": {
+        "denominator": "max(k_io_node, k_io_floor)",
+        "k_io_floor_s^-1": 5.0,
+        "why": "k_io is a linear parameter whose grid reaches 1 s^-1, so an unfloored relative CRLB is dominated by the smallest-k_io node as an artifact of division, not of information content"
+      },
+      "aggregation": {
+        "status": "declared 2026-09-05 at execution; see amendment_log entry 2026-09-05-phase2-specification",
+        "relative_crlb_per_parameter": {
+          "log_rho": "sqrt([F^-1]_11); a log-parameter CRLB IS the fractional precision, so no division is applied",
+          "log_V": "sqrt([F^-1]_22); likewise",
+          "k_io": "sqrt([F^-1]_33) / max(k_io_node, k_io_floor)"
+        },
+        "order_of_operations": "per parameter, take the MEDIAN over the evaluation nodes, where a node at which F is not positive definite contributes +inf; then take the max over parameters. The pre-registered uniform MEAN is +inf for every candidate acquisition because every one of them has unidentified nodes, so it cannot rank. See amendment 2026-09-05-phase2-node-aggregation.",
+        "also_reported": [
+          "identifiable node fraction, per protocol",
+          "mean over identifiable nodes, per parameter",
+          "worst identifiable node (true minimax over nodes and parameters)",
+          "per-parameter aggregates, never pooled",
+          "A-optimality tr(W F^-1 W) and D-optimality det F",
+          "the (log rho, log V)-only minimax, labelled a diagnostic contrast and NOT a criterion",
+          "the same acquisition scored WITHOUT the Monte-Carlo debias, so the size of the bias trap is visible"
+        ],
+        "identifiability_precondition": "a node counts as identifiable only when the whole inverse diagonal of F is positive, which is Sylvester's leading-minor test strengthened to what a CRLB actually requires. The identifiable node fraction is itself a reported primary quantity, not a filter applied out of sight."
+      }
+    },
+    "evaluation_node_set": {
+      "primary": "every node carrying all three k=1 stencils: retained (rho, V) mask nodes crossed with the full interior k_io grid (indices 1..49, i.e. 1..125 s^-1), weighted uniformly",
+      "k_io_above_30": "reported as a coverage statement AND included in the unrestricted minimax, which is the pre-registered criterion; the (log rho, log V)-only minimax is reported beside it as a labelled diagnostic contrast, never as a substitute",
+      "secondary_anchor": "the MADI II cortical-GM and WM parameter medians, reported as an interpretable single-voxel reference",
+      "k_io_restriction": {
+        "status": "WITHDRAWN by user decision 2026-09-05; see amendment_log entry 2026-09-05-withdraw-kio-restriction",
+        "previously": "k_io restricted to [1, 30] s^-1 to keep the minimax criterion non-degenerate",
+        "now": "no k_io ceiling is imposed; the minimax criterion runs over the full pre-registered range",
+        "required_diagnosis": "because the k_io relative CRLB is effectively unbounded above 30 s^-1 for EVERY candidate acquisition, the minimax score may saturate on k_io and become near-identical across protocols. Degeneracy must be measured and reported, not corrected for: the argmax parameter per protocol, the spread of scores across the sweep, and the fraction of protocols within 5% of the best."
+      }
+    },
+    "reporting": "clinical and research gradient scenarios are reported separately and never pooled",
+    "monte_carlo_debias_coverage": {
+      "status": "declared 2026-09-05 at execution; a data limitation, not a choice",
+      "problem": "the CRN covariance term of Var(J_hat) needs ensemble_means_subset, which the library stores for only 200 diagnostic columns = 8 timing pairs. The remaining 1,237 pairs have signal_variance but no covariance, so their Var(J_hat) cannot be computed exactly.",
+      "rule": "the sweep uses the endpoint-only Var(J_hat) = (Var(S-) + Var(S+))/(n_ensembles h^2) everywhere. Dropping a positive CRN covariance OVERSTATES Var(J_hat), so the debiased Fisher is a lower bound and the reported CRLB is conservative.",
+      "calibration": "at the 8 diagnostic timing pairs both forms are computed and the difference is reported, so the size of the conservatism is measured rather than asserted"
+    },
+    "feasibility_basis": {
+      "gradient_mask": "per column, retained under both scenarios separately; clinical is a strict subset of research",
+      "per_entry_masks": "trust floor S/S0 >= 0.015, and Rician S/sigma_c >= 3 where sigma_c = sigma_1/sqrt(n_c) uses the averaging the acquisition itself assigns to that column. Applied per (node, column) inside the Fisher sum. See amendment 2026-09-05-phase2-averaging-aware-mask.",
+      "noise_model": "pre-registered T2 and t_epi; SNR 50 at b=0; averaging per column = N/(m * subset size), which is known before the b-subset is selected because N, m and the size are all declared",
+      "gradient_scenario_choice": "DEFERRED by user decision 2026-09-05. Neither scenario is nominated as primary; every result is reported under both, side by side, never pooled or averaged.",
+      "role": "CONDITIONAL, applied at evaluation only. Since 2026-09-06 none of these masks selects the Phase-1 substrate, and each scenario asserts that the substrate carries every column it admits rather than silently intersecting with it. See analysis_domain_architecture."
+    }
+  },
+  "reference_protocols": {
+    "status": "retained for manuscript context only; demoted from evaluation targets on 2026-09-05",
+    "purpose": "situate published acquisitions inside the swept space; approximate placement is sufficient and protocol-exact timing is not required",
+    "madi_ii": {
+      "delta_ms": 20.0,
+      "Delta_ms": 50.0
+    },
+    "madi_iii": {
+      "delta_ms": 7.0,
+      "Delta_ms": 25.0
+    },
+    "jackson_thesis": {
+      "status": "requires_source_timing_confirmation",
+      "priority": "deprioritized 2026-09-05; do not spend further effort recovering delta/Delta",
+      "known": {
+        "b_values_s_mm2": "16 values, 50 to 4700",
+        "TE_ms": 111.5,
+        "lowest_shell_is_b50_not_b0": true
+      },
+      "use": "placed approximately in the swept space from its b-range and TE; also the worked example for the finite-b0-precision amplitude regime"
+    },
     "multi_Delta_candidates": [
-      {"delta_ms": 5.0, "Delta_ms": 15.0},
-      {"delta_ms": 7.0, "Delta_ms": 25.0},
-      {"delta_ms": 10.0, "Delta_ms": 30.0},
-      {"delta_ms": 15.0, "Delta_ms": 40.0},
-      {"delta_ms": 20.0, "Delta_ms": 50.0}
+      {
+        "delta_ms": 5.0,
+        "Delta_ms": 15.0
+      },
+      {
+        "delta_ms": 7.0,
+        "Delta_ms": 25.0
+      },
+      {
+        "delta_ms": 10.0,
+        "Delta_ms": 30.0
+      },
+      {
+        "delta_ms": 15.0,
+        "Delta_ms": 40.0
+      },
+      {
+        "delta_ms": 20.0,
+        "Delta_ms": 50.0
+      }
     ]
-  }
+  },
+  "amendment_log": [
+    {
+      "id": "2026-09-05-t-epi",
+      "date": "2026-09-05",
+      "field": "noise_model.t_epi_ms",
+      "previously": 0.0,
+      "now": 30.0,
+      "why": "t_epi=0 prices no EPI readout at all, so TE = delta + Delta understates the cost of long diffusion times and biases any protocol optimizer toward long Delta for a reason that is not physical. 30 ms represents the delta/Delta-independent TE overhead: roughly half a 40-60 ms EPI echo train to the k-space centre, plus refocusing-pulse and crusher time. This is the mid-range of the 20-40 ms real-readout window.",
+      "effect": "shrinks every column's usable signal by exp(30/T2), tightening the Rician-validity mask; see the Phase-0/1 framework for the revised survival counts"
+    },
+    {
+      "id": "2026-09-05-s0-marginalization",
+      "date": "2026-09-05",
+      "field": "amplitude_model",
+      "previously": "absent; CRLBs implicitly assumed S0 known exactly",
+      "now": "both fixed-S0 and S0-marginalized bounds are reported wherever a CRLB is computed",
+      "why": "user-approved adoption of archive/marginal_s0_fisher_crlb_implementation_plan.md, which had specified the unknown-, known-, and finite-b0-precision cases but was never carried into the active plan"
+    },
+    {
+      "id": "2026-09-05-protocol-sweep",
+      "date": "2026-09-05",
+      "field": "protocols -> protocol_sweep + reference_protocols",
+      "previously": "an evaluation list of three named historical protocols (MADI II, MADI III, Jackson thesis) plus five multi-Delta candidates; the Jackson entry was blocked on unrecoverable delta/Delta timing",
+      "now": "a declared sweep over the library's own feasible (delta, Delta) and b-subset space, comparing single-Delta against multi-Delta arms at matched total measurement count; the three named protocols are retained as manuscript context under reference_protocols",
+      "why": "the project goal is an optimal realistic acquisition, not reproduction of historical acquisitions. Protocol-exact Jackson timing is not recoverable and is not needed to place it approximately.",
+      "specification_gaps_closed_at_adoption": [
+        "the evaluation node set, because an unrestricted max over k_io makes the minimax criterion degenerate given the Phase-1 k_io sensitivity result",
+        "a relative-CRLB floor for the linear k_io parameter",
+        "the b-subset selection rule, because the subset space is not enumerable",
+        "the multi-Delta cardinality and its search strategy"
+      ]
+    },
+    {
+      "id": "2026-09-05-drop-k3-k4",
+      "date": "2026-09-05",
+      "field": "stencil_half_widths, stencil_rule",
+      "previously": {
+        "rho": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "V": [
+          1,
+          2
+        ],
+        "k_io": [
+          1
+        ]
+      },
+      "now": {
+        "rho": [
+          1,
+          2
+        ],
+        "V": [
+          1,
+          2
+        ],
+        "k_io": [
+          1
+        ]
+      },
+      "why": "k=3 and k=4 exist at only 4,641 and 510 centres and Phase 1 settled the stencil question against them: truncation bias dominates Monte-Carlo noise by 17x (rho) and 55x (V) already at k=1, and each doubling of h quadruples the truncation bias. k=2 is retained only because the Richardson estimate needs it; no Fisher matrix is built from k=2.",
+      "effect": "a Phase-1 re-run no longer writes J_rho_k3/k4 or their audits. The EXISTING k=3/k=4 fields and the framework record of them are retained unchanged as the evidence for this choice, not deleted."
+    },
+    {
+      "id": "2026-09-05-withdraw-kio-restriction",
+      "date": "2026-09-05",
+      "field": "protocol_sweep.evaluation_node_set",
+      "previously": "primary evaluation set capped at k_io in [1, 30] s^-1, on the grounds that an unrestricted max makes the minimax criterion degenerate given the Phase-1 k_io sensitivity collapse",
+      "now": "no k_io ceiling; the minimax criterion runs over the full interior k_io grid, 1..125 s^-1",
+      "why": "user decision. The intent is to read the unrestricted result with the k_io limitation in mind rather than have the tooling hide it. The cap was the analyst's mitigation, not a measurement.",
+      "consequence_to_report": "the predicted degeneracy is not suppressed; it is measured. Per protocol: the argmax parameter, the spread of scores across the sweep, and the fraction within 5% of the best. If k_io is the argmax nearly everywhere and scores cluster, that is stated in the verdict, not a footnote."
+    },
+    {
+      "id": "2026-09-05-n0-eff-sweep",
+      "date": "2026-09-05",
+      "field": "amplitude_model.n0_eff_sweep",
+      "previously": "n0_eff fixed at 4 for the Phase-0/1 worked example",
+      "now": "swept over {0, 1, 2, 4, 8} plus the known-amplitude limit, at every reported Phase-2 result",
+      "why": "n0_eff governs the entire fixed-versus-fitted-S0 trade and was an assumption rather than a measurement. At n0_eff = 4 the penalty was already <= 0.4%, so the informative range lies below it."
+    },
+    {
+      "id": "2026-09-05-phase2-specification",
+      "date": "2026-09-05",
+      "field": "protocol_sweep.criteria.aggregation, arm_definitions.search_strategy, monte_carlo_debias_coverage, feasibility_basis",
+      "previously": "the sweep declared a criterion (max over parameters) and a node set (weighted uniformly) but not the order of operations between them; declared m in {2,3,4} without a search strategy over the 1,245 timing pairs; and assumed a debiased Fisher matrix at every swept column.",
+      "now": "order of operations, per-parameter relative-CRLB definitions, the m=1/m=2 exhaustive plus m=3/m=4 greedy search with a measured greedy gap, the endpoint-only debias rule with its conservatism calibrated at the 8 diagnostic pairs, and the feasibility basis are all declared explicitly.",
+      "why": "these are gaps found at execution, not choices. C(1245,3) = 3.2e8 pair-triples is not enumerable, and the CRN covariance simply does not exist outside the 200 diagnostic columns. Each gap is declared here before the sweep was run so the search is not tuned after seeing results."
+    },
+    {
+      "id": "2026-09-05-phase2-node-aggregation",
+      "date": "2026-09-05",
+      "field": "protocol_sweep.criteria.aggregation.order_of_operations",
+      "previously": "per parameter, the uniform MEAN over evaluation nodes, then the max over parameters",
+      "now": "per parameter, the MEDIAN over evaluation nodes with +inf at unidentified nodes, then the max over parameters",
+      "why": "measured at execution: with the Monte-Carlo debias applied, no candidate acquisition is identifiable at every evaluation node, so the uniform mean is +inf for every protocol and ranks nothing. The median is the uniformly weighted order statistic that survives an infinite tail; it is finite exactly when a protocol identifies more than half the nodes. Scoring instead on the mean over only the identifiable nodes was rejected because it rewards a protocol for identifying FEWER nodes, which is precisely backwards.",
+      "safeguards": "the identifiable node fraction is reported as a primary quantity for every protocol, and the count of arms with a finite minimax is reported for every sweep, so a sweep in which the criterion cannot rank is visible rather than silently resolved by an arbitrary argmin"
+    },
+    {
+      "id": "2026-09-05-phase2-averaging-aware-mask",
+      "date": "2026-09-05",
+      "field": "protocol_sweep.feasibility_basis.per_entry_masks",
+      "previously": "the feasibility mask at the pre-registered noise model, whose noise_model.averages_per_column is 1",
+      "now": "Rician validity is evaluated at sigma_1/sqrt(n_c), the noise the acquisition actually achieves after its own averaging; the trust floor is unchanged at 0.015",
+      "why": "the two pre-registered statements are inconsistent: the sweep declares that a budget of N images is allocated across the selected columns, and the mask declares one average per column. Measured at execution, the one-average reading leaves the median node with 2-3 usable columns out of 24, so no three-parameter Fisher matrix exists anywhere on the grid and Phase 2 cannot run at all. averages_per_column = 1 belongs to the Phase-1 screen for which columns are ever usable, not to the evaluation of a specific acquisition.",
+      "consequence": "N is no longer a pure scale factor on the Fisher matrix. It changes which columns are usable, so it can change the ranking, and the reported optimum is stated at a declared N with a sensitivity check rather than claimed budget-independent."
+    },
+    {
+      "id": "2026-09-06-substrate-domain",
+      "date": "2026-09-06",
+      "field": "analysis_domain_architecture (new); protocol_sweep.feasibility_basis role; gradient_limits_T_per_m_role",
+      "previously": "the pre-registration carried no statement about the analysis domain at all. docs/fisher_crlb_analysis_plan.md section 1.3 specified that Phase 1 compute central differences 'only for columns surviving the declared research feasibility mask at at least one cellular node, plus all 200 diagnostic columns', and scripts/run_fisher_phase1.py required that selection.",
+      "now": "the reusable substrate spans every stored (delta, Delta, b) column and no hardware, acquisition or trust quantity may select it. Conditional masks are applied at evaluation, declared in the result, and reconstructible from the substrate. Every cache and report declares its column domain and downstream code refuses to read a restricted one as universal.",
+      "why": "the restriction was a 300 mT/m research-scanner ceiling. It removed 7,014 of the 31,125 stored columns -- the entire short-delta, high-b corner, including 84 timing pairs that lost every diffusion-weighted column -- from the reusable substrate, so no later analysis at any other gradient setting could reach them and no notebook-level filter could recover them. It was never pre-registered and appears in no amendment log, so it entered as an implementation decision by a coding agent rather than as an approved scientific choice.",
+      "effect": "Phase-1 column coverage 24,111 -> 31,125; fields 7.15 -> 8.61 GiB. NO executed number changes: every Phase-2 result was already conditioned on a gradient scenario whose admissible columns the restricted substrate contained in full (clinical is a subset of research is a subset of the old substrate), and the full N=128 sweep was re-executed on the corrected substrate: 2,911 reported quantities match exactly with zero mismatches, and all 32 per-node map files are identical.",
+      "interpretation_change": "no Phase-2 result may be read as a statement about intrinsic model identifiability over the stored acquisition domain. The recovered region is the short-pulse, high-q regime in which cell volume V is most strongly encoded; measuring what it contains is a separate, unrun analysis and is not claimed here.",
+      "evidence_retained": "the restricted Phase-1 and Phase-2 outputs are kept unchanged as the executed record, and --restrict-columns-to-feasibility reproduces the restricted basis on demand."
+    }
+  ],
+  "stencil_rule": {
+    "status": "amended 2026-09-05; see amendment_log entry 2026-09-05-drop-k3-k4",
+    "fisher_stencil": "k = 1 only, on all three axes; Fisher matrices are never built from k = 2",
+    "k2_purpose": "retained solely so the Richardson estimate (4*J_k1 - J_k2)/3 can quantify truncation bias",
+    "why": "Phase 1 measured truncation bias dominating Monte-Carlo noise by 17x (rho) and 55x (V) at k=1, and widening to k=2 trades a ~3x reduction in beta for a 16x rise in squared truncation bias"
+  },
+  "gradient_limits_T_per_m_role": "CONDITIONAL hardware scenarios applied at evaluation time and reported separately, never pooled. They do not select the Phase-1 substrate; see analysis_domain_architecture."
 }
