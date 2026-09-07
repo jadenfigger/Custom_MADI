@@ -119,6 +119,6 @@ python analysis/v5_stencil_probe.py \
   --declaration data/madi_v5_stencil_probe_entry_subset.json \
   --expected-shards 13 \
   --declared-shards 13 \
-  --output-dir docs/figures/v5_stencil_probe \
-  --report docs/v5_stencil_probe.md
+  --output-dir docs/provenance/figures/v5_stencil_probe \
+  --report docs/provenance/v5_stencil_probe.md
 ```

@@ -34,3 +34,9 @@ figures/
 *.nii
 *.nii.gz
 *.npz
+
+# Retained provenance evidence is source, not generated output: the figures,
+# CSVs and JSON under docs/provenance/ are the only surviving record of the
+# stencil probe and the CRN diagnostic, and docs/INDEX.md indexes them.
+!docs/provenance/figures/
+!docs/provenance/figures/**

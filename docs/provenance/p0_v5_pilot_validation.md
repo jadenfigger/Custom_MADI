@@ -62,5 +62,5 @@ the W2 variance estimator's calibration.
 explicit authorization to submit production.** No production or W4 replicate
 job is authorized or launched by this record.
 
-Use [`v5_pilot_runbook.md`](v5_pilot_runbook.md) for the reproducible current
+Use [`v5_pilot_runbook.md`](../archive/v5_pilot_runbook.md) for the reproducible historical
 pilot configuration and Sol commands.

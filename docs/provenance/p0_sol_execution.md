@@ -23,7 +23,7 @@ production gate.
 The accepted v5 pilot record is
 [`p0_v5_pilot_validation.md`](p0_v5_pilot_validation.md).  The only current
 pilot build and validation commands are in
-[`v5_pilot_runbook.md`](v5_pilot_runbook.md).
+[`v5_pilot_runbook.md`](../archive/v5_pilot_runbook.md).
 
 ## Execution record — 2026-08-03
 
@@ -102,7 +102,7 @@ files above for diagnosis.
 
 > **Historical only.** This one-ensemble, 24-column pilot was superseded by
 > the v5 8-ensemble, 1,500-column pilot documented in
-> [`v5_pilot_runbook.md`](v5_pilot_runbook.md).  Retain these details only to
+> [`v5_pilot_runbook.md`](../archive/v5_pilot_runbook.md).  Retain these details only to
 > interpret the 2026-08-03 artifacts and their validation record.
 
 Run this only after the golden check passes and the reference SHA check above

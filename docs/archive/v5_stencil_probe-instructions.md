@@ -14,7 +14,7 @@ W4 independent-seed replicate. It must not overwrite either.
 
 ## Declared production-grid cross
 
-[`data/madi_v5_stencil_probe_entry_subset.json`](../data/madi_v5_stencil_probe_entry_subset.json)
+[`data/madi_v5_stencil_probe_entry_subset.json`](../../data/madi_v5_stencil_probe_entry_subset.json)
 is a declared, canonical-grid-restricted entry set. The launcher resolves
 every coordinate against `make_remediation_log_grid()` before it builds any GPU
 entry, so a typo or out-of-grid coordinate aborts rather than changing the
@@ -58,7 +58,7 @@ match the declaration exactly.
 ## Build settings
 
 The `stencil-probe` launcher mode in
-[`scripts/build_lib.sbatch`](../scripts/build_lib.sbatch) uses the unchanged
+[`scripts/build_lib.sbatch`](../../scripts/build_lib.sbatch) uses the unchanged
 dense production preset: 100,000 walkers x 40 ensembles x 3 harvested axes,
 128 ms at 1 us, finite-lobe phase, kappa 0.90, SI fatal escape, full-facet SI
 Eq. S2 classifier, production seed `20260803`, and the certified 5-million-cell
@@ -146,7 +146,7 @@ source activate madiEnv
 which python
 python -m scripts.validate_v5_stencil_probe \
   --declaration data/madi_v5_stencil_probe_entry_subset.json
-python analysis/v5_stencil_probe.py libraries/madi_v5_stencil_probe.shard0{00..12}.npz --declaration data/madi_v5_stencil_probe_entry_subset.json --expected-shards 13 --output-dir docs/figures/v5_stencil_probe --report docs/v5_stencil_probe.md
+python analysis/v5_stencil_probe.py libraries/madi_v5_stencil_probe.shard0{00..12}.npz --declaration data/madi_v5_stencil_probe_entry_subset.json --expected-shards 13 --output-dir docs/provenance/figures/v5_stencil_probe --report docs/provenance/v5_stencil_probe.md
 ```
 
 The analysis aborts before calculating a correlation if any of the following
@@ -158,7 +158,7 @@ groups.
 
 On success it writes the per-axis correlation histograms, direct observed SE
 versus b/timing, beta-versus-stencil figure, reallocation table, full CSVs, and
-a JSON summary under `docs/figures/v5_stencil_probe/`. It then replaces this
+a JSON summary under `docs/provenance/figures/v5_stencil_probe/`. It then replaces this
 pre-launch record with the final validation report. Retain all 13 shards,
 hash files, Slurm logs, CSVs, JSON, figures, and generated report before any
 GO decision. Do not launch production or W4 merely because this probe

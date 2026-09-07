@@ -237,7 +237,7 @@ python analysis/v5_crn_diagnostic.py \
   libraries/madi_v5_remediation_pilot.shard001.npz \
   libraries/madi_v5_remediation_pilot.shard002.npz \
   libraries/madi_v5_remediation_pilot.shard003.npz \
-  --output-dir docs/figures/v5_crn_diagnostic
+  --output-dir docs/provenance/figures/v5_crn_diagnostic
 ```
 
 The script is an artifact-only analysis: it imports no `madi` module and does

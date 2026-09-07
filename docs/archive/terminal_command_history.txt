@@ -3,13 +3,13 @@
 # Shared args — define once for readability
 INPUT="50:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-madi-input_dwi.bvec"
 MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/Mayo_Glioma/derivatives/preproc/sub-125/dwi/sub-125_desc-brain_mask.nii.gz"
-LIB="data/libraries/madi_dense_universal.npz"
+LIB="data/libraries/madi_dense_universal_remediated.npz"
 BASE="data/outputs/madi_output_glioma_v3.0"
 SMALL_DELTA="20.0"
 
 INPUT="50:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-preproc_dwi.eddy_rotated_bvecs"
 MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/edema/derivatives/preproc/sub-187/dwi/sub-187_desc-nodif-brain_mask.nii.gz"
-LIB="data/libraries/madi_dense_universal.npz"
+LIB="data/libraries/madi_dense_universal_remediated.npz"
 BASE="data/outputs/madi_output_glioma_v3.1"
 SMALL_DELTA="20.0"
 
@@ -19,8 +19,9 @@ INPUT="15:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storag
        30:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td30_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td30_desc-preproc_dwi.eddy_rotated_bvecs
        40:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td40_desc-preproc_dwi.nii.gz:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq_dwi.bval:/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td40_desc-preproc_dwi.eddy_rotated_bvecs"
 MASK="/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/data_storage/data/mouse_psilocybin/derivatives/preproc/sub-H01/ses-pre/dwi/sub-H01_ses-pre_acq-td15_desc-brain_mask.nii.gz"
-LIB="data/libraries/madi_dense.npz"
-BASE="data/outputs/madi_output_psilocybin_v1.0"
+LIB="data/libraries/madi_dense_universal_remediated.npz"
+BASE="data/outputs/madi_output_psilocybin_v2.0"
+SMALL_DELTA="6.0"
 
 
 # ── MAP ──────────────────────────────────────────────────────────────

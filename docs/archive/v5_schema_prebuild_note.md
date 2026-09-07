@@ -64,6 +64,6 @@ canonical P0 grid and uses a distinct fixed build seed.  It remains explicitly
 unlaunched until after production and separate approval.
 
 The accepted v5 pilot record is
-[`p0_v5_pilot_validation.md`](p0_v5_pilot_validation.md).  Exact Sol build,
+[`p0_v5_pilot_validation.md`](../provenance/p0_v5_pilot_validation.md).  Exact Sol build,
 hashing, and validation steps are in
 [`v5_pilot_runbook.md`](v5_pilot_runbook.md).

@@ -46,9 +46,12 @@ The simulator still:
 
 No finite geometry is used to recalibrate any of those quantities.
 
-The acceptance gate now uses the largest of the absolute 0.005 tolerance,
-four times the existing pointwise binomial SE, and four times the SE of
-equal-volume spatial batch means (8 batches along each axis by default).
+The acceptance gate uses the largest of the absolute 0.005 tolerance, four
+times the existing pointwise binomial SE, and **five** times the SE of
+equal-volume spatial batch means (8 batches along each axis by default). The
+five-SE spatial term is a familywise guard for the 369 x 40 finite-geometry
+production ensemble set: it avoids rejecting the expected rare 4--5 SE tail
+while remaining stricter than a one-geometry uncertainty allowance.
 The latter captures the missing finite-domain component.  Each ensemble's
 metadata records `realised_vi_spatial_se` and the number of batches per axis;
 the library metadata records the full acceptance rule.  This preserves a

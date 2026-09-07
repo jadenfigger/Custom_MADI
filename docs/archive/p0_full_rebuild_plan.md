@@ -3,7 +3,7 @@
 This plan is a specification only. It does not authorize a production launch.
 The P0 geometry, boundary, grid, and pilot structural gates have passed. The
 exact-classifier cache passed its CPU/GPU equivalence and full-A100 speed
-gates; see `v5_fast_classifier_launch_readiness.md` for the measured results
+gates; see `../provenance/v5_fast_classifier_launch_readiness.md` for the measured results
 and the final user-controlled launch decision.
 
 ## Production configuration
@@ -37,7 +37,7 @@ Job `61617744` exposed an overly narrow low-density finite-geometry packing
 gate: its pointwise volume-sampling SE treated correlated points in a single
 finite Ω_sim realization as independent.  The corrected gate includes an
 equal-volume spatial batch-means SE while leaving S7a, Eq. S2, Eq. S8, and
-Eq. 5 unchanged.  See `finite_geometry_acceptance.md` for the diagnosis,
+Eq. 5 unchanged.  See `../provenance/finite_geometry_acceptance.md` for the diagnosis,
 provenance fields, and the exact 30-shard restart set.
 
 ## Sol launch, only after explicit approval
