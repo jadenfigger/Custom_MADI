@@ -52,7 +52,7 @@ module load mamba/latest
 ```
 If the env will use a GPU and you want to verify CUDA works in the same session, request a GPU instead:
 ```bash
-interactive -p public -q public -G -c 2 --mem=24G -t 0-02:00
+interactive -p htc -q public -G -c 1 --mem=24G -t 0-00:30
 module load mamba/latest
 ```
 (The `general` partition auto-remaps to `public/public` right now and will be removed entirely after the next maintenance — `-p public -q public` is the future-proof form.)
@@ -483,7 +483,7 @@ When everything finishes:
 ```bash
 seff <jobID>                          # check CPU/mem efficiency of a representative task
 ls libraries/madi_dense.shard*.npz | wc -l    # should be 64
-python scripts/merge_shards.py libraries/madi_dense.shard*.npz -o libraries/madi_dense.npz
+python scripts/merge_shards.py libraries/madi_dense_universal_remediated.shard*.npz -o libraries/madi_dense_universal_remediated.npz
 ```
 
 `merge_shards.py` dedupes on `(kio, ρ, V)` and carries the `(δ,Δ,b)` grid
