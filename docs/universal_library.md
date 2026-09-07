@@ -166,6 +166,18 @@ validation (out of scope for this phase).
   may bias the very-small-δ columns. Confirm the scanner's actual ramp time; if
   it matters, floor δ higher or accept the bias. (The Y-two-accumulator
   generalization for trapezoidal lobes was deliberately **not** built.)
+  **This is an annotation, not a filter.** Under the analysis-domain convention
+  adopted 2026-09-06 ([`fisher_domain_audit.md`](fisher_domain_audit.md)) a
+  fidelity caveat labels a stored column; it never removes it from a reusable
+  analysis substrate. Flooring δ is a choice for a *declared* acquisition
+  analysis, not a property of the library.
+
+- **The stored grid deliberately exceeds real gradient hardware.** 7,044 of the
+  31,125 stored columns require more than 300 mT/m and 21,126 require more than
+  80 mT/m, up to about 15.9 T/m at the extreme. The builder stores them without
+  a hardware model on purpose, so a `G_max` mask is an analysis-time — and
+  specifically an *evaluation-time* — responsibility. See
+  `fisher_crlb_analysis_plan.md` §2.8.
 - **Waveform is PGSE only.** TRSE-approximated-as-PGSE bias is a known, accepted
   limitation; no OGSE/bipolar/general-waveform support.
 - **Fitting stage.** The `--fit` path in `scripts/fit_data.py` **is** now
