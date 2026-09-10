@@ -620,3 +620,274 @@ def test_widening_the_column_domain_leaves_the_overlap_bit_identical(tmp_path) -
         assert np.array_equal(a.view(np.uint32), overlapping.view(np.uint32))
         compared += a.size
     assert compared > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: degeneracy geometry
+# ---------------------------------------------------------------------------
+
+def test_fisher_spectrum_matches_the_single_node_reference() -> None:
+    """The batched spectrum must equal `fisher_diagnostics` matrix by matrix.
+
+    `fisher_diagnostics` is the readable reference and already eigendecomposes
+    `D F D`; `fisher_spectrum` is its vectorized form for the ~10^4 nodes Phase 3
+    evaluates.  A second implementation of committed arithmetic is the pattern the
+    streaming audit exists to catch, so it is pinned here rather than trusted.
+    """
+    from madi.fisher_crlb import fisher_spectrum, pack_fisher
+
+    rng = np.random.default_rng(2026)
+    J = rng.normal(size=(5, 11, 3))
+    F = np.einsum("bci,bcj->bij", J, J)
+    kio_ref = np.asarray([5.0, 7.0, 12.0, 30.0, 125.0])
+    spectrum = fisher_spectrum(pack_fisher(F), kio_ref)
+
+    # Descending, so index 0 is the stiff direction and index 2 the sloppy one.
+    assert np.all(np.diff(spectrum["eigenvalues"], axis=-1) <= 1e-9)
+    for index in range(len(F)):
+        reference = fisher_diagnostics(F[index], kio_ref[index])
+        assert np.allclose(spectrum["eigenvalues"][index],
+                           reference["F_tilde_eigenvalues"][::-1], rtol=1e-10)
+        for slot in range(3):
+            ours = spectrum["eigenvectors"][index, :, slot]
+            theirs = reference["F_tilde_eigenvectors"][:, ::-1][:, slot]
+            assert np.isclose(abs(ours @ theirs), 1.0, atol=1e-9)   # equal up to sign
+        assert np.isclose(spectrum["condition_number"][index],
+                          reference["F_tilde_eigenvalues"][-1] / reference["F_tilde_eigenvalues"][0],
+                          rtol=1e-10)
+
+
+def test_a_constructed_constant_vi_degeneracy_is_recovered_exactly() -> None:
+    """A matrix built blind along the hyperbola must report a zero angle.
+
+    This is the positive control for plan section 3.2: if a Fisher matrix carries
+    literally no information along `(1, -1, 0)`, the reported sloppy direction has
+    to be that direction and the reported angle has to be zero.  It also pins the
+    complementary prediction, that the stiff direction is then the `v_i`-changing
+    one.
+    """
+    from madi.fisher_crlb import CONSTANT_VI_DIRECTION, degeneracy_geometry, pack_fisher
+
+    blind = CONSTANT_VI_DIRECTION
+    projector = np.eye(3) - np.outer(blind, blind)
+    F = projector @ np.diag([9.0, 4.0, 1.0]) @ projector
+    geometry = degeneracy_geometry(pack_fisher(F[None]), np.asarray([1.0]))
+    assert geometry["sloppy_angle_deg"][0] < 1e-6
+    assert geometry["stiff_angle_deg"][0] < 1e-6
+    assert abs(geometry["eigenvalues"][0, 2]) < 1e-9
+    assert geometry["sloppy_in_plane_fraction"][0] > 1.0 - 1e-9
+    assert geometry["sloppy_k_io_fraction"][0] < 1e-9
+    # A direction orthogonal to the hyperbola must read as 90 degrees, not 0.
+    from madi.fisher_crlb import VI_CHANGING_DIRECTION, direction_angle_deg
+    assert np.isclose(direction_angle_deg(VI_CHANGING_DIRECTION[None], CONSTANT_VI_DIRECTION)[0], 90.0)
+
+
+def test_the_direction_angle_is_acute_and_sign_free() -> None:
+    """An eigenvector has no sign, so its angle to a reference must not either."""
+    from madi.fisher_crlb import CONSTANT_VI_DIRECTION, direction_angle_deg
+
+    vectors = np.asarray([[1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    angles = direction_angle_deg(vectors, CONSTANT_VI_DIRECTION)
+    assert np.isclose(angles[0], 0.0) and np.isclose(angles[1], 0.0)
+    assert np.isclose(angles[2], 45.0)
+    assert np.all((angles >= 0.0) & (angles <= 90.0))
+
+
+def test_the_profiled_block_inverts_the_rho_V_block_of_F_inverse() -> None:
+    """`rho_V_profiled_block` must be the precision of `(log rho, log V)` jointly.
+
+    Profiling `k_io` out is only the right instrument for the hyperbola question
+    if it really is the `(rho, V)` block of the joint covariance, inverted -- that
+    is, `k_io` estimated rather than assumed known.  Asserted against an explicit
+    3x3 inverse.
+    """
+    from madi.fisher_crlb import pack_fisher, rho_V_profiled_block
+
+    rng = np.random.default_rng(31)
+    J = rng.normal(size=(4, 8, 3))
+    F = np.einsum("bci,bcj->bij", J, J)
+    block, valid = rho_V_profiled_block(pack_fisher(F))
+    assert valid.all()
+    for index in range(len(F)):
+        covariance = np.linalg.inv(F[index])[:2, :2]
+        assert np.allclose(block[index], np.linalg.inv(covariance), rtol=1e-9)
+
+
+def test_the_hyperbola_angle_does_not_depend_on_the_k_io_reference_scale() -> None:
+    """The reported hypothesis test must not be an artifact of a unit choice.
+
+    `D = diag(1, 1, k_io_ref)` is a convention, so any quantity that decides the
+    scientific question has to survive changing it.  Rescaling the `k_io` axis
+    leaves the `k_io`-profiled `(log rho, log V)` angle exactly invariant, and
+    leaves the in-plane part of the three-parameter sloppy direction's angle
+    alone once the direction still lies in the plane -- but it DOES move the
+    three-parameter angle itself, which is why both are reported.
+    """
+    from madi.fisher_crlb import degeneracy_geometry, pack_fisher, rho_V_profiled_spectrum
+
+    rng = np.random.default_rng(101)
+    J = rng.normal(size=(6, 9, 3))
+    F = np.einsum("bci,bcj->bij", J, J)
+    scale = np.diag([1.0, 1.0, 40.0])
+    rescaled = scale @ F @ scale
+
+    base = rho_V_profiled_spectrum(pack_fisher(F))
+    moved = rho_V_profiled_spectrum(pack_fisher(rescaled))
+    assert np.allclose(base["sloppy_angle_deg"], moved["sloppy_angle_deg"], atol=1e-9)
+
+    # And the pre-registered 3x3 form is invariant when D absorbs the same change.
+    one = degeneracy_geometry(pack_fisher(F), np.asarray(40.0))
+    two = degeneracy_geometry(pack_fisher(rescaled), np.asarray(1.0))
+    assert np.allclose(one["sloppy_angle_deg"], two["sloppy_angle_deg"], atol=1e-9)
+    assert np.allclose(one["condition_number"], two["condition_number"], rtol=1e-9)
+
+
+def test_an_indefinite_debiased_node_is_reported_rather_than_repaired() -> None:
+    """The Monte-Carlo debias can push a weak node indefinite; that is a result.
+
+    Phase 2 established that the sub-1% diagonal debias flips a third of the grid
+    from identifiable to not.  Phase 3 must keep reporting a direction at those
+    nodes -- the least-determined direction still exists -- while refusing to
+    quote a condition number across zero.
+    """
+    from madi.fisher_crlb import degeneracy_geometry, pack_fisher
+
+    F = np.diag([4.0, 2.0, -0.5])
+    geometry = degeneracy_geometry(pack_fisher(F[None]), np.asarray([1.0]))
+    assert not geometry["positive_definite"][0]
+    assert np.isnan(geometry["condition_number"][0])
+    assert np.isnan(geometry["eigenvalue_ratio_2_over_3"][0])
+    assert np.isclose(geometry["eigenvalues"][0, 2], -0.5)
+    assert np.isclose(np.linalg.norm(geometry["sloppy_vector"][0]), 1.0)
+
+
+def test_a_near_degenerate_sloppy_pair_is_flagged_by_the_eigenvalue_ratio() -> None:
+    """When `lambda_2 ~= lambda_3` the sloppy eigenvector is an arbitrary choice.
+
+    The angle is still computed, but it must come with the separation statistic
+    that says it cannot be read as a direction, or a plane of near-equal
+    eigenvalues would be reported as a confident alignment.
+    """
+    from madi.fisher_crlb import fisher_spectrum, pack_fisher
+
+    close = fisher_spectrum(pack_fisher(np.diag([100.0, 1.0, 1.0 + 1e-9])[None]), np.asarray([1.0]))
+    apart = fisher_spectrum(pack_fisher(np.diag([100.0, 20.0, 1.0])[None]), np.asarray([1.0]))
+    assert close["eigenvalue_ratio_2_over_3"][0] < 2.0
+    assert apart["eigenvalue_ratio_2_over_3"][0] > 2.0
+    # The span share is a spectrum-shape statistic and is deliberately NOT the
+    # degeneracy flag: a single dominant stiff direction makes it small even when
+    # lambda_2 and lambda_3 are an order of magnitude apart.
+    assert apart["sloppy_span_share"][0] < 0.25
+
+
+def test_phase3_accumulation_matches_the_audited_fisher_primitives() -> None:
+    """The Phase-3 streaming pass must equal `fisher_matrix` column by column.
+
+    `run_fisher_phase3.accumulate` walks timing pairs once and re-weights shared
+    per-column contributions for every declared domain.  That is a streaming
+    reimplementation of `F = sum_c u_c (J J^T - diag Var(J_hat))`, which is
+    exactly the shape of the defect the `Var(J_hat)` audit found, so it is pinned
+    to the audited single-node primitives here.
+    """
+    from madi.fisher_crlb import derivative_variance, unpack_fisher
+    from scripts.run_fisher_phase3 import Domain, MODEL_LAYER, accumulate
+
+    rng = np.random.default_rng(5)
+    n_entries, n_b, n_pairs, n_ensembles = 12, 4, 3, 8
+    vectors = rng.uniform(0.05, 1.0, size=(n_pairs * n_b, n_entries))
+    variance = rng.uniform(1e-6, 1e-4, size=(n_pairs * n_b, n_entries))
+    table = {
+        "nodes": np.zeros((2, 3), dtype=int), "centre": np.asarray([0, 1]),
+        "minus_rho": np.asarray([2, 3]), "plus_rho": np.asarray([4, 5]),
+        "minus_V": np.asarray([6, 7]), "plus_V": np.asarray([8, 9]),
+        "minus_k_io": np.asarray([10, 11]), "plus_k_io": np.asarray([0, 1]),
+        "step_rho": np.asarray([0.11, 0.12]), "step_V": np.asarray([0.15, 0.16]),
+        "step_k_io": np.asarray([2.0, 2.0]),
+    }
+    sigma_pair = np.asarray([0.02, 0.03, 0.05])
+    position_of = np.arange(n_pairs * n_b)
+    columns = {pair: position_of[pair * n_b + np.arange(1, n_b)] for pair in range(n_pairs)}
+    domain = Domain(name="check", layer=MODEL_LAYER, declaration={}, columns=columns)
+    accumulate([domain], table, vectors, variance, n_b=n_b, n_ensembles=n_ensembles,
+               sigma_pair=sigma_pair, kio_ref=np.asarray([5.0, 5.0]), trust_floor=0.015,
+               rician_min=3.0, position_of=position_of, log_every=0)
+
+    axes = (("rho", "step_rho"), ("V", "step_V"), ("k_io", "step_k_io"))
+    for node in range(2):
+        J, sigma, var = [], [], []
+        for pair in range(n_pairs):
+            for column in columns[pair]:
+                J.append([(vectors[column, table[f"plus_{axis}"][node]]
+                           - vectors[column, table[f"minus_{axis}"][node]]) / table[step][node]
+                          for axis, step in axes])
+                var.append([float(derivative_variance(
+                    np.asarray([variance[column, table[f"minus_{axis}"][node]]]),
+                    np.asarray([variance[column, table[f"plus_{axis}"][node]]]),
+                    None, None, denominator=table[step][node], n_ensembles=n_ensembles)[0])
+                    for axis, step in axes])
+                sigma.append(sigma_pair[pair])
+        expected = fisher_matrix(np.asarray(J), np.asarray(sigma), np.asarray(var))
+        assert np.allclose(unpack_fisher(domain.tissue)[node], expected, rtol=1e-12, atol=1e-15)
+    # b = 0 is excluded from every domain: J is identically zero there, so a
+    # column carrying no tissue information cannot enter the sum.
+    assert all(0 not in [c % n_b for c in cols] for cols in columns.values())
+
+
+def test_phase3_domains_apply_masks_without_changing_the_shared_substrate() -> None:
+    """A conditional mask must re-weight a domain, never alter another domain's sum.
+
+    This is the plan section 2.8 invariant at the level of the Phase-3 runner: two
+    domains reading the same timing pairs must differ by exactly their declared
+    condition, and the unmasked one must be the one that keeps every column.
+    """
+    from madi.fisher_crlb import unpack_fisher
+    from scripts.run_fisher_phase3 import Domain, MODEL_LAYER, accumulate
+
+    rng = np.random.default_rng(11)
+    n_entries, n_b, n_pairs, n_ensembles = 10, 4, 2, 8
+    vectors = rng.uniform(0.001, 1.0, size=(n_pairs * n_b, n_entries))
+    # Below the trust floor for every entry, but varying across them so the column
+    # still carries a non-zero derivative and a non-zero information trace.
+    vectors[2, :] = 0.002 + 0.0003 * np.arange(n_entries)
+    variance = np.full((n_pairs * n_b, n_entries), 1e-6)
+    table = {
+        "nodes": np.zeros((1, 3), dtype=int), "centre": np.asarray([0]),
+        "minus_rho": np.asarray([1]), "plus_rho": np.asarray([2]),
+        "minus_V": np.asarray([3]), "plus_V": np.asarray([4]),
+        "minus_k_io": np.asarray([5]), "plus_k_io": np.asarray([6]),
+        "step_rho": np.asarray([0.11]), "step_V": np.asarray([0.15]),
+        "step_k_io": np.asarray([2.0]),
+    }
+    position_of = np.arange(n_pairs * n_b)
+    columns = {pair: position_of[pair * n_b + np.arange(1, n_b)] for pair in range(n_pairs)}
+    unmasked = Domain(name="unmasked", layer=MODEL_LAYER, declaration={}, columns=dict(columns))
+    masked = Domain(name="masked", layer=MODEL_LAYER, declaration={}, columns=dict(columns),
+                    trust_floor=0.015)
+    excluded = Domain(name="excluded", layer=MODEL_LAYER, declaration={}, columns={0: np.asarray([2])})
+    accumulate([unmasked, masked, excluded], table, vectors, variance, n_b=n_b,
+               n_ensembles=n_ensembles, sigma_pair=np.asarray([0.02, 0.03]),
+               kio_ref=np.asarray([5.0]), trust_floor=0.015, rician_min=3.0,
+               position_of=position_of, log_every=0)
+
+    assert unmasked.cells[0] == 2 * (n_b - 1)
+    assert masked.cells[0] == 2 * (n_b - 1) - 1        # the one sub-floor column is gone
+    assert excluded.cells[0] == 1
+    # A domain is exactly the sum of its columns, so masking one out is exactly
+    # subtracting that column's own contribution -- no shared state leaks between
+    # declarations reading the same timing pairs.
+    assert np.allclose(unmasked.tissue, masked.tissue + excluded.tissue, rtol=1e-12, atol=0)
+    # And note which way it moves: a column below the trust floor is nearly pure
+    # Monte-Carlo noise, so once Var(J_hat) is subtracted its net contribution to
+    # the Fisher diagonal is NEGATIVE and masking it RAISES the diagonal.  That is
+    # the bias trap of plan section 2.5 in miniature.
+    assert excluded.tissue[0, 0] < 0.0
+    assert masked.tissue[0, 0] > unmasked.tissue[0, 0]
+    # The unmasked domain is unaffected by the other domain's condition: its own
+    # trust-floor ANNOTATION reports exactly the information that condition would
+    # remove, which is plan section 2.8's rule -- annotate, never select.
+    assert excluded.trace[0, 0] > 0.0
+    assert np.isclose(excluded.trace[0, 1], 0.0)
+    assert np.isclose(unmasked.trace[0, 0] - unmasked.trace[0, 1], excluded.trace[0, 0],
+                      rtol=1e-9, atol=0)
+    assert np.isclose(masked.trace[0, 1], masked.trace[0, 0])
+    assert np.allclose(unpack_fisher(masked.tissue)[0], unpack_fisher(masked.tissue)[0].T)

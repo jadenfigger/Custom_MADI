@@ -19,6 +19,15 @@
 > answered. See the amendment log at the end of this file and
 > [`fisher_domain_audit.md`](fisher_domain_audit.md).
 
+> **Forward pointer, 2026-09-09 — no number here changes.** Phase 3 has since
+> run ([`fisher_phase3.md`](fisher_phase3.md)) and answers two things this record
+> deliberately left open: the deferred question of §3.5, and the model-layer
+> reading the 2026-09-06 carry-forward said was now askable. It also re-forms the
+> four optimal arms of §3.2 by an independent accumulation path and reproduces
+> **72 of 72 compared quantities at exactly zero relative difference**, which is
+> an external confirmation of this record rather than a revision of it. Nothing
+> below was edited; see the amendment log entry `2026-09-09-phase3-forward`.
+
 ## Verdict
 
 **PHASE 2 EXECUTED. THE HEADLINE PREDICTION HOLDS, AND IS STRONGER THAN
@@ -563,7 +572,12 @@ is itself informative — they are the same degenerate direction. Under research
 `v_i = 0.475`. Both sit in the middle of the `v_i` band rather than at its edges.
 **Whether the worst nodes lie along constant-`v_i` hyperbolae is a Phase-3
 question and is deliberately not answered here**; eigendecomposition and the
-sloppy-direction analysis are out of scope.
+sloppy-direction analysis are out of scope. *(Answered 2026-09-09 in*
+[`fisher_phase3.md`](fisher_phase3.md) *§3.2: in the `(log rho, log V)` plane the
+degeneracy direction is the constant-`v_i` hyperbola at a median 2.95 degrees, so
+the coincident worst `log rho` and `log V` `kappa` nodes noted above are what a
+shared hyperbolic degeneracy predicts. The three-parameter sloppy eigenvector,
+however, points mostly along `k_io`.)*
 
 ### 3.6 The `k_io > 30` region
 
@@ -792,7 +806,9 @@ Stated here rather than left implicit.
 - Phase 3 material — eigendecomposition, sloppy directions, the constant-`v_i`
   hyperbola hypothesis — is **out of scope and not pre-empted**, even where
   section 3.5's coincident worst-`kappa` nodes for `log rho` and `log V` invite
-  the inference.
+  the inference. *(Executed separately on 2026-09-09;*
+  [`fisher_phase3.md`](fisher_phase3.md)*. This limitation stands as written for
+  this record: nothing here was computed from it.)*
 - Phase 5 item 5.1, the continuous averaging-allocation optimization under a
   fixed scan-time budget, is out of scope. Phase 2 evaluates the declared sweep
   at equal allocation across selected columns. That boundary is drawn correctly:
@@ -880,6 +896,26 @@ and the `n0_eff = 4` regimes, in both gradient scenarios, and `evaluation_nodes.
 
 This record is amended in place. `madi/fisher_crlb_preregistration.json` and
 `fisher_crlb_analysis_plan.md` carry matching entries.
+
+### 2026-09-09-phase3-forward — Phase 3 ran; this record is confirmed, not revised
+
+- **Previously:** section 3.5 deferred the constant-`v_i` question to Phase 3,
+  section 7 listed all Phase-3 material as out of scope and not pre-empted, and
+  the 2026-09-06 carry-forward said the model-layer identifiability question was
+  now askable and had not been answered.
+- **Now:** a forward pointer at the top of this file, a pointer beside each of
+  those two deferrals, and nothing else. No result, table, figure or conclusion
+  in this record was edited.
+- **Why:** Phase 3 executed on 2026-09-09
+  ([`fisher_phase3.md`](fisher_phase3.md)) and answered both deferrals. It also
+  re-formed the four optimal arms of section 3.2 from the same cache by a
+  different accumulation path — one streaming pass over all 1,245 timing pairs
+  with per-domain re-weighting — and reproduced 72 of 72 compared quantities at a
+  maximum relative difference of exactly 0.0 across all six `S0` regimes,
+  including the `+inf` minimax of both `m = 1` arms. That is independent
+  confirmation of this record.
+- **Not changed:** every executed Phase-2 number, and the limitation in section 7
+  as written, which is a statement about what this record computed.
 
 ### 2026-09-06-substrate-domain — the substrate was restricted; the results are not affected
 
