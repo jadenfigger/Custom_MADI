@@ -1035,3 +1035,265 @@ def packed_amplitude_marginal(packed_tt: np.ndarray, F_theta_s0: np.ndarray,
         correction = outer / denominator[..., None]
     correction = np.where(np.isfinite(correction), correction, 0.0)
     return packed_tt - correction
+
+
+# ---------------------------------------------------------------------------
+# Degeneracy geometry (Phase 3) -- added 2026-09-09
+# ---------------------------------------------------------------------------
+#
+# Phase 3 asks a different question from Phase 2.  Phase 2 asked how precisely a
+# declared acquisition can measure each parameter; Phase 3 asks which parameter
+# COMBINATIONS the model resolves and which it barely sees, and whether the
+# unresolved one is the constant-`v_i` hyperbola of plan section 2.4.
+#
+# Everything here is a property of a Fisher matrix that has already been formed,
+# so it carries no acquisition assumption of its own.  The Fisher matrix it is
+# handed does: `F = J^T Sigma^-1 J` is defined relative to a column set and a
+# column weighting, so a spectrum is only meaningful with both named.  Plan
+# section 6 requires that naming, and singles out the sloppy-direction ANGLE as
+# the weighting-robust quantity, because an angle is a property of a direction
+# and not of a scale.
+#
+# Two conventions, both stated rather than buried:
+#
+#   Non-dimensionalization.  Plan section 2.3 eigendecomposes `F_tilde = D F D`
+#   with `D = diag(1, 1, k_io_ref)`, so a unit step means something comparable on
+#   all three axes: the two log parameters are already fractional, and `k_io` is
+#   measured in units of `k_io_ref`.  The eigenvectors therefore live in the
+#   non-dimensionalized coordinates `theta_tilde = D^-1 theta`.  The first two
+#   axes are untouched by `D`, so the constant-`v_i` direction is `(1, -1, 0)`
+#   in both coordinate systems and the angle below is unaffected by the choice
+#   of `k_io_ref`.  Only the third component, and hence the leakage, depends on
+#   it.
+#
+#   The `k_io`-profiled companion.  `rho_V_profiled_block` eliminates `k_io` by
+#   Schur complement, giving the 2x2 precision of `(log rho, log V)` with `k_io`
+#   estimated jointly.  It is the instrument the (rho, V)-plane figure of plan
+#   section 3.3 actually needs, and, because both its axes are log parameters,
+#   it is free of `D` and of `k_io_ref` entirely.  It is reported ALONGSIDE the
+#   pre-registered 3x3 result, never instead of it.
+
+# `log v_i = log rho + log V + const`, so this direction holds `v_i` -- and with
+# it the geometry factor `g(v_i)` of plan section 2.4 -- exactly constant.
+CONSTANT_VI_DIRECTION = np.array([1.0, -1.0, 0.0]) / math.sqrt(2.0)
+# Its in-plane complement, along which `v_i` changes fastest.
+VI_CHANGING_DIRECTION = np.array([1.0, 1.0, 0.0]) / math.sqrt(2.0)
+
+
+def nondimensionalized_fisher(packed: np.ndarray, kio_ref: np.ndarray | float) -> np.ndarray:
+    """`F_tilde = D F D` with `D = diag(1, 1, k_io_ref)`, as (..., 3, 3).
+
+    `kio_ref` broadcasts against the leading axes of `packed`, so a batch of
+    nodes may each carry their own reference scale (Phase 2 uses the
+    pre-registered `max(k_io, k_io_floor)`).
+    """
+    F = unpack_fisher(packed)
+    scale = np.asarray(kio_ref, dtype=float)
+    d = np.stack([np.ones_like(scale), np.ones_like(scale), scale], axis=-1)
+    return F * d[..., :, None] * d[..., None, :]
+
+
+def fisher_spectrum(packed: np.ndarray, kio_ref: np.ndarray | float) -> dict[str, np.ndarray]:
+    """Eigen-spectrum of `D F D` for a batch of packed Fisher matrices.
+
+    Eigenvalues are returned in DESCENDING order, so `eigenvalues[..., 0]` is
+    the stiff direction and `eigenvalues[..., 2]` the sloppy one, matching plan
+    section 2.3's `lambda_1 / lambda_3` condition number.  `eigenvectors[..., :, i]`
+    is the unit eigenvector of `eigenvalues[..., i]`.
+
+    A Monte-Carlo-debiased Fisher matrix at a weakly determined node can have a
+    non-positive smallest eigenvalue.  That is reported (`positive_definite`),
+    not repaired: the eigenvector is still the direction the data sees least,
+    and suppressing the node would hide exactly the degeneracy being measured.
+    The condition number is left as NaN where `lambda_3 <= 0`, because a ratio
+    across zero is not a conditioning statement.
+
+    Two separation measures are returned because they answer different
+    questions and only one of them is about the sloppy eigenvector's
+    uniqueness.  `eigenvalue_ratio_2_over_3 = lambda_2 / lambda_3` is that one:
+    near 1 the smallest two eigenvalues are nearly degenerate, the sloppy
+    eigenvector is not uniquely defined, and any angle computed from it must be
+    read as an arbitrary choice inside a plane.  It is NaN where `lambda_3 <= 0`.
+    `sloppy_span_share = (lambda_2 - lambda_3) / (lambda_1 - lambda_3)` is
+    sign-safe and defined everywhere, but it measures where `lambda_2` sits in
+    the whole spectral span, so a matrix with one dominant stiff direction makes
+    it small even when `lambda_2` and `lambda_3` are an order of magnitude apart.
+    It is a spectrum-shape statistic, not a degeneracy flag.
+    """
+    F_tilde = nondimensionalized_fisher(packed, kio_ref)
+    eigenvalues, eigenvectors = np.linalg.eigh(F_tilde)     # ascending
+    eigenvalues = np.ascontiguousarray(eigenvalues[..., ::-1])
+    eigenvectors = np.ascontiguousarray(eigenvectors[..., ::-1])
+    lam1, lam2, lam3 = eigenvalues[..., 0], eigenvalues[..., 1], eigenvalues[..., 2]
+    positive = lam3 > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        condition = np.where(positive, lam1 / lam3, np.nan)
+        ratio = np.where(positive, lam2 / lam3, np.nan)
+        span = lam1 - lam3
+        share = np.where(span > 0, (lam2 - lam3) / span, np.nan)
+    return {
+        "eigenvalues": eigenvalues,
+        "eigenvectors": np.ascontiguousarray(eigenvectors),
+        "stiff_vector": np.ascontiguousarray(eigenvectors[..., 0]),
+        "sloppy_vector": np.ascontiguousarray(eigenvectors[..., 2]),
+        "condition_number": condition,
+        "eigenvalue_ratio_2_over_3": ratio,
+        "sloppy_span_share": share,
+        "positive_definite": positive,
+    }
+
+
+def direction_angle_deg(vectors: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Acute angle in degrees between each row of `vectors` and `reference`.
+
+    An eigenvector has no sign, so the angle between two DIRECTIONS is taken
+    through the absolute cosine and lands in [0, 90].  Zero means the two
+    directions coincide; 90 means they are orthogonal.  For an isotropically
+    random direction in three dimensions the median of this angle is 60 degrees,
+    which is the null reference the concentration near zero is read against.
+    """
+    vectors = np.asarray(vectors, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    reference = reference / np.linalg.norm(reference)
+    norms = np.linalg.norm(vectors, axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cosine = np.abs(np.tensordot(vectors, reference, axes=([-1], [0])) / norms)
+    return np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0)))
+
+
+def in_plane_direction_diagnostics(vectors: np.ndarray) -> dict[str, np.ndarray]:
+    """Split a 3-vector into its `(log rho, log V)` plane part and its `k_io` part.
+
+    A three-parameter sloppy direction need not lie in the `(log rho, log V)`
+    plane at all, and plan section 2.4's hyperbola hypothesis is a statement
+    about that plane.  Reporting the in-plane angle without also reporting how
+    much of the direction is in the plane would make a direction that is almost
+    entirely `k_io` look like a hyperbola whenever its tiny in-plane residue
+    happened to point the right way.  Both are therefore returned.
+
+    `in_plane_fraction` is the norm of the `(log rho, log V)` components of a
+    unit vector, so it is 1 when the direction lies wholly in the plane and 0
+    when it is pure `k_io`.  `in_plane_angle_deg` is the acute angle between the
+    projected direction and the constant-`v_i` direction, and is NaN when the
+    projection vanishes.
+    """
+    vectors = np.asarray(vectors, dtype=float)
+    norms = np.linalg.norm(vectors, axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        unit = vectors / norms[..., None]
+    plane = unit[..., :2]
+    fraction = np.linalg.norm(plane, axis=-1)
+    reference = CONSTANT_VI_DIRECTION[:2] / np.linalg.norm(CONSTANT_VI_DIRECTION[:2])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cosine = np.abs(plane @ reference) / fraction
+    angle = np.where(fraction > 0, np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0))), np.nan)
+    return {
+        "in_plane_fraction": fraction,
+        "k_io_fraction": np.abs(unit[..., 2]),
+        "in_plane_angle_deg": angle,
+    }
+
+
+def rho_V_profiled_block(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The `(log rho, log V)` precision with `k_io` profiled out, and its validity.
+
+    Returns `(block, valid)` where `block` is `(..., 2, 2)`.  Eliminating the
+    third parameter by Schur complement,
+
+        S = [[F_rr, F_rV], [F_rV, F_VV]] - (1 / F_kk) * outer([F_rk, F_Vk])
+
+    gives the matrix whose inverse is the `(log rho, log V)` block of `F^-1`.  It
+    is therefore the precision of the two parameters when `k_io` is estimated
+    jointly rather than assumed known, which is the quantity plan section 2.4's
+    hyperbola hypothesis and Phase 4's H1 are both about.
+
+    Both axes are log parameters and so are already commensurable: this
+    companion needs no non-dimensionalization and is completely independent of
+    the `k_io_ref` convention.  It is undefined where `F_kk <= 0`, which the
+    Monte-Carlo debias can produce at a node carrying essentially no `k_io`
+    information; `valid` is False there and the block is NaN.
+    """
+    packed = np.asarray(packed, dtype=float)
+    if packed.shape[-1] != 6:
+        raise ValueError("packed Fisher must have a trailing axis of length 6")
+    F_rr, F_rV, F_rk, F_VV, F_Vk, F_kk = (packed[..., i] for i in range(6))
+    valid = F_kk > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = F_rr - F_rk * F_rk / F_kk
+        b = F_rV - F_rk * F_Vk / F_kk
+        d = F_VV - F_Vk * F_Vk / F_kk
+    block = np.stack([np.stack([a, b], axis=-1), np.stack([b, d], axis=-1)], axis=-2)
+    return np.where(valid[..., None, None], block, np.nan), valid
+
+
+def rho_V_profiled_spectrum(packed: np.ndarray) -> dict[str, np.ndarray]:
+    """Sloppy/stiff directions of the `k_io`-profiled `(log rho, log V)` block.
+
+    Angles are measured against the constant-`v_i` direction `(1, -1)/sqrt(2)`
+    for the sloppy eigenvector and against `(1, 1)/sqrt(2)` for the stiff one,
+    which is the pair of predictions plan section 2.4 makes: `rho` and `V` trade
+    off along the hyperbola while `v_i` itself stays determined.
+
+    In two dimensions those two angles are **identically equal**: the block's
+    eigenvectors are orthogonal and so are the two reference directions, so the
+    stiff angle is an arithmetic consistency check on the sloppy one, not an
+    independent confirmation of the hypothesis.  Both are returned because a
+    reader comparing this block with the three-parameter spectrum, where the two
+    angles ARE independent, would otherwise have to derive that themselves.
+    """
+    block, valid = rho_V_profiled_block(packed)
+    filled = np.where(np.isfinite(block), block, 0.0)
+    eigenvalues, eigenvectors = np.linalg.eigh(filled)
+    eigenvalues = np.ascontiguousarray(eigenvalues[..., ::-1])
+    eigenvectors = np.ascontiguousarray(eigenvectors[..., ::-1])
+    stiff, sloppy = eigenvectors[..., 0], eigenvectors[..., 1]
+    reference_sloppy = CONSTANT_VI_DIRECTION[:2] / np.linalg.norm(CONSTANT_VI_DIRECTION[:2])
+    reference_stiff = VI_CHANGING_DIRECTION[:2] / np.linalg.norm(VI_CHANGING_DIRECTION[:2])
+    lam1, lam2 = eigenvalues[..., 0], eigenvalues[..., 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        condition = np.where(valid & (lam2 > 0), lam1 / lam2, np.nan)
+    nan = np.full(eigenvalues.shape[:-1], np.nan)
+    return {
+        "eigenvalues": np.where(valid[..., None], eigenvalues, np.nan),
+        "sloppy_vector": np.where(valid[..., None], sloppy, np.nan),
+        "stiff_vector": np.where(valid[..., None], stiff, np.nan),
+        "sloppy_angle_deg": np.where(valid, direction_angle_deg(sloppy, reference_sloppy), nan),
+        "stiff_angle_deg": np.where(valid, direction_angle_deg(stiff, reference_stiff), nan),
+        "condition_number": condition,
+        "positive_definite": valid & (lam2 > 0),
+        "valid": valid,
+    }
+
+
+def degeneracy_geometry(packed: np.ndarray, kio_ref: np.ndarray | float) -> dict[str, np.ndarray]:
+    """Plan items 3.1 and 3.2 for a batch of packed Fisher matrices.
+
+    Collects the pre-registered 3x3 spectrum of `D F D`, the angle between its
+    sloppy eigenvector and the constant-`v_i` direction, the same angle for the
+    stiff eigenvector against the `v_i`-changing direction, the in-plane/`k_io`
+    split of the sloppy direction, and the `k_io`-profiled 2x2 companion.
+    """
+    spectrum = fisher_spectrum(packed, kio_ref)
+    split = in_plane_direction_diagnostics(spectrum["sloppy_vector"])
+    profiled = rho_V_profiled_spectrum(packed)
+    return {
+        "eigenvalues": spectrum["eigenvalues"],
+        "eigenvectors": spectrum["eigenvectors"],
+        "condition_number": spectrum["condition_number"],
+        "eigenvalue_ratio_2_over_3": spectrum["eigenvalue_ratio_2_over_3"],
+        "sloppy_span_share": spectrum["sloppy_span_share"],
+        "positive_definite": spectrum["positive_definite"],
+        "sloppy_vector": spectrum["sloppy_vector"],
+        "stiff_vector": spectrum["stiff_vector"],
+        "sloppy_angle_deg": direction_angle_deg(spectrum["sloppy_vector"], CONSTANT_VI_DIRECTION),
+        "stiff_angle_deg": direction_angle_deg(spectrum["stiff_vector"], VI_CHANGING_DIRECTION),
+        "sloppy_in_plane_fraction": split["in_plane_fraction"],
+        "sloppy_k_io_fraction": split["k_io_fraction"],
+        "sloppy_in_plane_angle_deg": split["in_plane_angle_deg"],
+        "profiled_eigenvalues": profiled["eigenvalues"],
+        "profiled_sloppy_vector": profiled["sloppy_vector"],
+        "profiled_sloppy_angle_deg": profiled["sloppy_angle_deg"],
+        "profiled_stiff_angle_deg": profiled["stiff_angle_deg"],
+        "profiled_condition_number": profiled["condition_number"],
+        "profiled_positive_definite": profiled["positive_definite"],
+    }

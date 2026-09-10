@@ -17,7 +17,10 @@ Phase-0/1 record and its results),
 protocol sweep, the CRLB and `kappa` maps, and the `n0_eff` sweep),
 [`fisher_domain_audit.md`](fisher_domain_audit.md) (the 2026-09-06 audit that
 separated the reusable substrate from the conditional acquisition analyses, and
-the remediation it required).
+the remediation it required),
+[`fisher_phase3.md`](fisher_phase3.md) (the executed Phase-3 record: the
+degeneracy map, the constant-`v_i` hyperbola test, and the nine declared
+domains).
 
 This document is amended in place rather than superseded by parallel documents.
 Every change is recorded in the **amendment log** at the end of the file, and
@@ -689,16 +692,40 @@ weighting-robust quantity. Because the substrate now spans every stored column
 (§2.8), Phase 3 can be run over the full stored domain, over a declared hardware
 scenario, or over both for contrast, **without regenerating any derivative
 field.** Which of those is the reported result is a scientific choice for the
-project owner, not an implementation default.
+project owner, not an implementation default. *Decided by the user 2026-09-09:
+**both, contrasted** — the full stored domain as the model-layer result, both
+gradient scenarios beside it and never pooled, and for the conditional layer
+**both readings**, scenario-wide and the executed Phase-2 optima. See the
+amendment log, entry `2026-09-09-phase3-domain-decision`.*
 
 - **3.1** Eigendecompose the non-dimensionalized Fisher matrix at every
   interior node; report spectra and condition numbers.
 - **3.2** Compute the angle between the sloppy eigenvector and the
   constant-`v_i` direction `(1, -1)/sqrt(2)`.
+- **3.2a** *(added 2026-09-09; see the amendment log, entry
+  `2026-09-09-phase3-profiled-companion`.)* Report, **beside** 3.1 and 3.2 and
+  never instead of them, the `k_io`-profiled `(log rho, log V)` block
+  `[[F_rr, F_rV], [F_rV, F_VV]] - outer([F_rk, F_Vk]) / F_kk` and the angle of
+  *its* sloppy eigenvector to `(1, -1)/sqrt(2)`. §2.4 states the hyperbola
+  hypothesis about the `(log rho, log V)` plane, and the three-parameter sloppy
+  eigenvector of 3.1 need not lie in that plane — measured, it mostly does not.
+  Report the in-plane and `k_io` shares of the 3.1 eigenvector so the two
+  instruments can be read against each other, and note that the profiled block,
+  having two log axes, is independent of the `k_io_ref` convention entirely.
 - **3.3** The structural figure: the `(rho, V)` plane with the sloppy
   eigenvector drawn as a short line segment at each node, overlaid on
   constant-`v_i` hyperbolae. If the hypothesis holds, the alignment is visible
   at a glance. The figure is the argument.
+
+*(Executed 2026-09-09;* [`fisher_phase3.md`](fisher_phase3.md)*. The hypothesis
+holds in the plane and is not the whole answer: the `k_io`-profiled sloppy
+direction sits 2.95 degrees from the constant-`v_i` hyperbola at the median node
+against a 45-degree random-direction null, and stays within 2.6-5.1 degrees under
+every one of the nine declared domains; but the three-parameter sloppy
+eigenvector sits 43.8 degrees from it, because it points mostly along `k_io`. The
+gradient ceiling costs about 8x in condition number and almost nothing in
+direction. Amplitude marginalization is the one condition that rotates the
+degeneracy materially.)*
 
 ---
 
@@ -918,6 +945,55 @@ said, what it says now, and why, so a decision can be reconstructed without
 diffing git history by hand. Nothing is deleted; superseded wording is quoted
 here. `madi/fisher_crlb_preregistration.json` carries a matching
 `amendment_log` array.
+
+### 2026-09-09-phase3-domain-decision — Phase 3 reports both layers, contrasted
+
+- **Previously:** section 6 said Phase 3 *"can be run over the full stored
+  domain, over a declared hardware scenario, or over both for contrast, without
+  regenerating any derivative field. Which of those is the reported result is a
+  scientific choice for the project owner, not an implementation default."* The
+  choice was open and no Phase-3 result existed.
+- **Now:** the user chose **both, contrasted**, and for the conditional layer
+  **both readings**. Phase 3 evaluates nine declared domains in one pass: the
+  full stored grid (the model-layer result) plus two labelled contrasts on the
+  same columns that isolate the weighting and the trust-floor assumption; the
+  research and clinical gradient scenarios scenario-wide, differing from the full
+  grid only by the ceiling; and the four executed Phase-2 subset-size-8 `m = 1`
+  and `m = 2` optima, reproduced with their exact masks and budget.
+- **Why:** the model-layer question is what §6 exists to answer, but the audit's
+  recovered short-`delta`, high-`b` corner only becomes interpretable against a
+  scanner ceiling, and the Phase-2 arms are what Phase 4.4 will overlay
+  ill-fitting voxels on. Neither layer is nominated as the single answer; that
+  remains open, and is recorded as open decision 1 in
+  [`fisher_phase3.md`](fisher_phase3.md) §6.
+- **Measured effect:** the profiled sloppy angle's median moves only between 2.63
+  and 5.11 degrees across all nine, so the reported hypothesis test does not
+  depend on the choice. The condition number does: clinical gradients are 8.1x
+  worse conditioned than the model's own domain.
+
+### 2026-09-09-phase3-profiled-companion — the `k_io`-profiled block is reported beside the 3x3 spectrum
+
+- **Previously:** section 6 specified only items 3.1 (eigendecompose `D F D`) and
+  3.2 (the angle of its sloppy eigenvector to `(1, -1)/sqrt(2)`). Section 2.4
+  states the hyperbola hypothesis about the `(log rho, log V)` plane, and nothing
+  reconciled the two.
+- **Now:** new item **3.2a** requires the `k_io`-profiled 2x2 `(log rho, log V)`
+  block and its sloppy angle, reported beside the pre-registered 3x3 result and
+  never instead of it, together with the in-plane and `k_io` shares of the 3x3
+  sloppy eigenvector. The pre-registration gains a `phase3` block.
+- **Why:** measured at execution, the three-parameter sloppy eigenvector points
+  mostly out of the `(log rho, log V)` plane — median `|k_io|` component 0.683 —
+  so its 43.8-degree angle to a direction lying *in* that plane is large almost
+  by construction. Reporting only the pre-registered instrument would have
+  answered 3.2 literally and §2.4's hypothesis falsely; reporting only an
+  in-plane quantity would have dropped the pre-registered instrument. Both are
+  facts and they answer different questions.
+- **Not changed:** item 3.1 remains the pre-registered instrument and is reported
+  first. Nothing is substituted; the addition is strictly additive.
+- **Bonus property, recorded because it is load-bearing:** the profiled block has
+  two log axes, so it needs no non-dimensionalization and its angle is
+  independent of the `k_io_ref` convention. The 3.1 angle is not, which is the
+  second reason both are reported.
 
 ### 2026-09-06-substrate-domain — the reusable substrate spans every stored column
 

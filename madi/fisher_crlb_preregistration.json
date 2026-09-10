@@ -206,6 +206,85 @@
       "role": "CONDITIONAL, applied at evaluation only. Since 2026-09-06 none of these masks selects the Phase-1 substrate, and each scenario asserts that the substrate carries every column it admits rather than silently intersecting with it. See analysis_domain_architecture."
     }
   },
+  "phase3": {
+    "status": "declared 2026-09-09 at execution; see amendment_log entries 2026-09-09-phase3-domain-decision and 2026-09-09-phase3-profiled-companion, and docs/fisher_phase3.md",
+    "objective": "characterize the degeneracy and test the hypothesis that it runs along constant-v_i hyperbolae",
+    "question_answered": "the geometry of the model's own degeneracy. A Fisher matrix is J^T Sigma^-1 J, so a spectrum is meaningful only with its column set AND its column weighting named; every Phase-3 result carries both.",
+    "non_dimensionalization": {
+      "D": "diag(1, 1, k_io_ref)",
+      "k_io_ref": "max(k_io_node, k_io_floor)",
+      "k_io_floor_s^-1": 5.0,
+      "why_this_value": "reuses criteria.relative_scale_for_k_io.k_io_floor_s^-1 so Phase-2 relative CRLBs and Phase-3 spectra are non-dimensionalized on one convention",
+      "invariance": "D leaves the (log rho, log V) axes untouched, so the constant-v_i direction and every angle measured in that plane are independent of k_io_ref. Only the k_io component of a 3-vector depends on it."
+    },
+    "reference_directions": {
+      "constant_v_i": [
+        1.0,
+        -1.0,
+        0.0
+      ],
+      "v_i_changing": [
+        1.0,
+        1.0,
+        0.0
+      ],
+      "normalisation": "unit; log v_i = log rho + log V + const, so (1,-1,0)/sqrt(2) holds v_i and the geometry factor g(v_i) of plan section 2.4 exactly constant"
+    },
+    "instruments": {
+      "primary_pre_registered": "the 3x3 eigen-spectrum of D F D (plan items 3.1 and 3.2): eigenvalues descending, condition number lambda_1/lambda_3, and the acute angle of the smallest-eigenvalue eigenvector to the constant-v_i direction",
+      "companion": "the k_io-profiled (log rho, log V) block, [[F_rr,F_rV],[F_rV,F_VV]] - outer([F_rk,F_Vk])/F_kk, and the angle of its sloppy eigenvector (plan item 3.2a, added 2026-09-09)",
+      "why_both": "plan section 2.4 states the hyperbola hypothesis about the (log rho, log V) plane, but the three-parameter sloppy eigenvector need not lie in that plane and measurably does not. Reporting only the pre-registered instrument answers 3.2 literally and 2.4 falsely; reporting only an in-plane quantity drops the pre-registered instrument.",
+      "never": "the companion is reported BESIDE the 3x3 result and is never substituted for it",
+      "also_reported": [
+        "the in-plane and |k_io| shares of the 3x3 sloppy eigenvector",
+        "the angle of the 3x3 stiff eigenvector to the v_i-changing direction",
+        "the 2D companion's stiff angle, which is IDENTICALLY equal to its sloppy angle by orthogonality and is an arithmetic consistency check, not a second test"
+      ]
+    },
+    "angle_convention": {
+      "definition": "acute angle between two DIRECTIONS: arccos|cos|, in [0, 90] degrees, because an eigenvector carries no sign",
+      "null_reference_3d_median_deg": 60.0,
+      "null_reference_2d_median_deg": 45.0,
+      "reported_with": "every angle distribution is reported with its random-direction null and with the fractions below 5, 10, 20 and 30 degrees"
+    },
+    "degeneracy_flag": {
+      "statistic": "lambda_2 / lambda_3 on positive-definite nodes",
+      "threshold": 2.0,
+      "meaning": "below the threshold the smallest two eigenvalues are close enough that the sloppy eigenvector is a near-arbitrary choice inside a plane and its angle cannot be read as a direction",
+      "not_the_flag": "(lambda_2 - lambda_3)/(lambda_1 - lambda_3) is retained as sloppy_span_share, a spectrum-SHAPE statistic. It is small whenever one stiff direction dominates, which it does for this library, so it is not a degeneracy measure. See amendment_log 2026-09-09-phase3-degeneracy-flag.",
+      "nodes_are_not_excluded": "near-degenerate nodes stay in every reported distribution; excluding them would select on the outcome"
+    },
+    "indefinite_nodes": "the Monte-Carlo debias can drive a weakly determined node indefinite. The sloppy DIRECTION is still reported there, because it still exists and suppressing it would hide the degeneracy being measured; the condition number is left undefined wherever lambda_3 <= 0, because a ratio across zero is not a conditioning statement. Positive-definite node fractions are reported as primary quantities.",
+    "declared_domains": {
+      "decision": "the user chose BOTH LAYERS, CONTRASTED on 2026-09-09, and BOTH READINGS for the conditional layer. Neither layer is nominated as the single answer.",
+      "model_layer": [
+        "full_stored_domain: every stored diffusion-weighted column, TE/T2 weighting, no gradient/trust/Rician mask",
+        "full_stored_domain_uniform_weighting: identical columns, Sigma = I; a labelled weighting contrast, NOT a criterion",
+        "full_stored_domain_trust_floor: identical columns, S/S0 >= 0.015 applied; a labelled measurement-trust contrast, NOT a criterion"
+      ],
+      "conditional_scenario_layer": [
+        "scenario_wide_research: G <= 300 mT/m",
+        "scenario_wide_clinical: G <= 80 mT/m"
+      ],
+      "conditional_acquisition_layer": "phase2_optimum_{scenario}_size8_{m1,m2}: the four executed Phase-2 optima with their exact b-subsets, trust floor, Rician mask at their own averaging, and matched budget",
+      "single_variable_contrast": "full_stored_domain and the two scenario-wide arms differ ONLY by the gradient ceiling, so their contrast isolates the hardware condition. The trust floor and Rician validity are annotated on those arms rather than applied, and the trust floor's effect on the matrix is measured separately by full_stored_domain_trust_floor.",
+      "annotations_not_selections": "per node, the share of the domain's UNDEBIASED non-dimensionalized Fisher trace contributed by cells above the trust floor and by cells Rician-valid at 1 and at 16 averages. Plan section 2.8: a conditional quantity may annotate a substrate, never select it.",
+      "reporting": "clinical and research scenarios are reported separately and never pooled, as everywhere else in this work"
+    },
+    "substrate_requirement": "Phase 3 REFUSES to run on a restricted Phase-1 substrate. The model-layer question is not answerable on a scanner-masked substrate, so the run aborts with the column-domain banner unless the manifest declares the complete stored grid.",
+    "scale": {
+      "model_and_scenario_arms": "one average per column at the pre-registered noise model; no budget is declared because these are not acquisitions",
+      "acquisition_arms": "the Phase-2 matched-budget factor N/n_selected at the declared N",
+      "what_is_comparable": "every ratio, condition number and angle is invariant to the overall scale and IS comparable across domains. Eigenvalues are NOT: the domains differ by up to 3,700x in column count."
+    },
+    "amplitude_regimes": "the section-2.7 reporting rule is extended to the geometry: spectra and angles are computed under the known-amplitude bound, the unknown-amplitude bound (n0_eff = 0) and the worked reference n0_eff = 4, and lambda/F_s0_s0 is reported per node so the prior's proportional strength is visible. The uniform-weighting arm reports only the two scale-free regimes, because Sigma = I carries no physical noise scale on which to place a finite prior.",
+    "implementation": {
+      "arithmetic": "madi.fisher_crlb: nondimensionalized_fisher, fisher_spectrum, direction_angle_deg, in_plane_direction_diagnostics, rho_V_profiled_block, rho_V_profiled_spectrum, degeneracy_geometry, CONSTANT_VI_DIRECTION, VI_CHANGING_DIRECTION",
+      "orchestration": "scripts/run_fisher_phase3.py, which imports build_node_table, pair_contributions and _summary from scripts/run_fisher_phase2.py rather than re-deriving them",
+      "read_out": "scripts/plot_fisher_phase3.py, which computes no Fisher quantity",
+      "record": "docs/fisher_phase3.md"
+    }
+  },
   "reference_protocols": {
     "status": "retained for manuscript context only; demoted from evaluation targets on 2026-09-05",
     "purpose": "situate published acquisitions inside the swept space; approximate placement is sufficient and protocol-exact timing is not required",
@@ -370,6 +449,34 @@
       "effect": "Phase-1 column coverage 24,111 -> 31,125; fields 7.15 -> 8.61 GiB. NO executed number changes: every Phase-2 result was already conditioned on a gradient scenario whose admissible columns the restricted substrate contained in full (clinical is a subset of research is a subset of the old substrate), and the full N=128 sweep was re-executed on the corrected substrate: 2,911 reported quantities match exactly with zero mismatches, and all 32 per-node map files are identical.",
       "interpretation_change": "no Phase-2 result may be read as a statement about intrinsic model identifiability over the stored acquisition domain. The recovered region is the short-pulse, high-q regime in which cell volume V is most strongly encoded; measuring what it contains is a separate, unrun analysis and is not claimed here.",
       "evidence_retained": "the restricted Phase-1 and Phase-2 outputs are kept unchanged as the executed record, and --restrict-columns-to-feasibility reproduces the restricted basis on demand."
+    },
+    {
+      "id": "2026-09-09-phase3-domain-decision",
+      "date": "2026-09-09",
+      "field": "phase3.declared_domains",
+      "previously": "plan section 6 left the reported Phase-3 analysis domain explicitly to the project owner -- full stored domain, a declared hardware scenario, or both for contrast -- and the pre-registration carried no phase3 block at all.",
+      "now": "the user chose BOTH, CONTRASTED, and BOTH READINGS for the conditional layer. Nine declared domains are evaluated in one streaming pass over the unrestricted substrate: three on the full stored grid, two scenario-wide, four reproducing the executed Phase-2 optima.",
+      "why": "the model-layer question is what section 6 exists to answer, but the 2026-09-06 audit's recovered short-delta/high-b corner is only interpretable against a scanner ceiling, and the Phase-2 arms are what Phase 4.4 overlays ill-fitting voxels on. Neither layer is nominated; that stays open.",
+      "effect": "the k_io-profiled sloppy angle's median moves only between 2.63 and 5.11 degrees across all nine domains, so the hypothesis test does not depend on the choice. The condition number does: clinical gradients are 8.1x worse conditioned than the model's own domain."
+    },
+    {
+      "id": "2026-09-09-phase3-profiled-companion",
+      "date": "2026-09-09",
+      "field": "phase3.instruments",
+      "previously": "plan section 6 specified only the 3x3 eigendecomposition of D F D (item 3.1) and the angle of its sloppy eigenvector to the constant-v_i direction (item 3.2). Section 2.4 states the hyperbola hypothesis about the (log rho, log V) plane and nothing reconciled the two.",
+      "now": "new plan item 3.2a: the k_io-profiled 2x2 (log rho, log V) block and its sloppy angle are reported BESIDE the pre-registered 3x3 result and never instead of it, with the in-plane and |k_io| shares of the 3x3 eigenvector so the two can be read against each other.",
+      "why": "measured at execution, the three-parameter sloppy eigenvector points mostly out of the plane -- median |k_io| component 0.683 -- so its 43.8-degree angle to a direction lying IN that plane is large almost by construction. Reporting only the pre-registered instrument would answer item 3.2 literally and section 2.4's hypothesis falsely.",
+      "load_bearing_property": "the profiled block has two log axes, so it needs no non-dimensionalization and its angle is independent of the k_io_ref convention. The 3x3 angle is not. That is the second reason both are reported, and it is pinned by test_the_hyperbola_angle_does_not_depend_on_the_k_io_reference_scale.",
+      "not_changed": "item 3.1 remains the pre-registered instrument and is reported first; the addition is strictly additive."
+    },
+    {
+      "id": "2026-09-09-phase3-degeneracy-flag",
+      "date": "2026-09-09",
+      "field": "phase3.degeneracy_flag",
+      "previously": "the first Phase-3 implementation reported (lambda_2 - lambda_3)/(lambda_1 - lambda_3) as the measure of whether the sloppy eigenvector is uniquely defined, and flagged 98.8% of nodes as not isolated.",
+      "now": "the flag is lambda_2/lambda_3 on positive-definite nodes with a threshold of 2, which flags 6.2%. The span form is retained under the name sloppy_span_share and described as a spectrum-shape statistic.",
+      "why": "the span form is small whenever one stiff direction dominates, which it does for this library (lambda_1 median 1.6e5 against lambda_2 median 4.4e3), so it was reporting the spectrum's shape as if it were a degeneracy of the sloppy pair.",
+      "effect": "no published number depended on it; it was corrected before docs/fisher_phase3.md was written."
     }
   ],
   "stencil_rule": {

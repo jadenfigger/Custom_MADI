@@ -161,7 +161,13 @@ correct *for the acquisitions it evaluated*, all of which were gradient-limited
 by construction, but it could not have been a statement about the model, because
 the region where `V` is best determined was not in the substrate. The corrected
 substrate makes that question askable; **this audit does not answer it, and no
-new scientific claim is made here.**
+new scientific claim is made here.** *(Used for the first time on 2026-09-09 by
+Phase 3,* [`fisher_phase3.md`](fisher_phase3.md)*, whose `full_stored_domain` arm
+is the model-layer reading and whose contrast against the two scenario-wide arms
+measures what the ceiling costs. The finding — the gradient ceiling changes the
+condition number by about 8x and the degenerate direction hardly at all — is
+recorded there, not here. See the amendment log entry
+`2026-09-09-phase3-used-it`.)*
 
 The `universal_library.md` §9 ramp-time caveat applies to part of the recovered
 region and is carried forward as an annotation: at `delta = 1–3 ms` a real
@@ -381,6 +387,22 @@ No existing physics or statistical regression test was weakened.
 ---
 
 ## 9. Amendment log
+
+### 2026-09-09-phase3-used-it — the recovered domain was analysed for the first time
+
+- **Previously:** §4 recorded that the corrected substrate made a model-level
+  identifiability question askable and stated explicitly that this audit does not
+  answer it. §5 stated that Phase 3 is model-conditioned on a noise model and
+  must say so.
+- **Now:** a pointer in §4 to [`fisher_phase3.md`](fisher_phase3.md), which is
+  the first analysis to use the recovered domain. Nothing in this audit's
+  classification, table, verification or numbers was edited.
+- **Why:** a fresh agent reading §4 should be able to find the analysis that
+  answered it rather than re-deriving that it is still open. Phase 3 does name
+  its noise model and its column set with every spectrum, as §5 required, and its
+  §2 declares nine domains rather than one.
+- **Not changed:** every audit finding, the R1-R21 dispositions, and the
+  bit-for-bit verification results of §7b.
 
 ### 2026-09-06-initial — the audit
 
