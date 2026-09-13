@@ -285,6 +285,96 @@
       "record": "docs/fisher_phase3.md"
     }
   },
+  "phase4": {
+    "status": "declared 2026-09-10 BEFORE any Phase-4 fit result was read; see amendment_log entry 2026-09-10-phase4-declarations and docs/fisher_phase4.md",
+    "objective": "explain the unrealistic-cell-volume artifact MADI III named and the Jackson thesis handled with a 20 pL threshold",
+    "question_answered": "explanation of a fitting pathology",
+    "dataset": {
+      "subject": "Mayo_Glioma sub-125",
+      "acquisition": "PGSE delta = 20 ms, Delta = 50 ms; b = 0 (5 volumes), 500 (6), 1000 (18), 1500 (24), 2000 (30), 2500 (36) s/mm2; powder-averaged per shell; Rician-corrected",
+      "why_this_dataset": "the one repository dataset with an executed, correctly masked reference fit showing the pathology (madi_output_glioma_v4.0/bayes_s-auto: 20.3% of fitted voxels above 20 pL). sub-059 shares the protocol and is the replication candidate.",
+      "not_the_thesis_structure": "this acquisition has true b = 0 volumes, so the Jackson-thesis H4 mechanism -- a BIASED amplitude reference from normalizing by a b = 50 shell -- is absent by construction. No repository dataset has that structure.",
+      "noise": "measured, from the baseline fit's own record: Rician sigma estimated with the fitter's 48-iteration background dilation, per-shell averaging from the fit sidecar. At one timing pair the TE/T2 factor is common to every column, so kappa, angles, condition numbers and defects are identical under the pre-registered TE model; only absolute bounds carry the measured scale."
+    },
+    "fit_arms": {
+      "held_fixed": "library, mask, delta, Delta, Rician correction and its dilation, vi band [0.40, 0.99], no rho_max, free water excluded",
+      "baseline": "the executed madi_output_glioma_v4.0 configuration, re-run so every arm comes from one code state",
+      "fit_s0": "H4, item 4.1: --fit-s0",
+      "trust_floor_column": "H3, item 4.2: --trust-floor --trust-floor-mode column",
+      "trust_floor_candidate": "H3, item 4.2: --trust-floor --trust-floor-mode candidate",
+      "methods": [
+        "map",
+        "bayes"
+      ],
+      "bayes_free_s0_sigma_m": "matched on the baseline Bayes run's median n_eff via --target-n-eff, the procedure docs/fitting_methods.md prescribes because sigma_m is not comparable between the fixed- and free-S0 branches",
+      "runner": "scripts/run_fisher_phase4_fits.sh, sequential because the fitter holds the library in memory"
+    },
+    "trust_floor_fit_forms": {
+      "floor": "the pre-registered trust_floor",
+      "column": "drop an acquisition column at which ANY candidate falls below the floor, so every candidate is scored on identical data; plan section 2.6's conservative diagnostic",
+      "candidate": "drop a candidate ENTRY below the floor at any used column, keeping every measurement",
+      "not_offered": "a per-(entry, column) residual mask: it gives candidates different residual dimensionalities, which makes residuals incomparable and biases selection toward the entries the floor indicts",
+      "implementation": "madi.fisher_crlb.fit_trust_floor_masks over madi.library.candidate_selection_mask"
+    },
+    "pathology_definition": {
+      "blow_up": "fitted V > 20 pL, the Jackson-thesis cutoff, cited as the handling this phase is asked to replace and not chosen by this analysis",
+      "cutoff_sweep_pL": [
+        5,
+        10,
+        15,
+        20,
+        30,
+        50,
+        90
+      ],
+      "rule": "every contrast is reported across the whole sweep, so no conclusion rests on 20 pL",
+      "unfitted_voxels": "rho = V = 0 is carried as not fitted, never as a volume of zero"
+    },
+    "criteria": {
+      "H4_H3": "per arm and cutoff, on voxels both fits reached: the fraction above before and after, its relative change, and the stayed / resolved / newly-blown-up transition counts, with shrinks_at_every_cutoff and grows_at_every_cutoff flags. No magnitude threshold is declared.",
+      "H1_vs_H2": "goodness-of-fit ratio = residual / expected noise residual, sum over columns of sigma^2 / (S0_voxel^2 n_c), compared between blow-up voxels and the rest by probability of superiority. H1 predicts at or below 0.5 and H2 well above. The expectation is the zero-fitted-dof one, used to compare groups, not to calibrate absolute fit quality. ADC (b <= 1000 and all shells) is the free-water proxy H2 predicts to be high.",
+      "H1_overlay": "at each voxel's nearest canonical node: this acquisition's kappa_V, condition number, profiled sloppy angle and identifiability; the Phase-3 full_stored_domain kappa_V; the share of voxels whose node carries no Fisher matrix; the log v_i band position",
+      "H1_ridge": "angle of the (log rho, log V) move to the constant-v_i hyperbola, for MAP -> Bayes posterior mean and for baseline MAP -> each MAP arm, against the 45-degree random-direction null, with |d log v_i| against |d log V|",
+      "H1_ridge_geometric_null": {
+        "status": "ADDED 2026-09-10 AFTER the first Phase-4 report was read; POST-HOC. See amendment_log entry 2026-09-10-phase4-geometric-null. H1_ridge above is the pre-registered criterion and is kept unedited.",
+        "definition": "each voxel's starting estimate paired with the perturbed estimate of a randomly chosen other voxel from the same pair of fits (seed 20260910); preserves the band geometry and the fitted distribution, breaks only the voxel-to-own-refit link",
+        "statistic": "probability that a null angle exceeds an observed angle, and the same for |d log v_i| / |d log V|",
+        "reading": "a ridge mechanism predicts observed angles smaller than this null's, not merely smaller than 45 degrees"
+      }
+    },
+    "replacement_4_5": {
+      "point_estimate": "log v_i from the baseline MAP entry",
+      "bound": "madi.fisher_crlb.estimable_rho_V_contrast_bound on the k_io-profiled block at the voxel's node, scaled by S0_median / S0_voxel because F scales as S0^2",
+      "why_not_the_plain_crlb": "the debiased Fisher matrix at this acquisition is positive definite at 179 of 11,417 nodes (1.57%), measured before any fit was read. The contrast log v_i is estimable wherever the uninformative direction is orthogonal to it, and Phase 3 measured that direction to be the constant-v_i hyperbola.",
+      "defect": "reported as a continuous per-voxel quantity",
+      "defect_tolerances_reported": [
+        0.0,
+        0.01,
+        0.02,
+        0.05,
+        0.1,
+        0.2
+      ],
+      "defect_tolerance_nominated": null,
+      "defect_tolerance_decision": "PENDING the project owner. Measured before any fit was read, node-level coverage runs from 1.6% (strict) to 79% (0.20) while the bound where reported moves only from a median of about 4% to 7%.",
+      "rho_V_gate": "kappa below kappa_unidentified_threshold, per parameter, at the voxel's node; a voxel whose node has no bound is withheld",
+      "quality_flag": "Bayes fractional posterior SD validated against the CRLB on the matching log parameter at the voxel's node, by Spearman rank correlation and the ratio distribution"
+    },
+    "join": "madi.fisher_crlb.nearest_canonical_node: log rho and log V, linear k_io. A voxel whose node carries no Fisher matrix gets no bound, never a neighbour's.",
+    "guards": [
+      "a fit arm is refused unless its recorded mask sha256 equals the declared mask's",
+      "a fit arm is refused unless its sidecar status is completed",
+      "every signal-shaping loader argument is taken from the baseline fit's requested arguments, and the recovered Rician sigma is asserted equal to the one the fit recorded",
+      "the unrestricted Phase-1 substrate is required"
+    ],
+    "implementation": {
+      "arithmetic": "madi.fisher_crlb (packed_adjugate, directional_crlb, estimable_rho_V_contrast_bound, nearest_canonical_node, fit_trust_floor_masks), madi.library.candidate_selection_mask, madi.volume_pathology",
+      "fitting_flag": "scripts/fit_data.py --trust-floor / --trust-floor-mode",
+      "orchestration": "scripts/run_fisher_phase4.py",
+      "read_out": "scripts/plot_fisher_phase4.py",
+      "record": "docs/fisher_phase4.md"
+    }
+  },
   "reference_protocols": {
     "status": "retained for manuscript context only; demoted from evaluation targets on 2026-09-05",
     "purpose": "situate published acquisitions inside the swept space; approximate placement is sufficient and protocol-exact timing is not required",
@@ -477,6 +567,24 @@
       "now": "the flag is lambda_2/lambda_3 on positive-definite nodes with a threshold of 2, which flags 6.2%. The span form is retained under the name sloppy_span_share and described as a spectrum-shape statistic.",
       "why": "the span form is small whenever one stiff direction dominates, which it does for this library (lambda_1 median 1.6e5 against lambda_2 median 4.4e3), so it was reporting the spectrum's shape as if it were a degeneracy of the sloppy pair.",
       "effect": "no published number depended on it; it was corrected before docs/fisher_phase3.md was written."
+    },
+    {
+      "id": "2026-09-10-phase4-declarations",
+      "date": "2026-09-10",
+      "field": "phase4",
+      "previously": "plan section 7 specified hypotheses H1-H4 and items 4.1-4.5 without naming a dataset, a fit-time form for the trust floor, a residual discriminator, a pathology definition beyond the thesis cutoff, or how a CRLB-derived error bar on log v_i is obtained where the Fisher matrix does not invert. The pre-registration carried no phase4 block.",
+      "now": "a phase4 block declaring the dataset, the fit arms, the two fit-time trust-floor forms, the cutoff sweep, the H1/H2 discriminator, the overlay and ridge measurements, the 4.5 reporting rule with its estimable-contrast bound, and the guards",
+      "why": "each was a gap that had to be closed to run Phase 4, and each is declared here before any Phase-4 fit result was read, so no criterion can have been tuned on the outcome",
+      "left_open": "the v_i defect tolerance for the 4.5 report, which changes coverage materially and is not a default this analysis may choose; and whether to replicate on sub-059"
+    },
+    {
+      "id": "2026-09-10-phase4-geometric-null",
+      "date": "2026-09-10",
+      "field": "phase4.criteria.H1_ridge_geometric_null",
+      "previously": "the ridge criterion (phase4.criteria.H1_ridge) compared move angles with a 45-degree uniform null only",
+      "now": "a permutation null preserving the band geometry and fitted distribution is reported beside it and the ridge conclusion is read against it; H1_ridge is kept unedited",
+      "why": "the band is about 23 times longer along the hyperbola than across it, so any move inside it makes a small angle; the uniform null credited the mask's shape to the degeneracy",
+      "post_hoc": "added after the first Phase-4 report was read and before any ridge claim was written; it removed a conclusion (observed medians 2.0-3.6 degrees against null medians 4.3-4.5, probability null > observed 0.43-0.60)"
     }
   ],
   "stencil_rule": {

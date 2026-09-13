@@ -1279,16 +1279,17 @@ def _grid_columns(fit_triples, lib_delta_pairs, lib_b_values, n_b,
     return cols
 
 
-def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
-                                 n_b, vi_min, vi_max, rho_max,
-                                 fit_triples, *, include_free_water=False,
-                                 return_weights=False, require_weights=False):
-    """Apply candidate filtering and produce the masked, subset library matrix.
+def candidate_selection_mask(library, vi_min, vi_max, rho_max, *,
+                             include_free_water=False):
+    """Which library entries are candidates for a fit, as a boolean mask.
 
-    Returns
-    -------
-    lib_mat : (n_candidates, n_features)
-    kios_arr, rhos_arr, Vs_arr : (n_candidates,)
+    This is the single definition of the `v_i` / `rho_max` / free-water
+    candidate filter that every matcher applies through
+    `_build_candidate_lib_matrix`.  It is public because a caller that needs to
+    act on the candidate set itself -- the fit-time trust floor of
+    `madi.fisher_crlb.fit_trust_floor_masks`, for instance -- must use the same
+    filter rather than re-deriving it, which is how a second copy of a rule
+    drifts out of step with the first.
     """
     vis  = np.array([e.realised_vi for e in library])
     rhos = np.array([e.rho for e in library])
@@ -1301,6 +1302,22 @@ def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
         mask &= ~free
     if rho_max is not None:
         mask &= (rhos <= rho_max)
+    return mask
+
+
+def _build_candidate_lib_matrix(library, lib_delta_pairs, lib_b_values,
+                                 n_b, vi_min, vi_max, rho_max,
+                                 fit_triples, *, include_free_water=False,
+                                 return_weights=False, require_weights=False):
+    """Apply candidate filtering and produce the masked, subset library matrix.
+
+    Returns
+    -------
+    lib_mat : (n_candidates, n_features)
+    kios_arr, rhos_arr, Vs_arr : (n_candidates,)
+    """
+    mask = candidate_selection_mask(library, vi_min, vi_max, rho_max,
+                                    include_free_water=include_free_water)
 
     n_candidates = int(mask.sum())
     if n_candidates == 0:

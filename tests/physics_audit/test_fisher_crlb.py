@@ -891,3 +891,201 @@ def test_phase3_domains_apply_masks_without_changing_the_shared_substrate() -> N
                       rtol=1e-9, atol=0)
     assert np.isclose(masked.trace[0, 1], masked.trace[0, 0])
     assert np.allclose(unpack_fisher(masked.tissue)[0], unpack_fisher(masked.tissue)[0].T)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: contrast bounds, the canonical-node join, the fit-time trust floor
+# ---------------------------------------------------------------------------
+
+def test_directional_crlb_matches_the_explicit_inverse_and_is_not_normalized() -> None:
+    """The bound on `log v_i` is a bound on a SUM, so its contrast is used as given.
+
+    Pinned against an explicit inverse, including the full adjugate it is built
+    from, and against the per-parameter CRLB for unit contrasts.  The factor of
+    sqrt(2) between `(1, 1, 0)` and its unit vector is asserted outright: a
+    normalized contrast would report the variance per unit length along the
+    direction instead of the variance of `log rho + log V`.
+    """
+    from madi.fisher_crlb import (LOG_VI_CONTRAST, directional_crlb, pack_fisher,
+                                  packed_adjugate, unpack_fisher)
+
+    rng = np.random.default_rng(404)
+    J = rng.normal(size=(6, 9, 3))
+    F = np.einsum("bci,bcj->bij", J, J)
+    packed = pack_fisher(F)
+    adjugate, det = packed_adjugate(packed)
+    assert np.allclose(unpack_fisher(adjugate) / det[:, None, None], np.linalg.inv(F), rtol=1e-9)
+    for index in range(len(F)):
+        inverse = np.linalg.inv(F[index])
+        assert np.isclose(directional_crlb(packed, LOG_VI_CONTRAST)[index],
+                          np.sqrt(LOG_VI_CONTRAST @ inverse @ LOG_VI_CONTRAST), rtol=1e-9)
+        for axis in range(3):
+            basis = np.zeros(3)
+            basis[axis] = 1.0
+            assert np.isclose(directional_crlb(packed, basis)[index], np.sqrt(inverse[axis, axis]), rtol=1e-9)
+    unit = directional_crlb(packed, LOG_VI_CONTRAST / np.sqrt(2.0))
+    assert np.allclose(directional_crlb(packed, LOG_VI_CONTRAST), np.sqrt(2.0) * unit, rtol=1e-12)
+
+
+def test_v_i_stays_estimable_when_the_uninformative_direction_is_the_hyperbola() -> None:
+    """The case plan §4.5 rests on: `rho` and `V` unbounded, `v_i` bounded.
+
+    A Fisher matrix blind along `(1, -1, 0)` — slightly negative there, as the
+    Monte-Carlo debias makes it — has no inverse, so no per-parameter CRLB and no
+    exact contrast CRLB exist.  `log v_i` is orthogonal to that direction, so it
+    is still estimable, and its bound is analytic: with information `a` along the
+    unit `(1, 1, 0)/sqrt(2)` direction the variance of `log rho + log V` is `2/a`.
+    """
+    from madi.fisher_crlb import (CONSTANT_VI_DIRECTION, LOG_VI_CONTRAST, directional_crlb,
+                                  estimable_rho_V_contrast_bound, pack_fisher, packed_inverse_diagonal)
+
+    stiff = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+    kio_axis = np.array([0.0, 0.0, 1.0])
+    a, c = 4.0, 9.0
+    F = (a * np.outer(stiff, stiff) + c * np.outer(kio_axis, kio_axis)
+         - 1e-6 * np.outer(CONSTANT_VI_DIRECTION, CONSTANT_VI_DIRECTION))
+    packed = pack_fisher(F[None])
+    result = estimable_rho_V_contrast_bound(packed)
+    assert np.isclose(result["bound"][0], np.sqrt(2.0 / a), rtol=1e-9)
+    assert result["defect"][0] < 1e-9
+    assert result["non_positive_count"][0] == 1
+    assert not result["strictly_estimable"][0]
+    assert np.isnan(directional_crlb(packed, LOG_VI_CONTRAST)[0])
+    assert not packed_inverse_diagonal(packed)[2][0]
+
+
+def test_a_null_along_rho_leaves_half_of_the_v_i_contrast_uninformed() -> None:
+    """The defect is a real measurement, not a formality that is always zero.
+
+    Blind along pure `log rho`, the `(1, 1)` contrast has a projection of
+    `1/sqrt(2)` onto the uninformative direction, so `v_i` is not estimable and
+    the defect says by how much.
+    """
+    from madi.fisher_crlb import estimable_rho_V_contrast_bound, pack_fisher
+
+    result = estimable_rho_V_contrast_bound(pack_fisher(np.diag([-1e-6, 5.0, 7.0])[None]))
+    assert np.isclose(result["defect"][0], 1.0 / np.sqrt(2.0), rtol=1e-9)
+    assert result["non_positive_count"][0] == 1
+
+
+def test_the_estimable_bound_is_exact_on_positive_definite_matrices_and_ignores_k_io_scale() -> None:
+    """Where `F` inverts, the extension must return exactly the ordinary contrast CRLB.
+
+    And, because it is built on the `k_io`-profiled block, rescaling the `k_io`
+    axis must leave both the bound and the defect unchanged: the answer to "can
+    `v_i` be reported here" cannot depend on the `D = diag(1, 1, k_io_ref)`
+    convention.
+    """
+    from madi.fisher_crlb import (LOG_VI_CONTRAST, directional_crlb,
+                                  estimable_rho_V_contrast_bound, pack_fisher)
+
+    rng = np.random.default_rng(77)
+    J = rng.normal(size=(7, 10, 3))
+    F = np.einsum("bci,bcj->bij", J, J)
+    packed = pack_fisher(F)
+    result = estimable_rho_V_contrast_bound(packed)
+    assert np.allclose(result["bound"], directional_crlb(packed, LOG_VI_CONTRAST), rtol=1e-9)
+    assert np.all(result["defect"] == 0.0)
+    assert np.all(result["strictly_estimable"])
+    D = np.diag([1.0, 1.0, 40.0])
+    rescaled = estimable_rho_V_contrast_bound(pack_fisher(np.einsum("ij,bjk,kl->bil", D, F, D)))
+    assert np.allclose(rescaled["bound"], result["bound"], rtol=1e-9)
+    assert np.allclose(rescaled["defect"], result["defect"], atol=1e-12)
+
+
+def test_nearest_canonical_node_matches_rho_and_V_in_log_space_and_k_io_linearly() -> None:
+    """The voxel-to-Fisher-node join must be the grid's own geometry.
+
+    Exact labels land on their node; a realised label a percent off its nominal
+    node stays on it; the boundary between two volume nodes is their geometric,
+    not arithmetic, mean; and a non-physical fit has no node rather than node 0.
+    """
+    from madi.fisher_crlb import canonical_grid, nearest_canonical_node
+
+    rhos, volumes, kios, _ = canonical_grid()
+    ir, iv, ik = nearest_canonical_node(np.array([rhos[12], rhos[30]]), np.array([volumes[40], volumes[7]]),
+                                        np.array([kios[5], kios[40]]))
+    assert ir.tolist() == [12, 30] and iv.tolist() == [40, 7] and ik.tolist() == [5, 40]
+    ir2, iv2, _ = nearest_canonical_node(rhos[[20]] * 1.01, volumes[[20]] * 0.99, kios[[3]])
+    assert ir2[0] == 20 and iv2[0] == 20
+    above_geometric_midpoint = np.array([np.sqrt(volumes[10] * volumes[11]) * 1.001])
+    assert nearest_canonical_node(rhos[[0]], above_geometric_midpoint, kios[[0]])[1][0] == 11
+    ir3, iv3, ik3 = nearest_canonical_node(np.array([0.0, np.nan]), np.array([1.0, 1.0]), np.array([1.0, 1.0]))
+    assert ir3.tolist() == [-1, -1] and iv3.tolist() == [-1, -1] and ik3.tolist() == [-1, -1]
+
+
+def test_fit_trust_floor_masks_offer_exactly_the_two_well_posed_forms() -> None:
+    """Column form and candidate form, from one `(candidate, column)` table.
+
+    A column is dropped if any candidate is below the floor there; a candidate is
+    dropped if it is below the floor at any column.  A per-cell residual mask is
+    deliberately absent, because it would give candidates different residual
+    dimensionalities and bias selection toward the entries the floor indicts.
+    """
+    from madi.fisher_crlb import fit_trust_floor_masks
+
+    signals = np.array([[0.60, 0.20, 0.010],
+                        [0.55, 0.18, 0.030],
+                        [0.50, 0.012, 0.004]])
+    masks = fit_trust_floor_masks(signals, 0.015)
+    assert masks["column_keep"].tolist() == [True, False, False]
+    assert masks["candidate_keep"].tolist() == [False, True, False]
+    assert masks["cells_below_floor"] == 3
+    assert masks["columns_dropped"] == 2 and masks["candidates_dropped"] == 2
+    assert np.isclose(masks["cell_fraction_below_floor"], 3.0 / 9.0)
+
+
+def test_candidate_selection_mask_is_the_filter_every_matcher_applies() -> None:
+    """The fit-time trust floor must act on the same candidates the matchers score.
+
+    `candidate_selection_mask` was extracted from `_build_candidate_lib_matrix`
+    so that a caller acting on the candidate set cannot re-derive the `v_i` /
+    `rho_max` / free-water filter and drift from it.  Pinned here: the rows the
+    matcher builds are exactly the entries the mask keeps, in order.
+    """
+    import warnings
+    from types import SimpleNamespace
+
+    from madi.library import _build_candidate_lib_matrix, candidate_selection_mask
+
+    def entry(vi, rho, free=False):
+        volume = vi / (rho * 1e-6) if rho else 0.0
+        return SimpleNamespace(realised_vi=vi, rho=rho, V=volume, kio=5.0, is_free_water=free,
+                               vector=np.array([1.0, 0.5 * vi, 0.25 * vi]), weight=1.0)
+
+    library = [entry(0.30, 1e5), entry(0.50, 2e5), entry(0.70, 3e6), entry(0.95, 4e5),
+               entry(0.60, 9e6), entry(0.0, 0.0, free=True)]
+    mask = candidate_selection_mask(library, 0.4, 0.9, 5e6)
+    assert mask.tolist() == [False, True, True, False, False, False]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        lib_mat, _, rhos, _ = _build_candidate_lib_matrix(
+            library, [(10.0, 20.0)], [0.0, 500.0, 1000.0], 3, 0.4, 0.9, 5e6,
+            [(10.0, 20.0, 500.0), (10.0, 20.0, 1000.0)])
+    kept = [e for e, keep in zip(library, mask) if keep]
+    assert np.allclose(rhos, [e.rho for e in kept])
+    assert np.allclose(lib_mat, np.array([e.vector[1:] for e in kept]))
+    assert candidate_selection_mask(library, 0.4, 0.9, 5e6, include_free_water=True).tolist() == \
+        [False, True, True, False, False, True]
+
+
+def test_a_contrast_with_no_informative_projection_has_no_bound_not_a_zero_one() -> None:
+    """An empty informative sum must read as "no bound", never as "perfectly determined".
+
+    Two ways to get there, both pinned: the whole `(log rho, log V)` plane
+    uninformative, and a single uninformative direction lying exactly along the
+    `v_i` contrast.  Found on the executed Phase-4 run, where the unguarded sum
+    reported a median bound of 0 for voxels whose defect was 1.
+    """
+    from madi.fisher_crlb import estimable_rho_V_contrast_bound, pack_fisher
+
+    whole_plane = estimable_rho_V_contrast_bound(pack_fisher(np.diag([-1e-6, -2e-6, 7.0])[None]))
+    assert whole_plane["non_positive_count"][0] == 2
+    assert whole_plane["defect"][0] == 1.0 and np.isnan(whole_plane["bound"][0])
+
+    along_v_i = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+    hyperbola = np.array([1.0, -1.0, 0.0]) / np.sqrt(2.0)
+    F = 5.0 * np.outer(hyperbola, hyperbola) - 1e-6 * np.outer(along_v_i, along_v_i) + np.diag([0.0, 0.0, 3.0])
+    single = estimable_rho_V_contrast_bound(pack_fisher(F[None]))
+    assert single["non_positive_count"][0] == 1
+    assert np.isclose(single["defect"][0], 1.0) and np.isnan(single["bound"][0])

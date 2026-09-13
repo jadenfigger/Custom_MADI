@@ -353,6 +353,12 @@ table before H1**: the
 Fisher matrix says the model carries essentially no joint information there, in
 advance of any fit.
 
+*(Tested 2026-09-10 in* [`fisher_phase4.md`](fisher_phase4.md) *§2.1: 85.3% of
+Phase-4 blow-up voxels sit on the lowest `rho` node and 79.9% take one library
+volume, 41.79 pL, so the location prediction holds. The mechanism is out-of-model
+signal (H2), not the degeneracy ridge; see amendment
+`2026-09-10-phase4-pointer`. Nothing above was edited.)*
+
 At the other end, `rho > 1e6` is fully identifiable, well conditioned, and its
 sloppy direction has swung *into* the plane (`|k_io|` share 0.365 against 0.70 at
 low density): at high cell density the residual degeneracy really is the
@@ -545,7 +551,9 @@ Stated here rather than left implicit.
 4. **Whether Phase 4 should use the §3.3 low-density table as an H1 prior.** The
    16 `(rho, V)` pairs with no identifiable node sit at the low-density,
    large-cell corner the unrealistic-volume blow-ups run toward. Deciding whether that is a prediction Phase
-   4 tests or a confound Phase 4 must control for is a scientific choice.
+   4 tests or a confound Phase 4 must control for is a scientific choice. *(Answered 2026-09-10 by* [`fisher_phase4.md`](fisher_phase4.md) *§3: neither
+   as asked. The corner is where out-of-model signal is pushed, and the ridge that
+   would make it an H1 mechanism does not show up above the band's geometry.)*
 
 ---
 
@@ -651,6 +659,16 @@ stored `cpu_gpu_golden_v1.npz` fixture). It is recorded as pre-existing in
 
 This record is updated in place. Entries record what changed, what it replaced,
 and why.
+
+### 2026-09-10-phase4-pointer — Phase 4 tested this record's prediction; nothing here changes
+
+- **Previously:** §3.3 predicted the unrealistic-volume pathology lives in the
+  low-density, large-cell corner and asked Phase 4 to read that table before H1;
+  §6 open decision 4 left open whether it is an H1 prior or a confound.
+- **Now:** a pointer beside each, to [`fisher_phase4.md`](fisher_phase4.md). No
+  number, table, figure or conclusion in this record was edited.
+- **Why:** Phase 4 executed on 2026-09-10. The location prediction holds (85.3% of
+  blow-ups on the lowest `rho` node); the mechanism it was offered for does not.
 
 ### 2026-09-09-initial — first execution of Phase 3
 

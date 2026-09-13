@@ -286,3 +286,52 @@ source — `user` / `auto-rician` / `target-n-eff` / `default-placeholder` —
 plus `n_lib`, the vi/rho_max-filtered candidate-library size, for judging
 `n_eff` against), the inputs, and a timestamp, so experiments are
 self-documenting.
+
+---
+
+## Fit-time trust floor (`--trust-floor`)
+
+*Added 2026-09-10 for Fisher/CRLB Phase 4, hypothesis H3; see the amendment log below.*
+
+The pre-registered `S/S0` trust floor (`trust_floor` in
+`madi/fisher_crlb_preregistration.json`, 0.015) says library signal that low is
+Monte-Carlo noise rather than tissue contrast. It is an analysis-time and fit-time
+mask, never a builder property, and it is **off by default**. `--trust-floor`
+switches it on as an experimental condition. A bare `--trust-floor` uses the
+pre-registered value, and `--trust-floor 0.02` overrides it. It applies to every
+method and both S₀ conventions, because it acts on the columns and candidates
+before any matcher runs.
+
+| mode | flag | what is removed | what it costs |
+|---|---|---|---|
+| `column` (default) | `--trust-floor-mode column` | any acquisition column at which **any** candidate falls below the floor | trustworthy high-b measurements, discarded because some other tissue decays below the floor there |
+| `candidate` | `--trust-floor-mode candidate` | any candidate **entry** below the floor at any used column | nothing measured; the untrustworthy library entries simply cannot win |
+
+A per-`(entry, column)` residual mask is deliberately **not** offered. A fit is a
+comparison between candidates, and masking cells gives each candidate a different
+number of residual terms. That makes residuals incomparable, and it favours the
+very entries the floor indicts, since an entry that drops its own worst-fitting
+high-b columns is scored on an easier problem. The candidate filter is
+`madi.library.candidate_selection_mask`, the same filter every matcher applies,
+and the mask is `madi.fisher_crlb.fit_trust_floor_masks`. The run sidecar records
+the floor, its source, the mode, the cell counts, and every dropped column, under
+`fit_configuration.trust_floor_mask`.
+
+With `column` mode on a five-shell acquisition, the fit can drop to three columns
+for three parameters. The fitter prints the retained feature vector; read it.
+
+---
+
+## Amendment log
+
+This reference is amended in place, per the convention in `INDEX.md`.
+
+### 2026-09-10-trust-floor — the fit-time trust floor is documented
+
+- **Previously:** this reference described no trust-floor option, because the
+  fitter had none; the floor existed only as an analysis-time Fisher mask.
+- **Now:** the section above documents `--trust-floor` and `--trust-floor-mode`.
+- **Why:** Fisher/CRLB Phase 4 tests hypothesis H3 — that high-b library values
+  below the floor drive the unrealistic-volume artifact — by switching the floor on
+  in a fit. See `fisher_crlb_analysis_plan.md` §7 and its amendment
+  `2026-09-10-phase4-trust-floor-fit-forms`. Nothing else in this document changed.

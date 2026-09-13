@@ -1297,3 +1297,241 @@ def degeneracy_geometry(packed: np.ndarray, kio_ref: np.ndarray | float) -> dict
         "profiled_condition_number": profiled["condition_number"],
         "profiled_positive_definite": profiled["positive_definite"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Contrast bounds, grid lookup, and the fit-time trust floor (Phase 4)
+# ---------------------------------------------------------------------------
+#
+# Phase 4 asks a question about a *combination* of parameters rather than about
+# one at a time.  Phase 3 measured that the model's degeneracy in the
+# `(log rho, log V)` plane runs along the constant-`v_i` hyperbola, which is the
+# statement that `log v_i = log rho + log V` is the combination the data does
+# determine.  Reporting it needs the variance of that sum, not the variance of
+# either term, and the two are very different numbers wherever the parameters
+# trade off: `Var(log rho + log V) = Var(log rho) + Var(log V) + 2 Cov`, and the
+# covariance is large and negative along the ridge.
+#
+# The trust-floor helper is the fit-time form of the same pre-registered
+# threshold `feasibility_masks` applies at analysis time.  It lives here so
+# there is exactly one definition of the floor, and so a fit and a Fisher
+# evaluation cannot drift apart on what "below the floor" means.
+
+LOG_VI_CONTRAST = np.array([1.0, 1.0, 0.0])
+"""`log v_i = log rho + log V`, as a contrast vector in PARAMETER_ORDER.
+
+Deliberately **not** unit-normalized.  `u^T F^-1 u` is the variance of the
+*linear combination* `u . theta`, so the coefficients are the ones that appear
+in the combination itself.  Normalizing would report the variance per unit
+length along that direction instead, which is a different quantity and is off
+by a factor of two here.
+"""
+
+
+def packed_adjugate(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Adjugate (cofactor) entries and determinant of a batch of packed 3x3s.
+
+    Returns `(adjugate_packed, det)` with the adjugate in the same six-entry
+    packed layout as its input, so `F^-1 = adjugate / det` entrywise.  This is
+    the full-matrix companion to `packed_inverse_diagonal`, which returns only
+    the three diagonal cofactors because that is all a per-parameter CRLB needs.
+    """
+    packed = np.asarray(packed, dtype=float)
+    if packed.shape[-1] != 6:
+        raise ValueError("packed Fisher must have a trailing axis of length 6")
+    a, b, c, d, e, f = (packed[..., i] for i in range(6))
+    A11 = d * f - e * e
+    A12 = c * e - b * f
+    A13 = b * e - c * d
+    A22 = a * f - c * c
+    A23 = b * c - a * e
+    A33 = a * d - b * b
+    det = a * A11 + b * A12 + c * A13
+    return np.stack([A11, A12, A13, A22, A23, A33], axis=-1), det
+
+
+def directional_crlb(packed: np.ndarray, contrast: np.ndarray = LOG_VI_CONTRAST) -> np.ndarray:
+    """CRLB on a linear combination `u . theta`: `sqrt(u^T F^-1 u)`.
+
+    `contrast` is a coefficient vector in PARAMETER_ORDER, **used as given and
+    never normalized** — see `LOG_VI_CONTRAST`.  With the default it returns the
+    bound on `log v_i = log rho + log V`, which is a fractional precision on
+    `v_i` because it is a log quantity.
+
+    NaN wherever the matrix fails the same strengthened positive-definiteness
+    test `packed_inverse_diagonal` uses, because a variance read off an
+    indefinite information matrix is not a bound.  The Monte-Carlo debias can
+    produce such nodes and they are reported, not repaired.
+    """
+    packed = np.asarray(packed, dtype=float)
+    contrast = np.asarray(contrast, dtype=float)
+    if contrast.shape[-1] != 3:
+        raise ValueError("contrast must have three coefficients, in PARAMETER_ORDER")
+    adjugate, det = packed_adjugate(packed)
+    u0, u1, u2 = contrast[..., 0], contrast[..., 1], contrast[..., 2]
+    quadratic = (adjugate[..., 0] * u0 * u0 + adjugate[..., 3] * u1 * u1
+                 + adjugate[..., 5] * u2 * u2
+                 + 2.0 * (adjugate[..., 1] * u0 * u1 + adjugate[..., 2] * u0 * u2
+                          + adjugate[..., 4] * u1 * u2))
+    _, _, positive = packed_inverse_diagonal(packed)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        variance = np.where(positive, quadratic / det, np.nan)
+    return np.sqrt(np.where(variance >= 0, variance, np.nan))
+
+
+def nearest_canonical_node(rho: np.ndarray, volume: np.ndarray, kio: np.ndarray
+                           ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Canonical `(rho_index, V_index, k_io_index)` nearest to fitted values.
+
+    `rho` and `V` are matched in **log** space, which is the space their grid is
+    uniform in and the space the Fisher parameterization uses; `k_io` is matched
+    linearly, because its grid includes zero and its parameter is linear.  This
+    is the join a fitted map needs before it can be read against a per-node
+    Fisher quantity, and it is here rather than in a script so a fit and an
+    analysis cannot disagree about which node a voxel belongs to.
+
+    A MAP fit returns exact library labels and lands exactly on a node; a
+    posterior mean does not, and is assigned its nearest node.
+    """
+    rhos_c, volumes_c, kios_c, _ = canonical_grid()
+    rho = np.asarray(rho, dtype=float)
+    volume = np.asarray(volume, dtype=float)
+    kio = np.asarray(kio, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho_index = np.argmin(np.abs(np.log(np.where(rho > 0, rho, np.nan))[..., None]
+                                     - np.log(rhos_c)[None, :]), axis=-1)
+        volume_index = np.argmin(np.abs(np.log(np.where(volume > 0, volume, np.nan))[..., None]
+                                        - np.log(volumes_c)[None, :]), axis=-1)
+    kio_index = np.argmin(np.abs(kio[..., None] - kios_c[None, :]), axis=-1)
+    finite = np.isfinite(rho) & (rho > 0) & np.isfinite(volume) & (volume > 0) & np.isfinite(kio)
+    fill = np.full_like(rho_index, -1)
+    return (np.where(finite, rho_index, fill), np.where(finite, volume_index, fill),
+            np.where(finite, kio_index, fill))
+
+
+def fit_trust_floor_masks(candidate_signals: np.ndarray, trust_floor: float) -> dict[str, Any]:
+    """The two well-posed fit-time forms of the pre-registered `S/S0` trust floor.
+
+    `candidate_signals` is `(candidates, columns)`: the library signal of every
+    candidate entry at every acquisition column a fit would use.
+
+    Plan §2.6 defines the floor per `(entry, column)` and applies it *inside* a
+    Fisher sum, where a per-cell mask is unproblematic because the sum is over
+    cells.  A fit is a *comparison between candidates*, and a per-cell mask there
+    would give every candidate a different residual dimensionality — which not
+    only makes the residuals incomparable but biases selection toward exactly the
+    entries the floor indicts, since an entry that drops its own worst-fitting
+    high-`b` columns is scored on an easier problem.  Two forms avoid that, and
+    both are returned because they bracket the question from opposite sides:
+
+    ``column_keep``
+        Drop an acquisition column if **any** candidate falls below the floor
+        there.  Every candidate is then scored on identical data.  This is §2.6's
+        "conservative diagnostic": it discards trustworthy high-`b` measurements
+        because some other tissue has decayed below the floor.
+
+    ``candidate_keep``
+        Drop a candidate **entry** that falls below the floor at any used column,
+        keeping every measurement.  This targets the library values the floor
+        actually calls noise, and leaves the columns intact.
+
+    Neither is a statement about the model: both are conditional
+    measurement-trust assumptions, switched on and off as experimental
+    conditions (plan §7, hypothesis H3).
+    """
+    signals = np.asarray(candidate_signals, dtype=float)
+    if signals.ndim != 2:
+        raise ValueError("candidate_signals must be (candidates, columns)")
+    below = signals < float(trust_floor)
+    column_keep = ~below.any(axis=0)
+    candidate_keep = ~below.any(axis=1)
+    return {
+        "trust_floor": float(trust_floor),
+        "below": below,
+        "column_keep": column_keep,
+        "candidate_keep": candidate_keep,
+        "columns_dropped": int(np.count_nonzero(~column_keep)),
+        "candidates_dropped": int(np.count_nonzero(~candidate_keep)),
+        "cells_below_floor": int(np.count_nonzero(below)),
+        "cell_fraction_below_floor": float(np.mean(below)) if below.size else 0.0,
+    }
+
+
+def estimable_rho_V_contrast_bound(packed: np.ndarray,
+                                   contrast: tuple[float, float] = (1.0, 1.0)) -> dict[str, np.ndarray]:
+    """Bound on an in-plane contrast `c . (log rho, log V)`, with `k_io` estimated jointly.
+
+    The default contrast is `log v_i = log rho + log V`.  Where the Fisher matrix
+    is positive definite this returns exactly `directional_crlb(F, (c, 0))`.  It
+    exists for the case where it is not.
+
+    A Monte-Carlo-debiased Fisher matrix is frequently indefinite along one
+    direction, and a contrast can still be *estimable* when the uninformative
+    direction is orthogonal to it: a combination is bounded by
+    `c^T F^+ c` when `c` lies in the range of `F`, whatever the individual
+    parameters do (Stoica and Marzetta, "Parameter estimation problems with
+    singular information matrices", IEEE Trans. Signal Process. 49, 2001).
+    Phase 3 measured that the uninformative in-plane direction is the
+    constant-`v_i` hyperbola, which is orthogonal to `log v_i` by construction —
+    so this is exactly the situation in which `v_i` can be reported while `rho`
+    and `V` cannot.
+
+    The calculation uses the `k_io`-profiled block `S` of
+    `rho_V_profiled_block`, not `D F D`: both axes of `S` are log parameters, so
+    the result is independent of the `k_io_ref` convention, and by Haynsworth
+    inertia additivity `S` has exactly as many non-positive eigenvalues as `F`
+    wherever `F_kk > 0`.
+
+    Returns
+    -------
+    bound
+        `sqrt(sum over positive eigenpairs of S of (e_i . c)^2 / l_i)`: the bound
+        on the contrast from the directions the data inform.  Equal to the exact
+        contrast CRLB wherever `F` is positive definite.  **NaN where no part of
+        the contrast lies in an informative direction** (defect = 1): the sum is
+        then empty, and reporting it as zero would say "perfectly determined"
+        about a contrast the data do not inform at all.
+    defect
+        `||projection of c onto the non-positive eigenspace of S|| / ||c||`, in
+        `[0, 1]`: the share of the contrast lying in directions the data do not
+        inform.  Strictly, any non-zero defect makes the bound infinite; it is
+        reported as a continuous quantity rather than thresholded here, because
+        where that line is drawn is a reporting choice, not arithmetic.
+    non_positive_count
+        Number of non-positive eigenvalues of `S` (0, 1 or 2).
+    strictly_estimable
+        The pre-registered strengthened positive-definiteness test on `F`, the
+        same test `directional_crlb` and every identifiable fraction use.
+    profiled_valid
+        `F_kk > 0`; where False there is no profiled block and every other output
+        is NaN.
+    """
+    packed = np.asarray(packed, dtype=float)
+    c = np.asarray(contrast, dtype=float)
+    if c.shape != (2,) or not np.any(c):
+        raise ValueError("contrast must be two non-zero-in-sum coefficients for (log rho, log V)")
+    block, valid = rho_V_profiled_block(packed)
+    filled = np.where(np.isfinite(block), block, 0.0)
+    eigenvalues, eigenvectors = np.linalg.eigh(filled)          # eigenvectors are COLUMNS
+    projection = np.einsum("...ji,j->...i", eigenvectors, c)    # e_i . c
+    non_positive = eigenvalues <= 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        informative = np.where(non_positive, 0.0,
+                               projection ** 2 / np.where(eigenvalues > 0, eigenvalues, 1.0))
+    bound = np.sqrt(informative.sum(axis=-1))
+    defect = np.sqrt(np.where(non_positive, projection ** 2, 0.0).sum(axis=-1)) / np.linalg.norm(c)
+    # An empty informative sum -- the whole plane uninformative, or the contrast
+    # lying entirely along the uninformative direction -- is no bound, not a zero
+    # one.  Found on the executed Phase-4 run, where it put a median "bound" of 0
+    # on voxels whose defect was 1.
+    bound = np.where(defect >= 1.0 - 1e-9, np.nan, bound)
+    count = non_positive.sum(axis=-1)
+    _, _, strict = packed_inverse_diagonal(packed)
+    nan = np.full(bound.shape, np.nan)
+    return {
+        "bound": np.where(valid, bound, nan),
+        "defect": np.where(valid, np.clip(defect, 0.0, 1.0), nan),
+        "non_positive_count": np.where(valid, count, -1),
+        "strictly_estimable": strict & valid,
+        "profiled_valid": valid,
+    }

@@ -743,6 +743,15 @@ and inherits its weighting statement. Note the standing coverage limitation: 136
 of 369 `(rho, V)` pairs carry no Fisher matrix at all, being the mask-band edge,
 and the unrealistic-volume hypothesis is a mask-boundary hypothesis.
 
+*Specified 2026-09-10, before any Phase-4 fit result was read.* Phase 4 is
+executed on **Mayo_Glioma sub-125** (PGSE `delta = 20`, `Delta = 50` ms,
+`b = 0..2500 s/mm2`), the one repository dataset with an executed, correctly
+masked fit showing the pathology. That acquisition has true `b = 0` volumes, so
+H4's thesis-specific mechanism — a *biased* reference from normalizing by a
+`b = 50` shell — is absent by construction and is not testable on any repository
+dataset; 4.1 tests the variance side. Every Phase-4 declaration is pre-registered
+under `phase4`. See the amendment log, entry `2026-09-10-phase4-dataset-and-h4-scope`.
+
 Background: plotting ADC against recovered `V` voxelwise separates the data
 into two branches, a plausible linear-like branch and an exponential-like
 branch running to about 180 pL/cell, against MADI II medians of 6.0 pL (cortical
@@ -767,7 +776,13 @@ Hypotheses, tested in order of cost:
   that shell as an amplitude prior and retaining it as an ordinary column.
   `madi.fisher_crlb.amplitude_prior_precision` takes the reference shell's
   realized signal for this reason.
-- **4.2** Test H3. One masking flag.
+- **4.2** Test H3. One masking flag. *(Specified 2026-09-10; amendment
+  `2026-09-10-phase4-trust-floor-fit-forms`. The flag is `--trust-floor`, in two
+  fit-time forms that bracket the question: `column` drops an acquisition column
+  at which any candidate is below the floor, `candidate` drops a candidate entry
+  below the floor at any used column. §2.6's per-`(entry, column)` form is not
+  offered for a fit, because a fit compares candidates and a per-cell mask gives
+  them different residual dimensionalities.)*
 - **4.3** The residual map, which cleanly discriminates H1 from H2 and is nearly
   free: H1 predicts low residuals (many entries fit comparably, one was chosen
   arbitrarily), H2 predicts high residuals (nothing fits).
@@ -785,6 +800,24 @@ Hypotheses, tested in order of cost:
   per-voxel, probabilistically meaningful quality flag; and validate that flag
   against the CRLB prediction, since the Fisher matrix predicts where the ridge
   is worst before any fitting is done.
+  *(Specified 2026-09-10; amendment `2026-09-10-phase4-v_i-estimable-bound`.
+  At the executed acquisition the debiased Fisher matrix inverts at 1.6% of
+  nodes, so a plain CRLB on `log v_i` would exist almost nowhere. The error bar is
+  the estimable-contrast bound on the `k_io`-profiled block, reported with its
+  estimability defect. The defect tolerance below which `v_i` is reported is
+  **not** pre-registered, changes coverage materially, and is left to the project
+  owner; every tolerance is reported and none is nominated.)*
+
+*(Executed 2026-09-10 on Mayo_Glioma sub-125;* [`fisher_phase4.md`](fisher_phase4.md)*.
+The unrealistic volumes are H2: blow-up voxels fit at 16.6 times their noise floor
+against 0.34 for the rest, carry free-water-like ADC (2.42 against 0.92 µm²/ms),
+and 79.9% of them take one library volume, 41.79 pL, at the `(rho_min, v_i_min)`
+corner of the band. H1's residual prediction fails and its ridge signature is not
+distinguishable from the band's geometry (amendment
+`2026-09-10-phase4-geometric-null`). `--fit-s0` halves the 20-30 pL blow-ups but
+grows the >50 pL tail; the trust floor removes the >50 pL tail and leaves the
+bulk. At this acquisition 98% of blow-up voxels have no Fisher matrix, `rho` and
+`V` are separately reportable nowhere, and item 4.5's premise is not met.)*
 
 Honest limit to state in the manuscript: if H1 is the mechanism, the blow-up is
 not a bug and cannot be fixed by better code. It is the model reporting that it
@@ -945,6 +978,98 @@ said, what it says now, and why, so a decision can be reconstructed without
 diffing git history by hand. Nothing is deleted; superseded wording is quoted
 here. `madi/fisher_crlb_preregistration.json` carries a matching
 `amendment_log` array.
+
+### 2026-09-10-phase4-geometric-null — the ridge test gained a geometric null after the first report
+
+- **Previously:** item 4.4's "estimates sliding along the ridge" was pre-registered
+  (`phase4.criteria.H1_ridge`) against a 45-degree uniform null.
+- **Now:** a permutation null that keeps each voxel's starting estimate and pairs
+  it with a randomly chosen other voxel's perturbed estimate is reported beside it,
+  and the ridge conclusion is read against that null.
+- **Why:** the library band is about 23 times longer along the constant-`v_i`
+  hyperbola than across it, so any move inside it makes a small angle with the
+  hyperbola whatever the Fisher geometry is. Against the uniform null the observed
+  medians of 2.0-3.6 degrees looked like strong support for H1; against the
+  geometric null the probability that a null angle exceeds an observed one is
+  0.43-0.60 for every perturbation.
+- **Transparency:** this is **post-hoc**. It was added after the first Phase-4
+  report was read and before any ridge claim was written. It is the more
+  conservative reference and it removed a conclusion rather than creating one. The
+  pre-registered uniform-null criterion is kept, unedited, and still reported.
+
+### 2026-09-10-phase4-dataset-and-h4-scope — Phase 4 runs on sub-125, where H4's thesis mechanism cannot occur
+
+- **Previously:** section 7 framed the pathology through the MADI III and
+  Jackson-thesis data and named no repository dataset. H4's stated mechanism is
+  the thesis's `b = 50` lowest shell, a biased amplitude reference.
+- **Now:** Phase 4 is executed on Mayo_Glioma sub-125 (`delta = 20`,
+  `Delta = 50` ms; `b = 0` ×5, 500 ×6, 1000 ×18, 1500 ×24, 2000 ×30, 2500 ×36),
+  with one condition varied per fit arm under MAP and Bayes. 4.1 tests the
+  variance side of H4 — whether a fitted `S0` changes the pathology, and what the
+  amplitude costs in bound and direction — and states that the bias side is
+  untestable here.
+- **Why:** it is the one repository dataset with an executed, correctly masked
+  reference fit showing the pathology (20.3% of Bayes-fitted voxels above 20 pL).
+  No repository dataset has a `b = 50`-without-`b = 0` structure, and §2.7 already
+  records that `S(50)` extrapolated from the stored grid cannot carry a
+  conclusion. Averaging reduces noise; it cannot reduce bias.
+- **Found while choosing it:** `data/outputs/madi_output_glioma_v4.0/map` is not
+  a glioma fit. Its command fits edema **sub-187** DWI with the sub-187 mask
+  (95,655 voxels) while filed beside the correctly masked sub-125 Bayes run. It is
+  data and is left untouched; the Phase-4 runner refuses any arm whose recorded
+  mask hash differs from the declared mask.
+- **Left open:** replication on sub-059, which shares the protocol.
+
+### 2026-09-10-phase4-trust-floor-fit-forms — the H3 masking flag has two fit-time forms
+
+- **Previously:** item 4.2 read "Test H3. One masking flag." Section 2.6 defines
+  the floor per `(entry, column)` and applies it inside a Fisher sum, and no fit
+  exposed it.
+- **Now:** `scripts/fit_data.py --trust-floor` (bare flag uses the pre-registered
+  value) with `--trust-floor-mode column|candidate`, backed by
+  `madi.fisher_crlb.fit_trust_floor_masks` and the newly public
+  `madi.library.candidate_selection_mask`. The mask is recorded in the run
+  sidecar.
+- **Why:** a Fisher sum is a sum over cells, so a per-cell mask is harmless there.
+  A fit is a comparison between candidates, and a per-cell residual mask gives
+  each candidate a different residual dimensionality. That makes residuals
+  incomparable, and it biases selection toward exactly the entries the floor
+  indicts, since an entry that drops its own worst-fitting high-`b` columns is
+  scored on an easier problem. The two forms that avoid it bracket H3 from
+  opposite sides: `column` throws away trustworthy measurements to keep the data
+  identical, and `candidate` keeps every measurement and removes the untrustworthy
+  library entries.
+- **Measured before any fit result was read:** at sub-125's acquisition 5,174 of
+  94,095 `(candidate, column)` cells (5.5%) fall below 0.015. `column` mode drops
+  `b = 2000` and `b = 2500`, leaving three columns for three parameters, and
+  `candidate` mode drops 3,355 of 18,819 entries. The column-mode record was
+  confirmed end to end on a single-slice smoke fit.
+
+### 2026-09-10-phase4-v_i-estimable-bound — the 4.5 error bar where the Fisher matrix does not invert
+
+- **Previously:** item 4.5 asked for `log v_i` "with a CRLB-derived error bar"
+  and did not say what to do where the Fisher matrix is singular.
+- **Now:** the bound is `madi.fisher_crlb.estimable_rho_V_contrast_bound`. On the
+  `k_io`-profiled block it sums over informative eigendirections, and it equals
+  the ordinary contrast CRLB wherever `F` inverts. It is reported with an
+  **estimability defect**: the share of the `v_i` contrast lying in directions the
+  data do not inform. The strict reading (defect 0) and tolerances
+  0.01–0.20 are all reported. **No tolerance is nominated.**
+- **Why:** at the executed acquisition, measured before any fit was read, the
+  debiased Fisher matrix is positive definite at 179 of 11,417 nodes (1.57%). A
+  plain CRLB on `log v_i` would therefore exist almost nowhere. That would make
+  4.5's "principled replacement" empty for a reason unrelated to `v_i`. At the
+  10,124 nodes with one uninformative direction, that direction is the hyperbola
+  (median |cos| to `(1, -1)` = 0.998), so `v_i` is nearly estimable where `rho`
+  and `V` are not. This is the Stoica–Marzetta result for singular information
+  matrices, and the profiled route matched the exact contrast CRLB on every
+  invertible node to 1.1e-8.
+- **Why the tolerance is left open:** strictly, any non-zero defect makes the
+  bound infinite. How much defect a reported `v_i` may carry is a reporting
+  choice, not arithmetic. It changes node-level coverage from 1.6% (strict) to
+  79% (0.20), while the bound where reported moves only from a median of about 4%
+  to 7%. That changes what the manuscript's replacement for the 20 pL cutoff
+  reports, so it is the project owner's call.
 
 ### 2026-09-09-phase3-domain-decision — Phase 3 reports both layers, contrasted
 

@@ -1460,6 +1460,7 @@ def _record_fit_completion(
             "fit_triples_delta_Delta_b": [
                 [float(delta), float(Delta), float(b)] for delta, Delta, b in fit_triples
             ],
+            "trust_floor_mask": extras.get("trust_floor"),
             "grid_edge_policy": {
                 "vi_min": float(args.vi_min),
                 "vi_max": float(args.vi_max),
@@ -1756,6 +1757,25 @@ def main():
     ap.add_argument("--rho-max", type=float, default=None,
                     help="Optional upper bound on library rho [cells/uL] "
                          "for matching (e.g. 1500000 for brain).")
+    ap.add_argument("--trust-floor", type=float, nargs="?", const=-1.0, default=None,
+                    metavar="S_OVER_S0",
+                    help="Apply the pre-registered S/S0 trust floor as a FIT-TIME mask "
+                         "(hypothesis H3 of fisher_crlb_analysis_plan.md section 7). Bare "
+                         "--trust-floor uses the pre-registered value from "
+                         "madi/fisher_crlb_preregistration.json; a value overrides it. Library "
+                         "signal below the floor is measurement noise rather than tissue "
+                         "contrast, and this switches that condition on as an experimental "
+                         "condition. Off by default: the floor is an analysis-time and fit-time "
+                         "mask, never a builder property.")
+    ap.add_argument("--trust-floor-mode", choices=("column", "candidate"), default="column",
+                    help="How the trust floor is applied. 'column' drops an acquisition column "
+                         "at which ANY candidate falls below the floor, so every candidate is "
+                         "scored on identical data (plan section 2.6's conservative diagnostic). "
+                         "'candidate' drops a candidate ENTRY that falls below the floor at any "
+                         "used column, keeping every measurement. A per-(entry,column) residual "
+                         "mask is deliberately not offered: it gives each candidate a different "
+                         "residual dimensionality, which both makes residuals incomparable and "
+                         "biases selection toward the very entries the floor indicts.")
     ap.add_argument("--include-free-water", action="store_true",
                     help="Include the explicit rho=V=0 free-water atom in "
                          "the MAP candidate set. When selected, k_io is "
@@ -1785,6 +1805,8 @@ def main():
                 "vi_max": float(args.vi_max),
                 "rho_max": args.rho_max,
                 "include_free_water": bool(args.include_free_water),
+                "trust_floor_requested": args.trust_floor,
+                "trust_floor_mode": args.trust_floor_mode,
                 "tie_breaking": "first array-order entry among exact minima (numpy.argmin)",
                 "b_snap_tolerance_s_mm2": B_LIB_MATCH_TOL,
                 "timing_snap_tolerance_ms": TIMING_SNAP_TOL_MS,
@@ -2337,6 +2359,69 @@ def main():
         snap_summary = _snap_summary(snap_events)
         extras["all_snap_events"] = snap_events
         extras["snap_summary"] = snap_summary
+
+        # ---- Fit-time S/S0 trust floor (plan section 7, hypothesis H3) ------
+        # Switched on as an experimental condition, never on by default.  The
+        # mask itself comes from madi.fisher_crlb so a fit and a Fisher
+        # evaluation cannot disagree about what "below the floor" means, and
+        # the candidate filter comes from madi.library for the same reason.
+        trust_floor_record = None
+        if args.trust_floor is not None:
+            from madi.fisher_crlb import fit_trust_floor_masks, load_preregistration
+            from madi.library import candidate_selection_mask
+            floor = (float(load_preregistration()["trust_floor"])
+                     if args.trust_floor == -1.0 else float(args.trust_floor))
+            fit_columns, _ = resolve_grid_columns(
+                fit_triples, lib_delta_pairs, lib_b_values, lib_n_b,
+                b_tol=B_LIB_MATCH_TOL, timing_tol=TIMING_SNAP_TOL_MS)
+            selected = candidate_selection_mask(
+                lib, args.vi_min, args.vi_max, args.rho_max,
+                include_free_water=args.include_free_water)
+            candidate_signals = np.asarray(
+                [lib[i].vector[fit_columns] for i in np.flatnonzero(selected)], dtype=float)
+            floor_masks = fit_trust_floor_masks(candidate_signals, floor)
+            print(f"\n  Trust floor {floor:g} (S/S0), mode '{args.trust_floor_mode}':")
+            print(f"    {floor_masks['cells_below_floor']} of {candidate_signals.size} "
+                  f"(candidate, column) cells below the floor "
+                  f"({floor_masks['cell_fraction_below_floor']*100:.2f}%)")
+            trust_floor_record = {
+                "trust_floor": floor,
+                "mode": args.trust_floor_mode,
+                "source": ("preregistration" if args.trust_floor == -1.0 else "user"),
+                "candidates_considered": int(candidate_signals.shape[0]),
+                "columns_considered": int(candidate_signals.shape[1]),
+                "cells_below_floor": floor_masks["cells_below_floor"],
+                "cell_fraction_below_floor": floor_masks["cell_fraction_below_floor"],
+                "columns_dropped": floor_masks["columns_dropped"],
+                "candidates_dropped": floor_masks["candidates_dropped"],
+            }
+            if args.trust_floor_mode == "column":
+                keep = np.asarray(floor_masks["column_keep"], dtype=bool)
+                dropped = [f"b={fit_triples[i][2]:g}" for i in np.flatnonzero(~keep)]
+                if not keep.any():
+                    print("ERROR: the trust floor removes every acquisition column."); return
+                print(f"    columns dropped: {floor_masks['columns_dropped']} "
+                      f"({', '.join(dropped) if dropped else 'none'}); "
+                      f"{int(keep.sum())} retained")
+                trust_floor_record["dropped_columns"] = [
+                    {"delta_ms": float(fit_triples[i][0]), "Delta_ms": float(fit_triples[i][1]),
+                     "b_s_mm2": float(fit_triples[i][2])} for i in np.flatnonzero(~keep)]
+                measured = measured[:, keep]
+                if extras.get("raw") is not None:
+                    extras["raw"] = extras["raw"][:, keep]
+                fit_triples = [t for t, k in zip(fit_triples, keep) if k]
+                n_features = len(fit_triples)
+            else:
+                keep_candidate = np.asarray(floor_masks["candidate_keep"], dtype=bool)
+                if not keep_candidate.any():
+                    print("ERROR: the trust floor removes every candidate entry."); return
+                drop = np.zeros(len(lib), dtype=bool)
+                drop[np.flatnonzero(selected)[~keep_candidate]] = True
+                print(f"    candidate entries dropped: {floor_masks['candidates_dropped']} "
+                      f"of {int(selected.sum())}; {int(keep_candidate.sum())} retained")
+                lib = [entry for entry, d in zip(lib, drop) if not d]
+            trust_floor_record["features_after_mask"] = len(fit_triples)
+        extras["trust_floor"] = trust_floor_record
         print("  Snap summary: "
               f"{snap_summary['n_snapped_b_shells']} b shell(s), "
               f"{snap_summary['n_snapped_timing_pairs']} timing pair(s); "
