@@ -103,3 +103,32 @@ in full to populate `LibraryEntry.metadata`, which is why loading the library
 whole is so expensive. The explorer never touches it; all row labels come from
 the small `kios` / `rhos` / `Vs` / `vis` / `nominal_*` / `weights` /
 `is_free_water` arrays, which total about 1.3 MB.
+---
+
+## 4. Plotly 6 quirks this tool had to work around
+
+Not defects in project code, but they cost real debugging time and will bite
+again if someone edits `app.py`.
+
+**Numpy `customdata` never reaches click events.** Plotly 6 serialises numpy
+arrays as `{"dtype": ..., "bdata": <base64>}`. plotly.js decodes that for
+coordinates, but it does not expand it into per-point `customdata`, so a click
+arrives with `customdata: null` and the "click a point to re-centre the slice"
+callback silently does nothing. Fixed by `_row_ids()`, which hands Plotly a
+plain list of ints. Anything added to `customdata` must go through it.
+
+**An empty `options` list nulls a Dropdown's value.** A `dcc.Dropdown` served
+with `value="k_io"` but `options=[]`, intending a callback to fill the options,
+renders blank and reports `None` to every callback that reads it. This bit
+twice: once on the per-slot `Delta` dropdown and once on `colour-by`. Serve the
+full option list in the layout and use callbacks only to change `disabled`.
+
+**A near-collinear 3-D scatter disappears at the default camera.** With grouped
+axes, three mean-S/S0 values at nearby diffusion times are almost perfectly
+correlated, so all 18,819 points lie close to the cube's main diagonal. The
+default Plotly camera (`eye = 1.25, 1.25, 1.25`) looks straight down that
+diagonal and foreshortens the whole manifold into a streak a few pixels long,
+which reads as an empty plot. Diagnosed by rendering the identical data to a
+standalone HTML file, where the streak is visible. The scene now sets an
+explicit off-diagonal camera and larger faint markers. If a future axis choice
+looks empty in 3-D, check the camera before suspecting the data.

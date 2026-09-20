@@ -164,22 +164,42 @@ def _spread(values: np.ndarray, log: bool = False) -> dict:
 
     ``log_width`` is max/min, the natural width on a log-spaced axis: 1.0 means
     the survivors sit at a single grid value, 10 means they span a decade.
+
+    Zero and negative values have no log width.  The free-water atom is exactly
+    that case -- it carries rho = V = 0 -- so the ratio is taken over the
+    strictly positive values only and ``n_nonpositive`` records how many were
+    set aside.  Letting one zero turn the whole width into NaN made the width
+    curve vanish whenever free water was included.
     """
     values = np.asarray(values, dtype=float)
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return {"n": 0, "min": float("nan"), "max": float("nan"),
-                "std": float("nan"), "log_width": float("nan")}
+                "std": float("nan"), "log_width": float("nan"),
+                "n_nonpositive": 0}
+    positive = finite[finite > 0.0]
     record = {
         "n": int(finite.size),
         "min": float(finite.min()),
         "max": float(finite.max()),
         "std": float(finite.std()),
         "log_width": float("nan"),
+        "n_nonpositive": int(finite.size - positive.size),
     }
-    if log and finite.min() > 0.0:
-        record["log_width"] = float(finite.max() / finite.min())
+    if log and positive.size > 0:
+        record["log_width"] = float(positive.max() / positive.min())
     return record
+
+
+def rmse_to_reference(block: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Root-mean-square distance to the reference, per entry, in S/S0 units.
+
+    Deliberately noise-free: unlike chi2 it does not divide by sigma, so it
+    ranks entries by raw prediction mismatch and does not move when the noise
+    slider does.  Zero at the reference entry itself.
+    """
+    residual = np.asarray(block, dtype=float) - np.asarray(reference, dtype=float)
+    return np.sqrt(np.einsum("ij,ij->i", residual, residual) / residual.shape[1])
 
 
 def slice_manifold(block: np.ndarray, reference: np.ndarray, labels: LibraryLabels,
@@ -187,8 +207,8 @@ def slice_manifold(block: np.ndarray, reference: np.ndarray, labels: LibraryLabe
                    sigma_measurement: float = DEFAULT_SIGMA,
                    variance_block: np.ndarray | None = None,
                    s0_mode: str = "fixed",
-                   display_block: np.ndarray | None = None,
-                   display_columns: np.ndarray | None = None) -> SliceResult:
+                   display_values: np.ndarray | None = None,
+                   display_names: list[str] | None = None) -> SliceResult:
     """Keep entries whose prediction matches ``reference`` on the given columns.
 
     Parameters
@@ -224,10 +244,12 @@ def slice_manifold(block: np.ndarray, reference: np.ndarray, labels: LibraryLabe
         "k_io": _spread(labels.kios[rows]),
         "vi": _spread(labels.vis[rows]),
     }
-    if display_block is not None and display_columns is not None:
+    if display_values is not None and display_names is not None:
+        # Display axes may be collapsed groups rather than single columns, so
+        # they arrive already reduced to one number per entry per axis.
         result.display_stats = {
-            labels.column_label(int(column)): _spread(display_block[survivors, j])
-            for j, column in enumerate(np.asarray(display_columns))
+            name: _spread(np.asarray(display_values)[survivors, j])
+            for j, name in enumerate(display_names)
         }
     return result
 
@@ -262,5 +284,8 @@ def widths_versus_measured_count(block: np.ndarray, reference: np.ndarray,
             "kio_std": step.parameter_stats["k_io"]["std"],
             "rho_std": step.parameter_stats["rho"]["std"],
             "V_std": step.parameter_stats["V"]["std"],
+            # Survivors with rho <= 0 (only the free-water atom) sit outside
+            # any log ratio; the width above is taken over the rest.
+            "n_nonpositive_rho": step.parameter_stats["rho"]["n_nonpositive"],
         })
     return answer

@@ -10,6 +10,8 @@ Prints, and does not assert, so the degeneracy result is whatever it is:
 3. The rho-V degeneracy -- slice around a mid-grid entry at one Delta, then
    add a second Delta, and report how the (rho, V) spread changes.
 4. Load time and peak memory for a representative 50-column request.
+5. The Fisher matrix at the same node: CRLB, spectrum, the constant-v_i angle,
+   and how the predicted width compares with the measured slice width.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import fisher as fisher_tools
 from . import slice as slicing
 from .build_column_cache import DEFAULT_LIBRARY
 from .columns import NpzColumnReader, cache_is_valid, load_labels, open_reader
@@ -137,13 +140,59 @@ def main() -> None:
     result = slicing.slice_manifold(
         measured, measured[centre], labels, eligible, threshold=len(measured_columns),
         sigma_measurement=0.02, variance_block=variance,
-        display_block=display, display_columns=display_columns)
+        display_values=display,
+        display_names=[labels.column_label(int(c)) for c in display_columns])
     slice_seconds = time.time() - started
     print(f"  {len(measured_columns)} measured + {len(display_columns)} display columns")
     print(f"  load  : {load_seconds:.3f} s")
     print(f"  slice : {slice_seconds * 1000:.1f} ms -> {result.n_survivors} survivors")
     print(f"  arrays: {(measured.nbytes + variance.nbytes + display.nbytes) / 1e6:.1f} MB")
     print(f"  RSS   : {before:.3f} GB before -> {_rss_gb():.3f} GB after")
+
+    _fisher_section(args, labels, reader, eligible, centre_row)
+
+
+def _fisher_section(args, labels, reader, eligible, centre_row):
+    """Print the Fisher/CRLB quantities beside the measured slice width."""
+    _heading("5. Fisher information, spectrum and CRLB")
+    started = time.time()
+    grid = fisher_tools.build_node_grid(labels)
+    coverage = fisher_tools.coverage(grid, 1)
+    print(f"  node grid + coverage in {time.time() - started:.2f}s: "
+          f"{coverage['complete']}/{coverage['total']} entries "
+          f"({coverage['fraction']:.1%}) have a complete k=1 central stencil")
+    print(f"  missing per axis: {coverage['missing_per_axis']}")
+
+    node = grid.node_of_row.get(int(centre_row))
+    if node is None:
+        print("  the reference row is not a cellular grid node")
+        return
+
+    for name, chosen in [("Delta=50 only", labels.columns_for_pair(20.0, 50.0, b_max=6000.0)),
+                         ("Delta=50 + Delta=20",
+                          np.concatenate([labels.columns_for_pair(20.0, 50.0, b_max=6000.0),
+                                          labels.columns_for_pair(20.0, 20.0, b_max=6000.0)]))]:
+        block = reader.read(chosen)
+        J, missing = fisher_tools.jacobian(grid, block, node)
+        if J is None:
+            print(f"  {name}: no central stencil on {missing}")
+            continue
+        report = fisher_tools.fisher_report(J, block[centre_row], 0.01,
+                                            labels.kios[centre_row])
+        threshold = 1.0 * len(chosen)
+        measured = slicing.slice_manifold(
+            block[eligible], block[centre_row], labels, eligible,
+            threshold=threshold, sigma_measurement=0.01)
+        predicted = float(np.exp(2.0 * np.sqrt(threshold) * report["crlb"][0]))
+        print(f"  {name:22s} n_cols={len(chosen):3d}")
+        print(f"     CRLB log rho={report['crlb'][0]:.4g} log V={report['crlb'][1]:.4g} "
+              f"k_io={report['crlb'][2]:.4g}   log v_i={report['crlb_log_vi']:.4g}")
+        print(f"     eig(D F D)={np.array2string(report['eigenvalues'], precision=4)} "
+              f"kappa={report['condition_number']:.4g} pd={report['positive_definite']}")
+        print(f"     sloppy angle from constant-v_i: {report['sloppy_angle_deg']:.2f} deg "
+              f"(3-D), {report['profiled_angle_deg']:.2f} deg (k_io profiled)")
+        print(f"     rho width: Fisher predicts {predicted:.4g}, slice measures "
+              f"{measured.parameter_stats['rho']['log_width']:.4g}")
 
 
 def _mid_grid_row(labels, eligible: np.ndarray) -> int:
