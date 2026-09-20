@@ -106,6 +106,13 @@ def memmap_member(path: str | Path, member: str) -> np.memmap:
     return np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=shape)
 
 
+def read_small_member(path: str | Path, member: str) -> np.ndarray:
+    """Read one small member whole (axis labels, scalars -- never a matrix)."""
+    with zipfile.ZipFile(path) as archive:
+        with archive.open(f"{member}.npy") as stream:
+            return np.lib.format.read_array(stream, allow_pickle=False)
+
+
 # ---------------------------------------------------------------------------
 # Labels: what each row and each column means
 # ---------------------------------------------------------------------------
