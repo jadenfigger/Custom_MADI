@@ -311,7 +311,8 @@ def parameter_figure(data, eligible, survivors, reference_row,
     figure.add_trace(go.Scattergl(
         x=x_all[~off_axis], y=y_all[~off_axis], mode="markers",
         name="all entries", marker=background,
-        customdata=_row_ids(eligible[~off_axis]), hoverinfo="skip",
+        customdata=_row_ids(eligible[~off_axis]), text=_hover_text(labels, eligible[~off_axis]),
+        hovertemplate="%{text}<extra></extra>",
     ))
     figure.add_trace(go.Scattergl(
         x=x_all[survivor_mask & ~off_axis], y=y_all[survivor_mask & ~off_axis],
@@ -328,7 +329,8 @@ def parameter_figure(data, eligible, survivors, reference_row,
             x=x_all[undefined], y=y_all[undefined], mode="markers",
             name=f"hue undefined ({int(undefined.sum())})",
             marker=dict(size=3, color="#e8e8e8"),
-            customdata=_row_ids(eligible[undefined]), hoverinfo="skip",
+            customdata=_row_ids(eligible[undefined]), text=_hover_text(labels, eligible[undefined]),
+            hovertemplate="%{text}<extra></extra>",
         ))
     if np.any(off_axis):
         # The free-water band: real entries, drawn where a log axis has no zero.
@@ -513,7 +515,8 @@ def fisher_plane_figure(labels, eligible, survivors, reference_row, colour,
     figure.add_trace(go.Scattergl(
         x=rho[eligible][on_axis], y=V[eligible][on_axis], mode="markers",
         name="all entries", marker=dict(size=3, color="#e0e0e0"),
-        customdata=_row_ids(eligible[on_axis]), hoverinfo="skip"))
+        customdata=_row_ids(eligible[on_axis]), text=_hover_text(labels, eligible[on_axis]),
+        hovertemplate="%{text}<extra></extra>"))
     keep = survivor_mask & on_axis
     figure.add_trace(go.Scattergl(
         x=rho[eligible][keep], y=V[eligible][keep], mode="markers",

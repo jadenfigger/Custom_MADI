@@ -128,7 +128,7 @@ def chi2_free_s0(block: np.ndarray, reference: np.ndarray,
         mm = float(scaled_reference @ scaled_reference)
     ss = np.maximum(ss, 1e-300)
     amplitude = ms / ss
-    residual = mm - (ms ** 2) / ss
+    residual = np.maximum(mm - (ms ** 2) / ss, 0.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         normalized = residual / np.maximum(amplitude, 1e-300) ** 2
     return np.where(amplitude > 0.0, normalized, np.inf)
@@ -259,7 +259,8 @@ def widths_versus_measured_count(block: np.ndarray, reference: np.ndarray,
                                  sigma_measurement: float = DEFAULT_SIGMA,
                                  variance_block: np.ndarray | None = None,
                                  s0_mode: str = "fixed",
-                                 reduced_threshold: float = 1.0) -> list[dict]:
+                                 reduced_threshold: float = 1.0,
+                                 checkpoint=lambda: None) -> list[dict]:
     """Add measured columns one at a time and watch the parameter spreads shrink.
 
     Columns are used in the order they appear in ``block``.  The threshold is
@@ -267,25 +268,43 @@ def widths_versus_measured_count(block: np.ndarray, reference: np.ndarray,
     the same question ("agrees to about one sigma per column") rather than a
     progressively harsher one.
     """
+    if s0_mode not in {"fixed", "free"}:
+        raise ValueError("S0 mode must be fixed or free.")
     answer = []
+    # Accumulate sufficient statistics once per column: O(entries * columns),
+    # rather than recomputing every prefix with quadratic column cost.
+    cumulative = np.zeros(block.shape[0])
+    ss, ms, mm = (np.zeros(block.shape[0]) for _ in range(3))
     for k in range(1, block.shape[1] + 1):
-        variance_k = None if variance_block is None else variance_block[:, :k]
-        step = slice_manifold(
-            block[:, :k], reference[:k], labels, eligible_rows,
-            threshold=reduced_threshold * k,
-            sigma_measurement=sigma_measurement,
-            variance_block=variance_k, s0_mode=s0_mode,
-        )
+        checkpoint()
+        variance_k = None if variance_block is None else variance_block[:, k - 1]
+        sigma = column_sigma(sigma_measurement, variance_k)
+        signal, measured = block[:, k - 1] / sigma, reference[k - 1] / sigma
+        if s0_mode == "fixed":
+            cumulative += (signal - measured) ** 2
+            chi2 = cumulative
+        else:
+            ss += signal ** 2
+            ms += signal * measured
+            mm += measured ** 2
+            safe_ss = np.maximum(ss, 1e-300)
+            amplitude = ms / safe_ss
+            with np.errstate(divide="ignore", invalid="ignore"):
+                chi2 = np.where(amplitude > 0, np.maximum(mm - ms ** 2 / safe_ss, 0)
+                                / np.maximum(amplitude, 1e-300) ** 2, np.inf)
+        rows = eligible_rows[chi2 <= reduced_threshold * k]
+        rho_stats = _spread(labels.nominal_rhos[rows], log=True)
+        V_stats = _spread(labels.nominal_Vs[rows], log=True)
         answer.append({
             "n_measured": k,
-            "n_survivors": step.n_survivors,
-            "rho_log_width": step.parameter_stats["rho"]["log_width"],
-            "V_log_width": step.parameter_stats["V"]["log_width"],
-            "kio_std": step.parameter_stats["k_io"]["std"],
-            "rho_std": step.parameter_stats["rho"]["std"],
-            "V_std": step.parameter_stats["V"]["std"],
+            "n_survivors": len(rows),
+            "rho_log_width": rho_stats["log_width"],
+            "V_log_width": V_stats["log_width"],
+            "kio_std": _spread(labels.kios[rows])["std"],
+            "rho_std": rho_stats["std"],
+            "V_std": V_stats["std"],
             # Survivors with rho <= 0 (only the free-water atom) sit outside
             # any log ratio; the width above is taken over the rest.
-            "n_nonpositive_rho": step.parameter_stats["rho"]["n_nonpositive"],
+            "n_nonpositive_rho": rho_stats["n_nonpositive"],
         })
     return answer

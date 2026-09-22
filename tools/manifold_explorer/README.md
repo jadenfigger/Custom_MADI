@@ -32,7 +32,7 @@ The intended experiment: slice at one `Delta`, watch the survivors stretch along
 a constant `rho*V` curve, then add a second `Delta` and watch the curve collapse.
 
 The slice is the **exact** region. The **Fisher / CRLB** view puts its *local
-quadratic approximation* on the same axes — `chi2 ~ dtheta^T F dtheta` — so you
+quadratic approximation* on the same axes â€” `chi2 ~ dtheta^T F dtheta` â€” so you
 can see where the linearisation holds and where it does not. Measured at
 `rho=3.3e5, V=2.1, k_io=20`, sigma 0.01:
 
@@ -49,7 +49,7 @@ reason both are drawn together.
 ## Setup (once)
 
 ```bash
-pip install dash
+pip install -r tools/manifold_explorer/requirements.txt
 ```
 
 Then build the column-major cache. The library is stored row-major, so reading
@@ -92,6 +92,7 @@ Opens `http://127.0.0.1:8050` in your browser. Useful flags:
 | `--no-cache` | read columns straight from the `.npz` (no cache needed, ~3 s per new `(delta, Delta)`) |
 | `--port N` | serve on another port |
 | `--no-browser` | do not open a browser |
+| `--memory-cache-mb N` | shared array-cache budget in MiB (default 256; 0 disables retention) |
 | `--debug` | Dash debug mode with the error overlay |
 
 It opens on a working slice: measured columns at `delta = 20 ms`,
@@ -100,7 +101,7 @@ It opens on a working slice: measured columns at `delta = 20 ms`,
 
 ## Layout
 
-**Left** — controls in the order you use them, each section foldable:
+**Left** â€” controls in the order you use them, each section foldable:
 
 | section | what it decides |
 |---|---|
@@ -110,12 +111,105 @@ It opens on a working slice: measured columns at `delta = 20 ms`,
 | 4. Slice | sigma, threshold, S0 convention, candidate filter |
 | 5. Colour | which quantity the points are coloured by |
 | 6. Fisher / CRLB | stencil, ellipse convention, debias, diagnostics |
+| 7. Workspace / export | session files, undo/redo, data exports, plot density |
 
-**Right** — one summary line that is always visible, then three views:
+**Right** â€” one summary line that is always visible, then four views:
 **Slice** (prediction space and the two parameter planes), **Fisher / CRLB**
 (the matrix, its spectrum, the ellipse over the survivors, CRLB vs column
-count) and **Widths**. All three stay mounted, so a click in any plot
+count), **Widths**, and **Inspect / next acquisition**. All views stay mounted, so a click in any plot
 re-centres every other one.
+
+## Workspace, inspection and acquisition planning
+
+* **Save / load sessions.** Section 7 downloads versioned JSON with ordered measured
+  columns, reference signals or row, display groups, noise/filter/Fisher settings,
+  colours, plot budget, active view and explicit inspected row. Loading restores
+  these controls together. Library fingerprints use labels and stored array
+  checksums; mismatched libraries are rejected before changing controls. Zoom and
+  camera are retained during normal redraws, but are not saved in session JSON.
+* **Undo / redo.** Up to 50 states are kept in this browser tab. Rapid changes are
+  coalesced over 350 ms. Loading JSON or signal CSV is undoable. Reloading the page
+  clears history; save JSON for durable workspaces.
+* **Reference CSV.** Import `column_id,signal` or `delta,Delta,b,signal` headers,
+  with one acquisition per row and finite S/S0 values. File order becomes measured
+  order, including in column-count curves. Import replaces the measured set,
+  disables group-following and selects pasted reference mode. Duplicate or unknown
+  acquisitions, malformed values and uploads over 2 MiB are rejected. Export
+  **Reference signals** for an import template.
+* **Inspector.** Hover a scatter point, then open **Inspect / next acquisition**.
+  The last hovered row is retained; entering a row pins the inspection. It reports
+  nominal/realised parameters, transformed coordinates, survival, chi-square,
+  raw RMSE and fitted amplitude, with per-acquisition residuals and the 20 largest
+  discrepancies. Free-S0 residuals are `(a*S - reference)/(a*sigma)`, matching the
+  slice. Nonpositive amplitudes are rejected with undefined residuals.
+* **Acquisition ranking.** Enable ranking to scan unmeasured columns at the
+  measured-column picker's `(delta, Delta)`. Score = population standard deviation
+  of surviving predictions / measurement noise. With MC variance enabled, the
+  noise denominator also includes mean survivor MC variance / 40. Prediction
+  quantiles are shown too. This equally weighted, raw-S/S0 heuristic is descriptive,
+  not posterior information gain or an amplitude-marginal design bound. Choose a
+  ranked acquisition and add it directly in entry-reference mode. Pasted references
+  instead need a CSV containing the additional observed signal.
+* **Candidate cap.** Section 4 exposes maximum realised rho, using the fitter's
+  selection rules. Leave it empty for no cap.
+
+| Shortcut (outside text inputs) | Action |
+|---|---|
+| Ctrl/Command+S | Save session JSON |
+| Alt+Z / Alt+Shift+Z | Undo / redo |
+| Alt+1 / 2 / 3 / 4 | Slice / Fisher / Widths / Inspect |
+| Alt+R | Snap reference to entered parameters |
+
+## Exporting results
+
+Use section 7's **Export current result** after computation finishes. Numeric
+exports use all eligible entries, irrespective of plot sampling.
+
+| Format | Contents |
+|---|---|
+| Survivor / all-candidate CSV | Row ids, nominal/realised parameters, chi-square, survival and transformed coordinates/validity |
+| NumPy NPZ | Eligible signals, ordered acquisition ids/triples, reference, optional MC variance, parameters, chi-square, survival mask, transformed coordinates/validity, session JSON, available reference Fisher matrix/CRLB/spectrum and computed acquisition ranking |
+| Reference CSV | Acquisition ids/triples and S/S0; suitable for reimport |
+| HTML report | Currently computed interactive plots and session provenance; Plotly embedded for offline viewing |
+| Plot camera button | Current plot as a 3600 Ã— 2400 PNG, rendered in the browser |
+
+NPZ files contain numeric, boolean and Unicode arrays only: use
+`np.load(path, allow_pickle=False)`. `session_json` is a Unicode scalar containing
+JSON. Undefined values (e.g. free-water k_io and invalid ADC) remain NaN in numeric
+arrays/CSV, accompanied by masks. Source libraries and caches stay read-only.
+The tool imports MADI reference measurements, not arbitrary point clouds or
+volumetric images: acquisition and row identities belong to the chosen library.
+
+## Responsiveness and resource limits
+
+Control changes schedule background work. Previous plots remain usable while
+status says queued/running; only the newest request in a browser can publish or
+export results. Obsolete queued jobs are cancelled and running calculations
+check cancellation between stages. An active library read cannot be interrupted.
+Errors show an actionable message; **Recompute** retries without losing controls.
+Idle pages stop polling.
+
+The default preview samples at most 5,000 distinct entries deterministically from
+survivors and background, retaining the reference. Colour ranges, counts, widths,
+ranking and exports use all eligible entries. Raise the plot budget for the whole
+cloud. Column-count curves are deferred until their view opens. Slice widths
+accumulate prefix statistics in linear rather than quadratic column time.
+
+Signal, variance and batch-Jacobian arrays share a byte-bounded LRU cache. The
+default 256 MiB limits cached arrays, not total process memory: running jobs,
+completed results and figures also use memory. Each input block is limited to
+128 MiB and measured selections/imports to 2,048 columns. Two workers serve up to
+eight retained browser results. Completed idle results are evicted first when
+full and expire after 30 minutes without access; recompute an evicted result.
+This local application uses one server process. Its jobs are not shared between
+multiple WSGI processes.
+
+Richardson derivatives are used consistently in reference, colour and column-count
+views. Richardson MC debias is rejected because cross-stencil covariance is
+unavailable; use k=1/k=2 or disable debias. Fisher colours state their fixed-S0,
+measurement-noise-only, non-debiased convention. The reference panel follows the
+selected S0/debias convention and uses measurement noise only; the exact slice
+can additionally include candidate-specific library MC variance.
 
 ## Using it
 
@@ -177,9 +271,9 @@ re-centres every other one.
    log-spaced axis: `1.0` = a single grid value, `10` = a decade.
 7. **Fisher / CRLB** (section 6, and the view of the same name). At the
    reference node the app builds the Jacobian by central differences across
-   neighbouring library entries — the same canonical nominal grid, log-coordinate
+   neighbouring library entries â€” the same canonical nominal grid, log-coordinate
    denominators and pre-registered stencil widths `scripts/run_fisher_phase1.py`
-   uses — and then calls `madi.fisher_crlb` for everything else. You get:
+   uses â€” and then calls `madi.fisher_crlb` for everything else. You get:
 
    - the 3x3 matrix in `(log rho, log V, k_io)`, its CRLB, `kappa`, and the
      eigenvalues of `D F D`;
@@ -224,6 +318,7 @@ re-centres every other one.
 
 ```bash
 python -m pytest tests/manifold_explorer -q              # needs pytest
+node --test tests/manifold_explorer/workspace_history.test.cjs  # optional browser-history unit checks
 python -m tools.manifold_explorer.selftest               # no pytest needed
 python -m tools.manifold_explorer.selftest --slow        # also reads the 15 GB artifact
 python -m tools.manifold_explorer.sanity_checks          # prints timings + the degeneracy result
@@ -242,7 +337,13 @@ result as measured, with nothing asserted or tuned.
 | `columns.py` | label loading and the two column readers (`.npz` memmap, column cache) |
 | `build_column_cache.py` | one-time banded transpose into `data/cache/` |
 | `slice.py` | candidate filter, chi2 conventions, slice + width statistics |
-| `app.py` | the Dash application |
+| `data.py` | read-only library access and cached candidate selection |
+| `analysis.py` | UI-independent analysis, inspection, ranking and scientific exports |
+| `runtime.py` | bounded array cache and background jobs |
+| `session.py` | session schema, library identity and validated JSON/CSV imports |
+| `workspace.py` | Dash adapters for jobs, downloads and inspection |
+| `assets/workspace.js` | browser-local history, debouncing and shortcuts |
+| `app.py` | Dash layout and scientific view controller |
 | `sanity_checks.py` | timings and the three sanity checks against the real library |
 | `selftest.py` | runs the test suite without pytest |
 | `KNOWN_ISSUES.md` | two defects in existing code this tool routes around |
