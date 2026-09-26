@@ -1,0 +1,226 @@
+{
+  "configuration": {
+    "REPO": "/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/processing/madi_gpu/Custom_MADI",
+    "LIBRARY": "/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/processing/madi_gpu/Custom_MADI/data/libraries/madi_dense_universal_remediated.npz",
+    "RUNS": "/home/jaden/madi_fisher_runs/full_domain",
+    "PHASE1": "/home/jaden/madi_fisher_runs/full_domain/phase1",
+    "CACHE": "/home/jaden/madi_fisher_runs/full_domain/cache",
+    "TISSUE_TARGETS": [
+      [
+        100000.0,
+        3.0,
+        5.0
+      ]
+    ],
+    "NODE_INDICES": null,
+    "SWEEP_TIMINGS": [
+      [
+        4.0,
+        20.0
+      ]
+    ],
+    "B_VALUES": [
+      500,
+      1000,
+      1500,
+      2000,
+      2500,
+      3000,
+      3500,
+      4000,
+      4500,
+      5000,
+      5500,
+      6000,
+      6500,
+      7000,
+      7500,
+      8000,
+      8500,
+      9000,
+      9500,
+      10000,
+      10500,
+      11000,
+      11500,
+      12000
+    ],
+    "SWEEP_COLUMN_IDS": null,
+    "SUPPORT": [
+      [
+        20.0,
+        50.0,
+        [
+          1000,
+          3000,
+          6000
+        ]
+      ]
+    ],
+    "ORDER_BY": "b",
+    "GRADIENT_RANGE_T_M": [
+      0.0,
+      null
+    ],
+    "SWEEP_REPEATS": 1,
+    "AVERAGES": 1.0,
+    "NOISE_MODEL": "constant",
+    "CONSTANT_SIGMA": 0.02,
+    "SNR_AT_TE_ZERO": 50.0,
+    "T2_MS": 80.0,
+    "T_EPI_MS": 30.0,
+    "TRUST_FLOOR": null,
+    "RICIAN_MIN": null,
+    "N0_EFF": 4.0,
+    "B0_TIMING": [
+      20.0,
+      50.0
+    ],
+    "INVALID_POLICY": "gap",
+    "DEBIAS_MC": true,
+    "ALLOW_UNDEFINED_FIGURES": true,
+    "RANK_RTOL": 1e-12,
+    "FIGSIZE": [
+      10.0,
+      6.3
+    ],
+    "FONT_SIZE": 18,
+    "COLORS": [
+      "#256abf",
+      "#d75c2b",
+      "#1b8a68",
+      "#8755a3"
+    ],
+    "LINEWIDTH": 2.4,
+    "MARKERSIZE": 4,
+    "XLIM": null,
+    "YLIMS": {
+      "k_io": null,
+      "log_rho": null,
+      "log_V": null
+    },
+    "TITLES": {
+      "k_io": "Exchange rate $k_{io}$",
+      "log_rho": "Log cell density $\\ln\\rho$",
+      "log_V": "Log cell volume $\\ln V$"
+    },
+    "OUTPUT": "/mnt/c/Miscellaneous/Coding_Projects/Python/mri_processing/processing/madi_gpu/Custom_MADI/analysis/outputs/crlb_vs_b",
+    "FORMATS": [
+      "png"
+    ],
+    "DPI": 300,
+    "PLOT_ORDER": [
+      "k_io",
+      "log_rho",
+      "log_V"
+    ]
+  },
+  "internal_order": [
+    "log_rho",
+    "log_V",
+    "k_io"
+  ],
+  "plot_order": [
+    "k_io",
+    "log_rho",
+    "log_V"
+  ],
+  "plotted_quantity": "untransformed variance bound diag(F^-1), linear axis",
+  "phase1_domain": {
+    "basis": "all_stored_columns",
+    "is_complete_stored_grid": true,
+    "columns": 31125,
+    "full_stored_columns": 31125,
+    "restriction_source": null,
+    "restriction_note": null,
+    "declares": "reusable model-derived substrate; no hardware, acquisition or trust mask applied"
+  },
+  "cache_manifest": {
+    "artifact": "data/libraries/madi_dense_universal_remediated.npz",
+    "banner": "GRID COMPLETE",
+    "column_domain": {
+      "basis": "all_stored_columns",
+      "columns": 31125,
+      "declares": "reusable model-derived substrate; no hardware, acquisition or trust mask applied",
+      "full_stored_columns": 31125,
+      "is_complete_stored_grid": true,
+      "restriction_note": null,
+      "restriction_source": null
+    },
+    "column_domain_banner": "COLUMN DOMAIN COMPLETE \u2014 all 31125 stored (delta, Delta, b) columns",
+    "members": {
+      "ensemble_means_subset": {
+        "bytes": 602240128,
+        "file": "ensemble_means_subset.npy",
+        "shape": [
+          18820,
+          40,
+          200
+        ]
+      },
+      "signal_variance": {
+        "bytes": 2343090128,
+        "columns": 31125,
+        "file": "signal_variance_selected.npy",
+        "rows": 18820,
+        "source_dtype": "float32"
+      },
+      "vectors": {
+        "bytes": 2343090128,
+        "columns": 31125,
+        "file": "vectors_selected.npy",
+        "rows": 18820,
+        "source_dtype": "float64"
+      }
+    },
+    "phase1": "/home/jaden/madi_fisher_runs/full_domain/phase1",
+    "schema": "madi-fisher-phase2-cache-v2",
+    "selected_columns": 31125
+  },
+  "support_columns": [
+    23077,
+    23081,
+    23087
+  ],
+  "sweep_columns": [
+    4526,
+    4527,
+    4528,
+    4529,
+    4530,
+    4531,
+    4532,
+    4533,
+    4534,
+    4535,
+    4536,
+    4537,
+    4538,
+    4539,
+    4540,
+    4541,
+    4542,
+    4543,
+    4544,
+    4545,
+    4546,
+    4547,
+    4548,
+    4549
+  ],
+  "n_ensembles": 40,
+  "amplitude_prior_precision": 10000.0,
+  "interpretation": "fixed support plus 1 independent repeats of one DW column",
+  "selected_nodes": [
+    {
+      "nodes": [
+        23,
+        38,
+        5
+      ],
+      "rho": 124519.70847350318,
+      "V": 3.9289098225529635,
+      "kio": 5.0
+    }
+  ]
+}

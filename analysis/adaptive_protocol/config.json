@@ -1,0 +1,28 @@
+{
+  "library": "data/libraries/madi_dense_universal_remediated.npz",
+  "runs": "//wsl.localhost/Ubuntu/home/jaden/madi_fisher_runs/full_domain",
+  "output": "analysis/adaptive_protocol/outputs/windows_run",
+  "budgets": [16, 128],
+  "nodes": {"k_io_values": [5, 20, 40], "requested_node": [250000, 4, 20]},
+  "noise": {"SNR_ref": 50.0, "TE_ref_s": 0.0, "T2_s": 0.040, "TE_offset_s": 0.014},
+  "evaluation": {
+    "debias": true, "trust_floor": 0.0, "rician_min": 0.0,
+    "rician_basis": "phase2_repeated_mean", "pd_rtol": 1e-12,
+    "objective": "robust_minimax", "objective_amplitude": "marginal_S0",
+    "minimum_coverage": 0.51
+  },
+  "design": {
+    "delta_values_ms": [2, 4, 8, 12, 20, 30],
+    "Delta_values_ms": [10, 15, 20, 25, 30, 40, 50, 60, 80],
+    "b_values_s_mm2": [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 9000, 9500, 10000, 10500, 11000, 11500, 12000],
+    "G_max_T_m": null, "delta_bounds_ms": null, "Delta_bounds_ms": null,
+    "b_bounds_s_mm2": null, "reserved_b0_volumes": 2,
+    "min_repetitions": 1, "max_repetitions": null,
+    "max_distinct_columns": 12, "max_timing_pairs": 4
+  },
+  "optimizer": {"random_seed": 20260925, "starts": 4, "iterations_per_start": 450,
+    "initial_temperature": 0.15, "final_temperature": 0.002,
+    "local_passes": 2, "top_k": 3},
+  "figures": {"dpi": 300, "formats": ["png", "pdf", "svg"], "k_io_values": [5, 20, 40]},
+  "protocols": []
+}
