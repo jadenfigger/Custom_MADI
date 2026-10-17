@@ -1689,12 +1689,11 @@ def main():
         help="[bayes only] Instead of a fixed --sigma-m, pick σ_m so that "
              "the posterior's effective number of contributing library "
              "entries (n_eff = 1/Σw_i², median over a random voxel "
-             "subsample) hits this value. Useful with --fit-s0, whose "
-             "residual scale (S0 fitted per candidate) is not directly "
-             "comparable to the fixed-S0 residual, so the same σ_m does "
-             "not give comparable posterior sharpness across the two — "
-             "run without --fit-s0 first, note its n_eff, then pass that "
-             "value here for the --fit-s0 run to match its discrimination.")
+             "subsample) hits this value. σ_m is the noise std on "
+             "S/S0_measured with or without --fit-s0 (the free-S0 "
+             "posterior is the profile likelihood over the amplitude), so "
+             "this is a choice of posterior sharpness, not a unit "
+             "conversion between the two modes.")
     method_grp.add_argument(
         "--lambda1", type=float, default=DEFAULT_LAMBDA1,
         help=f"[amico only] L1 (sparsity) penalty (default {DEFAULT_LAMBDA1}).")
@@ -2563,6 +2562,7 @@ def main():
 
         # ---- bayes / amico: distributional fitters ----
         raw_signal = extras['raw'] if args.fit_s0 else None
+        s0_measured = extras['s0'] if args.fit_s0 else None
         method_meta = {}   # method-specific params recorded in JSON
 
         # Candidate-library size after the vi/rho_max filter (same mask
@@ -2592,6 +2592,7 @@ def main():
                     n_b=lib_n_b, fit_triples=fit_triples,
                     target_n_eff=args.target_n_eff,
                     fit_s0=args.fit_s0, raw_signal=raw_signal,
+                    s0_measured=s0_measured,
                     vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                     use_gpu=use_gpu,
                 )
@@ -2633,6 +2634,7 @@ def main():
                 vi_min=args.vi_min, vi_max=args.vi_max, rho_max=args.rho_max,
                 log_space=args.log_space,
                 fit_s0=args.fit_s0, raw_signal=raw_signal,
+                s0_measured=s0_measured,
                 use_gpu=use_gpu,
             )
             print(f"  Done in {time.time()-t0:.1f}s")

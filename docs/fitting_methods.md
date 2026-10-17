@@ -79,15 +79,38 @@ then report, for each parameter θ ∈ {k_io, ρ, V},
 ```
 
 Weights are computed in log-space with a per-voxel `max(log w)` subtraction
-before exponentiating, for numerical stability. With `--fit-s0` the residual
-in the exponent is the free-S₀ residual **divided by that candidate's own
-fitted S₀²** before being compared against `σ_m`, and negative-S₀ candidates
-get zero weight. This keeps `σ_m` on the same normalized S/S₀ scale in both
-modes — the raw free-S₀ residual scales like `S₀²` (thousands, for typical
-DWI intensities), so applying `σ_m` to it directly (without this
-normalization) made the posterior collapse to a one-hot MAP-equivalent pick
-regardless of `σ_m` (`n_eff=1`, `std=0` everywhere) — a bug fixed in both
-the CPU and GPU paths.
+before exponentiating, for numerical stability.
+
+**With `--fit-s0`** each candidate gets its own amplitude `a`, and the weight
+is the **profile likelihood** over that amplitude, with the noise scaled by the
+voxel's *measured* S₀:
+
+```
+rᵢ = min_a ||m − a·sᵢ||²  =  ( ||M||² − (M·sᵢ)²/(sᵢ·sᵢ) ) / S0_measured²
+wᵢ ∝ exp( −rᵢ / (2 σ_m²) ),     m = M / S0_measured
+```
+
+Here `M` is the raw (un-normalized) shell signal. Candidates whose best
+amplitude is negative get zero weight. The reported `s0_fit` is the posterior
+mean of `a·S0_measured`, in raw units. Voxels with no usable measured S₀ (≤ 0
+or non-finite) get the zero-weight "no support" result. The noise is fixed in
+raw units, so every candidate is judged against the same scale, and σ_m means
+the same thing as in the fixed-S₀ branch.
+
+*Earlier versions* divided each candidate's residual by **its own** fitted
+S₀ᵢ² instead of by the measured S₀². That is `rᵢ/aᵢ²`, so each candidate got
+a noise level proportional to the amplitude it needed, and low-signal
+candidates (large cells, low ρ, which need a large `a`) were favoured. On
+CDMD sub-001 (arm A8) this pushed both cortical GM and WM to ρ ≈ 0.03–0.06·10⁶ cells/µL and
+V ≈ 33–39 pL, with posterior-mean S₀ 13–33× the measured b=0. Profile
+weighting on the same voxels gives GM k_io ≈ 60 s⁻¹, ρ ≈ 1.0·10⁶, V ≈ 0.8 pL,
+a ≈ 1.12. `bayes --fit-s0` outputs made before this fix should be
+regenerated. The MAP free-S₀ matcher was never affected, because the argmin
+of the raw residual does not depend on the noise scale.
+
+The profile likelihood replaces the amplitude by its best value; it does not
+integrate it out. With a flat prior on `a`, integrating would add a factor
+`1/||sᵢ||` per candidate. That factor is not applied.
 
 **σ_m** (residual noise std on the *normalized* signal, **regardless of
 whether `--fit-s0` is set**) is chosen as:
@@ -122,39 +145,25 @@ this can be judged after the fact.
 
 ### σ_m calibration (`--target-n-eff`)
 
-**The same σ_m does not give comparable posterior sharpness in the fixed-S₀
-and free-S₀ (`--fit-s0`) branches**, because their residuals are on
-genuinely different scales, not just different units. With `--fit-s0`, each
-candidate `i` gets its own least-squares-optimal `S0ᵢ*`, which absorbs the
-single largest source of mismatch (overall amplitude) before the shape
-residual is ever compared to σ_m — an extra fitted parameter can only shrink
-a residual, never grow it, the same way adjusted-R² never exceeds R². Because
-many entries in a dense library differ from their neighbors mostly in level
-rather than shape, this systematically fattens the weight given to
-*off-optimal* candidates once S₀ is free, flattening the posterior — for the
-same σ_m, `--fit-s0` runs typically land at a much higher `n_eff` (weaker
-discrimination) than the fixed-S₀ branch. This isn't a bug in either branch's
-math; it just means σ_m's "how much do I trust this candidate" meaning isn't
-portable between them. It also isn't fixable by a closed-form noise
-correction — the gap is dominated by how residuals fall off across *nearby*
-candidates in a specific library, i.e. local library geometry, not by the
-measurement noise level that σ_m formulas above are derived from.
+`--target-n-eff FLOAT` calibrates σ_m against `n_eff` instead of against
+noise. `n_eff(σ_m)` increases monotonically with σ_m under either S₀
+convention, because a larger σ_m always flattens the posterior. So
+`calibrate_sigma_m()` (`madi/fitters.py`) bisects σ_m on a random subsample of
+the voxels being fit (`sample_size`, default 1500) until the sample's *median*
+`n_eff` matches the target. It then runs the full fit with that σ_m. Use it to
+reason in terms of posterior sharpness instead of a noise value.
 
-`--target-n-eff FLOAT` sidesteps this by calibrating σ_m directly against
-`n_eff` instead of against noise: `n_eff(σ_m)` is monotonically increasing
-for either S₀ convention (larger σ_m always flattens the posterior further),
-so `calibrate_sigma_m()` (`madi/fitters.py`) bisects σ_m — on a random
-subsample of the voxels being fit (`sample_size`, default 1500), not the
-whole volume — until the sample's *median* `n_eff` matches the target, then
-runs the full fit with that σ_m. This works identically for both S₀
-conventions since it never assumes a noise model, only monotonicity.
+σ_m has the same meaning with and without `--fit-s0`: noise std on
+`S/S0_measured`. So a noise-derived σ_m (`--sigma-m` or auto-Rician) can be
+used directly for `--fit-s0`, and no conversion between the modes is needed.
+The two posteriors still differ at the same σ_m. Profiling out `a` can only
+shrink a residual, so `--fit-s0` posteriors are as broad as the fixed-S₀
+ones or broader. That reflects the extra free parameter, not a unit
+mismatch. Matching `n_eff` across the two modes with `--target-n-eff`
+therefore compares them at equal sharpness, not at equal noise.
 
-Typical workflow: run the fixed-S₀ `bayes` fit first (with `--sigma-m` or
-auto-Rician as usual), note its printed/`fit_metadata.json` `n_eff`, then
-rerun with `--fit-s0 --target-n-eff <that n_eff>` so the free-S₀ run matches
-the same discriminative power instead of guessing at a new `--sigma-m`.
-Calibration progress (`σ_m → median n_eff` per bisection step) is printed;
-the final calibrated σ_m is logged the same way a user-supplied one would be
+Calibration progress (`σ_m → median n_eff` per bisection step) is printed.
+The final calibrated σ_m is logged the same way a user-supplied one would be
 (`method_meta['sigma_m']`, `method_meta['sigma_m_source'] = "target-n-eff"`).
 
 **Outputs:** `kio_mean.nii.gz`, `rho_mean.nii.gz`, `V_mean.nii.gz`,
@@ -270,9 +279,8 @@ recorded in `fit_metadata.json` as `"device"`.
 - **`bayes`** — when you want uncertainty maps and noise-averaged, off-grid
   estimates. Tune `σ_m` to your noise level (auto with `--rician-correct`),
   or set `--target-n-eff` directly if you want to reason in terms of
-  discrimination strength instead of a noise value — the latter is
-  necessary, not just convenient, when comparing a `--fit-s0` run against a
-  fixed-S₀ one (see **σ_m calibration** above).
+  discrimination strength instead of a noise value (see **σ_m calibration**
+  above). The same σ_m applies with or without `--fit-s0`.
 - **`amico`** — when you want a sparse mixture interpretation, regularized /
   smoother maps, and the `n_eff` diagnostic, and can afford the per-voxel
   solve. Start from the ridge default and raise `--lambda2` for more smoothing
@@ -325,6 +333,20 @@ for three parameters. The fitter prints the retained feature vector; read it.
 ## Amendment log
 
 This reference is amended in place, per the convention in `INDEX.md`.
+
+### 2026-10-17-bayes-fits0-profile-likelihood — free-S₀ Bayes weighting fixed
+
+- **Previously:** `bayes --fit-s0` divided each candidate's raw residual by
+  that candidate's own fitted S₀², and the σ_m-calibration section said the
+  fixed- and free-S₀ residuals were on incomparable scales.
+- **Now:** the weight is the profile likelihood, raw residual / measured S₀²,
+  and `bayes_fit(fit_s0=True)` requires `s0_measured`. The σ_m-calibration
+  section and the `--target-n-eff` help text now say that σ_m has one meaning
+  in both modes.
+- **Why:** the old scaling gave each candidate a noise level proportional to
+  its own amplitude, which favoured low-signal candidates and drove cortical-GM
+  fits to ρ ≈ 0.05·10⁶, V ≈ 35 pL with S₀ 13–33× the measured b=0. See
+  `analysis/cdmd_cohort/springer_discrepancy/`.
 
 ### 2026-09-10-trust-floor — the fit-time trust floor is documented
 

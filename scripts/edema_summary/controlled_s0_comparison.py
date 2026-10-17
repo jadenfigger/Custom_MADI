@@ -280,6 +280,7 @@ def _fit_existing_bayes(
     meta: dict,
     ratios: np.ndarray,
     shells: np.ndarray,
+    s0_measured: np.ndarray,
     sigma_m: float,
 ) -> Dict[str, np.ndarray]:
     fitted = fitters.bayes_fit(
@@ -295,6 +296,7 @@ def _fit_existing_bayes(
         rho_max=None,
         fit_s0=method == "fits0",
         raw_signal=shells if method == "fits0" else None,
+        s0_measured=s0_measured if method == "fits0" else None,
         use_gpu=False,
     )
     for parameter in PARAMETERS:
@@ -308,6 +310,7 @@ def _calibrate_existing_sigma(
     meta: dict,
     ratios: np.ndarray,
     shells: np.ndarray,
+    s0_measured: np.ndarray,
     target_n_eff: float,
 ) -> float:
     return fitters.calibrate_sigma_m(
@@ -320,6 +323,7 @@ def _calibrate_existing_sigma(
         target_n_eff=target_n_eff,
         fit_s0=method == "fits0",
         raw_signal=shells if method == "fits0" else None,
+        s0_measured=s0_measured if method == "fits0" else None,
         vi_min=0.0,
         vi_max=0.95,
         rho_max=None,
@@ -348,8 +352,8 @@ def fit_three_methods(
     s0_measured = np.mean(b0, axis=1)
     ratios = shells / np.maximum(s0_measured[:, None], 1e-10)
     if fit_mode == "matched_n_eff":
-        sigma_fixed = _calibrate_existing_sigma("fixed", lib, meta, ratios, shells, target_n_eff)
-        sigma_fits0 = _calibrate_existing_sigma("fits0", lib, meta, ratios, shells, target_n_eff)
+        sigma_fixed = _calibrate_existing_sigma("fixed", lib, meta, ratios, shells, s0_measured, target_n_eff)
+        sigma_fits0 = _calibrate_existing_sigma("fits0", lib, meta, ratios, shells, s0_measured, target_n_eff)
         joint_scale = _joint_noise_scale_for_target(
             b0, shells, candidate_matrix, kios, rhos, volumes, noise_sigma, n_dirs, target_n_eff
         )
@@ -369,8 +373,8 @@ def fit_three_methods(
     else:
         raise ValueError(f"unknown fit mode {fit_mode}")
     results = {
-        "fixed": _fit_existing_bayes("fixed", lib, meta, ratios, shells, sigma_fixed),
-        "fits0": _fit_existing_bayes("fits0", lib, meta, ratios, shells, sigma_fits0),
+        "fixed": _fit_existing_bayes("fixed", lib, meta, ratios, shells, s0_measured, sigma_fixed),
+        "fits0": _fit_existing_bayes("fits0", lib, meta, ratios, shells, s0_measured, sigma_fits0),
         "joint": joint_s0_bayes(b0, shells, candidate_matrix, kios, rhos, volumes, noise_sigma, n_dirs, joint_scale),
     }
     for method, result in results.items():
