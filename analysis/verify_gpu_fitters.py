@@ -109,11 +109,14 @@ def check_map_and_bayes(library, n_vox, vi_min, vi_max, rho_max, seed=0):
         all_ok &= _report(f"Bayes fixed-S0 {key}",
                            np.allclose(r_c[key], r_g[key], atol=1e-6, rtol=1e-5))
 
+    s0_measured = raw[:, 0] / measured[:, 0]
     r_c = fitters.bayes_fit(measured, library, sigma_m=sigma_m, fit_s0=True,
-                             raw_signal=raw, vi_min=vi_min, vi_max=vi_max,
+                             raw_signal=raw, s0_measured=s0_measured,
+                             vi_min=vi_min, vi_max=vi_max,
                              rho_max=rho_max, use_gpu=False)
     r_g = fitters.bayes_fit(measured, library, sigma_m=sigma_m, fit_s0=True,
-                             raw_signal=raw, vi_min=vi_min, vi_max=vi_max,
+                             raw_signal=raw, s0_measured=s0_measured,
+                             vi_min=vi_min, vi_max=vi_max,
                              rho_max=rho_max, use_gpu=True)
     for key in ("kio_mean", "residual", "n_eff", "s0_fit"):
         all_ok &= _report(f"Bayes free-S0 {key}",
@@ -215,12 +218,13 @@ def check_degenerate_voxel_handling(seed=4):
 
     ok = True
 
+    s0_measured = np.array([100.0, 50.0])
     r_cpu = fitters.bayes_fit(measured, library, sigma_m=0.03, fit_s0=True,
-                               raw_signal=raw, vi_min=0.0, vi_max=1.0,
-                               use_gpu=False)
+                               raw_signal=raw, s0_measured=s0_measured,
+                               vi_min=0.0, vi_max=1.0, use_gpu=False)
     r_gpu = fitters.bayes_fit(measured, library, sigma_m=0.03, fit_s0=True,
-                               raw_signal=raw, vi_min=0.0, vi_max=1.0,
-                               use_gpu=True)
+                               raw_signal=raw, s0_measured=s0_measured,
+                               vi_min=0.0, vi_max=1.0, use_gpu=True)
     ok &= _report("Bayes free-S0 CPU has no NaN", not np.any(np.isnan(r_cpu["kio_mean"])))
     ok &= _report("Bayes free-S0 GPU has no NaN", not np.any(np.isnan(r_gpu["kio_mean"])))
     ok &= _report("Bayes free-S0 CPU/GPU agree on degenerate voxel",

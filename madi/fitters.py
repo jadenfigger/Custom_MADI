@@ -26,10 +26,8 @@ comparable.  See ``docs/fitting_methods.md`` for the math and guidance.
 
 ``calibrate_sigma_m``
     Picks σ_m for ``bayes_fit`` by target ``n_eff`` instead of by noise
-    level, bisecting on a voxel subsample. Needed because the fixed-S₀ and
-    free-S₀ (``fit_s0=True``) residuals are on different scales (S₀ fitted
-    per candidate absorbs the dominant mismatch term in the latter), so the
-    same σ_m does not give comparable posterior sharpness in both — see
+    level, bisecting on a voxel subsample. Useful when you want to reason
+    in terms of posterior sharpness rather than a noise value — see
     ``docs/fitting_methods.md`` § "σ_m calibration".
 
 The fitters return ``dict``s of flat per-voxel maps so that
@@ -117,15 +115,23 @@ def bayes_fit(
     vi_min=0.5, vi_max=0.95, rho_max=None,
     include_free_water=False,
     log_space=False, s_floor=1e-3,
-    fit_s0=False, raw_signal=None,
+    fit_s0=False, raw_signal=None, s0_measured=None,
     use_gpu=None,
 ):
     """Bayesian posterior-mean fit over the full candidate library.
 
     Weights ``w_i ∝ exp(-r_i / (2 σ_m²))`` where ``r_i`` is the squared
-    residual of library entry ``i`` (fixed-S₀: ``||m - s_i||²``; free-S₀:
-    ``||m||² - (m·s_i)²/(s_i·s_i)`` with negative-S₀ candidates excluded).
-    Computed in log-space with a per-voxel max subtraction for stability.
+    residual of library entry ``i`` on the normalized signal ``m = M/S0``.
+    Fixed-S₀: ``r_i = ||m - s_i||²``. Free-S₀: the profile likelihood over
+    a per-candidate amplitude ``a``, ``r_i = min_a ||m - a s_i||² =
+    (||M||² - (M·s_i)²/(s_i·s_i)) / S0_measured²``, with negative-amplitude
+    candidates excluded. ``σ_m`` therefore means the same thing (noise std
+    on ``M/S0_measured``) in both modes. Computed in log-space with a
+    per-voxel max subtraction for stability.
+
+    ``fit_s0=True`` needs ``raw_signal`` (un-normalized shell signal, the
+    ``M`` above) and ``s0_measured`` (per-voxel measured b=0 signal in the
+    same raw units; voxels where it is ≤0 or non-finite get zero weight).
 
     ``use_gpu`` : None (default) = use CUDA if available, else CPU. The
     GPU path (``fitters_gpu.bayes_fit_gpu``) is an exact reordering of this
@@ -155,12 +161,20 @@ def bayes_fit(
     if fit_s0:
         if raw_signal is None:
             raise ValueError("fit_s0=True requires raw_signal.")
+        if s0_measured is None:
+            raise ValueError("fit_s0=True requires s0_measured (the measured "
+                             "b=0 signal per voxel, raw units).")
         M = raw_signal.astype(np.float64)            # (n_vox, n_feat)
         R = lib_mat.astype(np.float64)               # (n_lib, n_feat)
+        s0_meas = np.asarray(s0_measured, dtype=np.float64).reshape(-1)
+        if s0_meas.shape[0] != M.shape[0]:
+            raise ValueError(f"s0_measured has {s0_meas.shape[0]} entries, "
+                             f"raw_signal has {M.shape[0]} voxels.")
 
         if use_gpu:
             return fitters_gpu.bayes_fit_gpu(M, R, kios_arr, rhos_arr,
                                               Vs_arr, sigma_m, fit_s0=True,
+                                              s0_measured=s0_meas,
                                               quadrature_weights=quadrature_weights)
 
         rr = np.maximum(np.sum(R * R, axis=1), 1e-30)
@@ -171,21 +185,20 @@ def bayes_fit(
         # Forbid negative S0 (flipped signal): give it zero posterior mass.
         resid = np.where(S0_cand > 0, resid, np.inf)
 
-        # `resid` is on raw (un-normalized) signal units -- it scales like
-        # S0_cand^2 -- but sigma_m is specified on the normalized S/S0
-        # scale (same convention as the fixed-S0 branch). Feeding the raw
-        # residual straight into `resid / (2 sigma_m^2)` below made the
-        # exponent astronomically large relative to sigma_m (S0 ~
-        # thousands => resid ~ S0^2 ~ millions), so exp() underflowed to
-        # exactly 0 for every candidate except the single best one --
-        # collapsing the posterior to a one-hot MAP-equivalent pick
-        # (n_eff=1, std=0) regardless of sigma_m. Dividing by S0_cand^2
-        # converts it back to the same normalized-signal residual the
-        # fixed-S0 branch uses: resid/S0_cand^2 = ||M/S0_cand - s_i||^2.
+        # Profile likelihood over the per-candidate amplitude. `resid` is
+        # min_a ||M - a s_i||^2 in raw units; the noise is fixed in raw
+        # units, so every candidate is scored against the SAME per-voxel
+        # scale, the measured S0: resid / S0_meas^2 = min_a ||m - a s_i||^2
+        # with m = M / S0_meas, the normalized signal sigma_m refers to.
+        # (Dividing by each candidate's own fitted S0^2 instead gave each
+        # candidate a noise level proportional to the amplitude it needed,
+        # so low-signal candidates won -- see docs/fitting_methods.md.)
+        # Voxels with no usable measured S0 get the all-inf "no support" row.
         # `resid` (raw units) is kept as-is for the reported `residual`
         # output, matching the MAP free-S0 matcher's convention.
-        S0_safe = np.where(S0_cand > 0, S0_cand, 1.0)
-        weight_resid = resid / (S0_safe ** 2)
+        s0_ok = np.isfinite(s0_meas) & (s0_meas > 0)
+        s0_sq = np.where(s0_ok, s0_meas, 1.0) ** 2
+        weight_resid = np.where(s0_ok[:, None], resid / s0_sq[:, None], np.inf)
     else:
         if log_space:
             measured = np.log(np.clip(measured_batch, s_floor, 1.0))
@@ -252,6 +265,7 @@ def calibrate_sigma_m(
     target_n_eff,
     fit_s0=False,
     raw_signal=None,
+    s0_measured=None,
     vi_min=0.5, vi_max=0.95, rho_max=None,
     sigma_lo=1e-5, sigma_hi=1.0,
     n_iter=25,
@@ -264,12 +278,7 @@ def calibrate_sigma_m(
 
     ``n_eff = 1/Σw_i²`` grows monotonically with σ_m under either S0
     convention (larger σ_m flattens the posterior toward uniform weights),
-    so a plain bisection converges regardless of how the fixed- vs free-S0
-    residual scales differ from each other — this sidesteps needing a
-    closed-form noise-propagation correction for ``fit_s0``, whose residual
-    (``S0`` fitted per candidate) is systematically smaller than the
-    fixed-S0 residual by an amount that depends on the library's local
-    geometry, not just measurement noise, so no such closed form exists.
+    so a plain bisection converges without assuming a noise model.
 
     Runs on a random subsample of ``sample_size`` voxels (not the full
     volume), since only the aggregate (median) n_eff is needed, not
@@ -279,8 +288,8 @@ def calibrate_sigma_m(
     """
     if target_n_eff <= 0:
         raise ValueError(f"target_n_eff must be > 0, got {target_n_eff}")
-    if fit_s0 and raw_signal is None:
-        raise ValueError("fit_s0=True requires raw_signal.")
+    if fit_s0 and (raw_signal is None or s0_measured is None):
+        raise ValueError("fit_s0=True requires raw_signal and s0_measured.")
 
     n_vox = measured_batch.shape[0]
     n_sample = min(sample_size, n_vox)
@@ -288,6 +297,7 @@ def calibrate_sigma_m(
     idx = rng.choice(n_vox, size=n_sample, replace=False)
     measured_sub = measured_batch[idx]
     raw_sub = raw_signal[idx] if fit_s0 else None
+    s0_sub = np.asarray(s0_measured)[idx] if fit_s0 else None
 
     def median_n_eff(sigma_m):
         out = bayes_fit(
@@ -296,7 +306,7 @@ def calibrate_sigma_m(
             lib_delta_pairs=lib_delta_pairs, lib_b_values=lib_b_values,
             n_b=n_b, fit_triples=fit_triples,
             vi_min=vi_min, vi_max=vi_max, rho_max=rho_max,
-            fit_s0=fit_s0, raw_signal=raw_sub,
+            fit_s0=fit_s0, raw_signal=raw_sub, s0_measured=s0_sub,
             use_gpu=use_gpu,
         )
         n_eff = out["n_eff"]

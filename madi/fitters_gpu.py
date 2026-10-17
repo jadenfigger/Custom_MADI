@@ -207,8 +207,8 @@ if HAS_CUDA:
         out_sumw2[tid] = sw2
 
     @cuda.jit
-    def _bayes_kernel_free_s0(raw, lib, lib_rr, kios, rhos, Vs, quadrature_weights,
-                               inv_two_sigma2,
+    def _bayes_kernel_free_s0(raw, lib, lib_rr, s0_meas, kios, rhos, Vs,
+                               quadrature_weights, inv_two_sigma2,
                                out_sumw, out_sumw_kio, out_sumw_kio2,
                                out_sumw_rho, out_sumw_rho2,
                                out_sumw_V, out_sumw_V2,
@@ -223,19 +223,19 @@ if HAS_CUDA:
         for f in range(n_feat):
             mm += raw[tid, f] * raw[tid, f]
 
-        # `resid` (below) is on raw signal units -- it scales like s0^2 --
-        # but inv_two_sigma2 = 1/(2 sigma_m^2) is calibrated for the
-        # normalized S/S0 scale (same convention as the fixed-S0 kernel).
-        # Weighting directly by `resid` made the exponent astronomically
-        # large relative to sigma_m whenever S0 ~ thousands (resid ~ S0^2
-        # ~ millions), underflowing exp() to exactly 0 for every candidate
-        # but the single best one -- collapsing the posterior to a one-hot
-        # MAP-equivalent pick (n_eff=1, std=0) regardless of sigma_m.
-        # `resid_w = resid / s0^2` converts it back to the same
-        # normalized-signal residual the fixed-S0 kernel uses
-        # (resid/s0^2 = ||raw/s0 - lib_j||^2); `resid` itself (raw units)
-        # is kept for the reported residual output, matching the MAP
-        # free-S0 matcher's convention.
+        # Profile likelihood over the per-candidate amplitude: `resid`
+        # (raw units) is scored against the voxel's MEASURED S0, the same
+        # scale for every candidate, so resid_w = resid / s0_meas^2 =
+        # min_a ||raw/s0_meas - a lib_j||^2 on the normalized scale
+        # inv_two_sigma2 refers to (see fitters.bayes_fit). `resid` itself
+        # (raw units) is kept for the reported residual output, matching
+        # the MAP free-S0 matcher's convention. A voxel with no usable
+        # measured S0 masks every candidate, hitting the guard below.
+        s0m = s0_meas[tid]
+        if s0m > 0.0 and s0m < math.inf:
+            inv_s0m2 = 1.0 / (s0m * s0m)
+        else:
+            inv_s0m2 = math.inf
         min_resid = math.inf
         for j in range(n_lib):
             mr = 0.0
@@ -244,10 +244,10 @@ if HAS_CUDA:
             rr = lib_rr[j]
             s0 = mr / rr
             resid = mm - (mr * mr) / rr
-            if s0 <= 0.0:
+            if s0 <= 0.0 or inv_s0m2 == math.inf:
                 resid_w = math.inf
             else:
-                resid_w = resid / (s0 * s0)
+                resid_w = resid * inv_s0m2
             if resid_w < min_resid:
                 min_resid = resid_w
 
@@ -273,7 +273,7 @@ if HAS_CUDA:
                 if s0 <= 0.0:
                     resid_w = math.inf
                 else:
-                    resid_w = resid / (s0 * s0)
+                    resid_w = resid * inv_s0m2
                 # exp(-inf) == 0.0: masked candidates naturally get zero weight.
                 w = quadrature_weights[j] * math.exp(-(resid_w - min_resid) * inv_two_sigma2)
                 sw += w
@@ -464,12 +464,14 @@ def map_match_fits0_gpu(raw_signal, lib_mat, kios_arr, rhos_arr, Vs_arr):
 
 
 def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
-                   sigma_m, fit_s0=False, quadrature_weights=None):
+                   sigma_m, fit_s0=False, s0_measured=None,
+                   quadrature_weights=None):
     """GPU counterpart of ``fitters.bayes_fit``.
 
     ``measured_batch`` is the (already log-transformed if requested)
     normalized signal for ``fit_s0=False``, or the raw un-normalized signal
-    for ``fit_s0=True`` — same convention as the CPU function.
+    for ``fit_s0=True`` — same convention as the CPU function. ``fit_s0``
+    also needs ``s0_measured`` (per-voxel measured S0, raw units).
     """
     inv_two_sigma2 = 1.0 / (2.0 * sigma_m ** 2)
     n_vox = measured_batch.shape[0]
@@ -491,11 +493,15 @@ def bayes_fit_gpu(measured_batch, lib_mat, kios_arr, rhos_arr, Vs_arr,
     grid = _grid(n_vox)
 
     if fit_s0:
+        if s0_measured is None:
+            raise ValueError("fit_s0=True requires s0_measured.")
         lib_rr = np.maximum(np.sum(lib * lib, axis=1), 1e-30)
         d_lib_rr = cuda.to_device(lib_rr)
+        d_s0_meas = cuda.to_device(
+            np.ascontiguousarray(s0_measured, dtype=np.float64).reshape(-1))
         d_sumw_s0 = cuda.device_array(n_vox, dtype=np.float64)
         _bayes_kernel_free_s0[grid, _THREADS_PER_BLOCK](
-            d_M, d_lib, d_lib_rr, d_kios, d_rhos, d_Vs, d_weights, inv_two_sigma2,
+            d_M, d_lib, d_lib_rr, d_s0_meas, d_kios, d_rhos, d_Vs, d_weights, inv_two_sigma2,
             *outs, d_sumw_s0)
         cuda.synchronize()
         sumw_s0 = d_sumw_s0.copy_to_host()
